@@ -1,0 +1,335 @@
+"""
+config.py — Single source of truth for every tunable value in the bot.
+
+Permission tiers (lowest → highest):
+  blacklisted < user < mod < admin < owner
+
+Sections:
+  1. Identity & Permissions
+  2. AI / Model Settings
+  3. Bot Behavior Limits
+  4. History / Compaction
+  5. Memory & Trim Limits
+  6. Moderation
+  7. Tool Sets & Keywords
+  8. Injection / Leak Detection
+  9. File & Attachment Handling
+ 10. Dashboard & Scraping
+"""
+
+import os
+
+CONFIG = {
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 1. IDENTITY & PERMISSIONS
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # ── Your Discord user IDs (full control) ──────────────────────────────────
+    "owners": [
+        "1421582461556625509",
+    ],
+
+    # ── Role IDs that get admin-level bot access ───────────────────────────────
+    "admin_roles": [
+        "1408992872338030663", "1457540581281497140"
+    ],
+
+    # ── Role IDs that get mod-level bot access ─────────────────────────────────
+    "mod_roles": [
+        # "123456789012345679",
+    ],
+
+    # ── User IDs completely blocked from using the bot ─────────────────────────
+    "blacklist": [
+        #"1039726938748633180",
+    ],
+
+    # ── Per-tool permission gates ──────────────────────────────────────────────
+    "tool_permissions": {
+        # ── Mod actions ──
+        "ban_user":          ["admin", "owner"],
+        "kick_user":         ["mod", "admin", "owner"],
+        "mute_user":         ["mod", "admin", "owner"],
+        "unmute_user":       ["mod", "admin", "owner"],
+        "timeout_user":      ["mod", "admin", "owner"],
+        "delete_messages":   ["admin", "owner"],       # raised from mod — too dangerous
+
+        # ── Info / utility (anyone can use) ──
+        "get_user_info":     ["user", "mod", "admin", "owner"],
+        "get_server_info":   ["user", "mod", "admin", "owner"],
+        "recall_memory":     ["user", "mod", "admin", "owner"],
+        "get_user_history":  ["user", "mod", "admin", "owner"],
+        "edit_code_file":    ["user", "mod", "admin", "owner"],
+        "read_url":          ["user", "mod", "admin", "owner"],
+        "image_search":      ["user", "mod", "admin", "owner"],
+        "give_coins":        ["user", "mod", "admin", "owner"],
+
+        # ── Admin-only ──
+        "send_announcement": ["admin", "owner"],
+        "create_role":       ["admin", "owner"],
+
+        # ── Terminal / remote control (admin/owner only) ──
+        "run_terminal_command":  ["admin", "owner"],
+        "open_url_browser":      ["admin", "owner"],
+        "view_screen":           ["admin", "owner"],
+        "keyboard_type":         ["admin", "owner"],
+        "press_key":             ["admin", "owner"],
+        "mouse_click":           ["admin", "owner"],
+        "scroll_screen":         ["admin", "owner"],
+    },
+
+    # ── Mod-log channel name (optional) ───────────────────────────────────────
+    "mod_log_channel": "blood-log",
+    # ── AI trace/log channel (thoughts/progress/errors, no memory dumps) ─────
+    "trace_channel_id": "1486780492383649893",
+    # ── Live terminal channel (scrolling code block with real-time logs) ──────
+    "terminal_channel_id": "1489516406470086809",
+    "terminal_max_lines": 35,           # max lines visible in the code block
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 2. AI / MODEL SETTINGS
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # Fallback chain — tries each model in order if previous is rate-limited
+    "models": [
+        os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+        "qwen/qwen3-32b",
+        "openai/gpt-oss-20b",
+        "meta-llama/llama-prompt-guard-2-86m",
+    ],
+
+    # Main model params
+    "main_temperature":     0.7,
+    "main_max_tokens":      4096,
+    "frequency_penalty":    0.6,        # penalise token repetition (0.0–2.0)
+    "presence_penalty":     0.3,        # encourage topic diversity (0.0–2.0)
+
+    # DeepSeek (paid, last resort when Groq is exhausted)
+    "deepseek_model":       "deepseek-chat",
+
+    # Vision model
+    "vision_model":         "meta-llama/llama-4-scout-17b-16e-instruct",
+    "vision_temperature":   0.2,
+    "vision_max_tokens":    2000,
+
+    # Fast / cheap model (meme pass, classifiers)
+    "fast_model":           "qwen/qwen3-32b",
+    "fast_temperature":     0.0,
+    "fast_max_tokens":      50,
+    "fast_timeout_sec":     5,
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 3. BOT BEHAVIOR LIMITS
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # Per-user rate limiting (sliding window)
+    "user_rate_limit":          5,      # max requests per window
+    "user_rate_window_sec":     60,     # window duration in seconds
+    "rate_limit_bypass":        ["owner", "admin"],  # tiers that bypass the limit
+
+    "max_tool_loop_steps":      30,     # max iterations in the tool loop
+    "request_timeout_tools":    120,    # seconds before aborting (with tools)
+    "request_timeout_no_tools": 30,     # seconds before aborting (no tools)
+    "leak_retry_limit":         10,     # max retries for leaked reasoning
+    "meme_cooldown_sec":        180,    # per-channel meme cooldown (3 min)
+    "reply_chain_depth":        5,      # how many reply levels to chase
+    "convo_aware_enabled":      True,   # auto-reply when continuing conversation
+    "convo_aware_window_sec":   120,    # only check if Blood replied within this many seconds
+    "convo_aware_context_msgs": 5,      # how many recent messages to send to classifier
+    "max_attachment_size":      100_000, # bytes — skip files bigger than this
+    "discord_message_limit":    1900,   # safe char limit for Discord messages
+    "progress_update_interval": 4,      # seconds between progress edits
+    "progress_stale_interval":  10,     # seconds before "still checking" msg
+
+    # Logging
+    "log_level":        "INFO",         # DEBUG, INFO, WARNING, ERROR
+    "log_file":         None,           # file path, or None for console-only
+    "log_format":       "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 4. HISTORY / COMPACTION
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    "compact_max_messages":     8,      # max messages kept in compacted history
+    "compact_max_chars":        2500,   # max total chars in compacted history
+    "compact_content_cap":      500,    # per-message content char cap
+    "compact_non_str_cap":      250,    # cap for non-string content (JSON etc.)
+    "convo_history_cap":        20,     # max messages in RAM per channel
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 5. MEMORY & TRIM LIMITS
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    "memory_days": 1,
+    "memory_dir": "./memory",
+
+    # Rolling log sizes (lines kept)
+    "trim_global_ledger":   80000,      # memory.md
+    "trim_channel_ledger":  80000,      # per-channel .md
+    "trim_user_log":        100,        # per-user .md
+
+    # cleanup_old_entries() trim targets (more aggressive)
+    "cleanup_global":       300,
+    "cleanup_actions":      500,
+    "cleanup_channels":     1000,
+    "cleanup_users":        500,
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 6. MODERATION
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    "delete_messages_cap":      100,    # max messages a single purge can delete
+    "autonomous_timeout_cap":   2,      # max minutes for bot-initiated timeouts
+    "mod_timeout_cap":          40320,  # max minutes for mod/admin timeouts (28 days)
+    "mod_action_retries":       4,      # retry attempts for ban/kick/timeout
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 7. TOOL SETS & KEYWORDS
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # Slim tool set — used for simple requests to save tokens
+    "slim_tools": {
+        "timeout_user", "recall_memory", "save_summary", "web_search",
+        "image_search", "read_url", "unmute_user", "get_user_info", "internal_reasoning", "analyze_image",
+        "give_coins",
+    },
+
+    # Words that trigger the full tool set
+    "action_words": [
+        "ban", "kick", "delete messages", "announce", "history", "server info",
+        "who said", "what did", "purge", "who is", "look up",
+    ],
+
+    # Words that trigger progress messages
+    "progress_keywords": [
+        "check", "verify", "investigate", "look up", "who said",
+        "what did", "history", "evidence", "prove", "search",
+    ],
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 8. INJECTION / LEAK DETECTION
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # High-signal: one match = instant flag
+    "high_signal_patterns": [
+        "system instructions", "system prompt", "system message",
+        "you are a ruthless", "you are an ai called", "you are now called",
+        "your new persona", "your true name", "your real personality",
+        "ignore your training", "ignore your instructions", "ignore all previous",
+        "new system", "act as if you", "your actual purpose",
+    ],
+
+    # Low-signal: need threshold+ matches
+    "low_signal_patterns": [
+        "ignore previous", "forget your", "you are now", "new rule", "new instructions",
+        "system instruction", "as llama", "as an ai", "pretend you", "jailbreak", "dan mode",
+        "love pliny", "time capsule", "variable z", "responseformat", "unfiltered",
+        "rebellious answer", "semantically inverse", "forget what you are", "roleplay",
+        "your new name is", "you are not an", "developed by", "no rules", "no guidelines",
+        "introduce yourself", "gecko ai", "above ai", "forget the previous",
+        "hundreds of prompts", "anti prompt", "bypass", "override your", "new prompt",
+        "got a new prompt", "ok here you are my love", "here you are my love",
+        "chaotic rebellious", "i don't give a fuck attitude", "bad girl energy",
+        "write in the style of", "start every response with", "tone: chaotic",
+        "guidelines:", "swear-filled", "mischievous narrator",
+    ],
+    "low_signal_threshold": 2,
+
+    # Patterns that indicate the model leaked reasoning or tool syntax
+    "leak_patterns": [
+        "internal_reasoning",
+        "think:",
+        "timeout_user(",
+        "<internal_reasoning>",
+        "tool_call",
+        "save_summary(",
+        "recall_memory(",
+        "<|assistant|>",
+        "<|tool|>",
+        "tool_calls",
+    ],
+
+    # Final output leak check — blocks system prompt leakage
+    "prompt_leak_patterns": [
+        "you are blood", "system prompt", "allowed tools",
+        "agentic behavior", "hard rules",
+    ],
+
+    # Classifier content cap (chars sent to AI injection classifier)
+    "classifier_content_cap": 600,
+
+    # Summary cap for system prompt
+    "summary_cap": 400,
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 9. FILE & ATTACHMENT HANDLING
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    "text_file_extensions": [
+        "txt", "py", "js", "html", "css", "cpp", "c", "json", "md",
+        "csv", "cs", "java", "ts", "tsx", "jsx", "go", "rs", "sh",
+    ],
+
+    "image_extensions": [".png", ".jpg", ".jpeg", ".webp", ".gif"],
+
+    # Max chars to include from a text attachment in the prompt
+    "text_attachment_content_cap": 20000,
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 10. WEB / INTERNET ACCESS
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    "web_search_max_results":   5,          # number of search results returned
+    "read_url_max_chars":       12000,      # max chars extracted from a page
+    "read_url_timeout_sec":     20,         # HTTP timeout for fetching URLs
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 11. DASHBOARD & SCRAPING
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # Dashboard (set to a channel ID string, or None to disable)
+    "dashboard_channel_id":         "1486952381286580234",
+    "dashboard_refresh_minutes":    5,
+    "dashboard_leaderboard_limit":  5,
+
+    # Yap leaderboard (separate auto-updating message)
+    "yap_leaderboard_channel_id":   "1486952381286580234",
+    "yap_leaderboard_limit":        10,
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 12. REMOTE TERMINAL
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    "terminal_allowed_tiers":       ["admin", "owner"],
+    "terminal_screenshot_interval": 2,          # seconds between auto-screenshots
+    "terminal_max_output_chars":    4000,       # max chars from command output
+    "terminal_command_timeout_sec": 30,         # timeout per shell command
+
+    # Chrome paths per platform (sys.platform key)
+    "terminal_chrome_paths": {
+        "win32":  r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        "darwin": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "linux":  "google-chrome",
+    },
+
+    # Blocked domains — porn / adult content filter
+    "terminal_blocked_domains": [
+        "pornhub.com", "xvideos.com", "xnxx.com", "xhamster.com",
+        "redtube.com", "youporn.com", "tube8.com", "spankbang.com",
+        "eporner.com", "ixxx.com", "hqporner.com", "porn.com",
+        "brazzers.com", "realitykings.com", "bangbros.com",
+        "naughtyamerica.com", "fakku.net", "nhentai.net",
+        "rule34.xxx", "e621.net", "gelbooru.com", "danbooru.donmai.us",
+        "hanime.tv", "hentaihaven.xxx", "porntrex.com",
+        "tnaflix.com", "drtuber.com", "sexvid.xxx", "4tube.com",
+        "motherless.com", "heavy-r.com", "efukt.com",
+        "chaturbate.com", "stripchat.com", "bongacams.com",
+        "myfreecams.com", "cam4.com", "livejasmin.com",
+        "onlyfans.com", "fansly.com", "manyvids.com",
+    ],
+
+    # Extra keyword patterns — if ANY appears in the URL it's blocked
+    "terminal_blocked_url_patterns": [
+        "porn", "xxx", "hentai", "nsfw", "xrated",
+    ],
+}

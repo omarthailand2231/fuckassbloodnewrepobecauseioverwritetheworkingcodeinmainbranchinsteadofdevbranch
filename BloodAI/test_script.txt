@@ -1,0 +1,13 @@
+def main():
+    print_str = ""
+    user_val = input("enter a number: ")
+    
+    if int(user_val) == 2 or int(user_val) > 2:
+        for letter in ["h", "i", " ", "m", "a", "r", "s"]:
+            print_str += letter
+        print(print_str)
+    elif int(user_val) < 2:
+        print("h" + "e" + "l" + "l" + "o" + " " + "w" + "o" + "r" + "l" + "d")
+
+if __name__ == "__main__":
+    main()
