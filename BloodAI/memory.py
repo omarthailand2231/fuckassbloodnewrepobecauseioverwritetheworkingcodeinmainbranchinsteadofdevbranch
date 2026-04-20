@@ -600,6 +600,10 @@ class MemoryManager:
             path = _md_path(guild_id, 1)
             if os.path.exists(path):
                 self._trim_md(path, CONFIG["cleanup_global"])
+            # Summaries (memory_2.md) — trim to prevent unbounded growth
+            path_summary = _md_path(guild_id, 2)
+            if os.path.exists(path_summary):
+                self._trim_md(path_summary, CONFIG.get("cleanup_summaries", 500))
             # Action logs
             path_actions = _md_path(guild_id, 3)
             if os.path.exists(path_actions):
@@ -617,3 +621,131 @@ class MemoryManager:
                     if fname.endswith(".md"):
                         self._trim_md(os.path.join(udir, fname), CONFIG["cleanup_users"])
         log.info("Memory cleanup done.")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # EMOTIONAL STATE — per-user + global bot mood
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _emotional_state_path(self, guild_id: str) -> str:
+        return os.path.join(self._guild_dir(guild_id), "emotional_state.json")
+
+    def _load_emotional_state(self, guild_id: str) -> dict:
+        path = self._emotional_state_path(guild_id)
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {"users": {}, "bot_mood": "neutral", "mood_history": []}
+
+    def _save_emotional_state(self, guild_id: str, data: dict):
+        path = self._emotional_state_path(guild_id)
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+
+    def get_user_emotional_data(self, guild_id: str, user_id: str) -> dict:
+        """Return emotional data for a specific user."""
+        state = self._load_emotional_state(guild_id)
+        return state["users"].get(user_id, {
+            "annoyance": 0, "respect": 0, "grudge": 0, "fear_level": 0,
+            "category": "neutral", "notes": ""
+        })
+
+    def update_user_emotional_data(self, guild_id: str, user_id: str, deltas: dict):
+        """Apply delta changes to a user's emotional data.
+        deltas: {"annoyance": +2, "respect": -1, ...} or absolute sets like {"category": "feared"}
+        """
+        state = self._load_emotional_state(guild_id)
+        user_data = state["users"].get(user_id, {
+            "annoyance": 0, "respect": 0, "grudge": 0, "fear_level": 0,
+            "category": "neutral", "notes": ""
+        })
+        for key, val in deltas.items():
+            if key in ("annoyance", "respect", "grudge", "fear_level") and isinstance(val, (int, float)):
+                user_data[key] = max(-100, min(100, user_data.get(key, 0) + val))
+            else:
+                user_data[key] = val
+        state["users"][user_id] = user_data
+        self._save_emotional_state(guild_id, state)
+
+    def get_bot_mood(self, guild_id: str) -> str:
+        state = self._load_emotional_state(guild_id)
+        return state.get("bot_mood", "neutral")
+
+    def set_bot_mood(self, guild_id: str, mood: str):
+        state = self._load_emotional_state(guild_id)
+        state["bot_mood"] = mood
+        history = state.get("mood_history", [])
+        history.append({"mood": mood, "at": _now_iso()})
+        state["mood_history"] = history[-50:]  # keep last 50 mood changes
+        self._save_emotional_state(guild_id, state)
+
+    def get_emotional_summary(self, guild_id: str, cap: int = 600) -> str:
+        """Compact emotional state summary for system prompt injection."""
+        state = self._load_emotional_state(guild_id)
+        mood = state.get("bot_mood", "neutral")
+        lines = [f"MOOD: {mood}"]
+        users = state.get("users", {})
+        # Group by category
+        categories = {}
+        for uid, data in users.items():
+            cat = data.get("category", "neutral")
+            categories.setdefault(cat, []).append((uid, data))
+        for cat in ["feared", "respected", "disrespected"]:
+            if cat in categories:
+                ids = [uid for uid, _ in categories[cat][:5]]
+                lines.append(f"{cat.upper()}: {', '.join(ids)}")
+        # Top grudges
+        grudged = [(uid, d["grudge"]) for uid, d in users.items() if d.get("grudge", 0) > 10]
+        grudged.sort(key=lambda x: x[1], reverse=True)
+        if grudged:
+            lines.append("GRUDGES: " + ", ".join(f"{uid}({g})" for uid, g in grudged[:5]))
+        result = "\n".join(lines)
+        return result[:cap]
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SCHEDULED TASKS
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _scheduled_tasks_path(self, guild_id: str) -> str:
+        return os.path.join(self._guild_dir(guild_id), "scheduled_tasks.json")
+
+    def load_scheduled_tasks(self, guild_id: str) -> list[dict]:
+        path = self._scheduled_tasks_path(guild_id)
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return []
+
+    def save_scheduled_tasks(self, guild_id: str, tasks: list[dict]):
+        path = self._scheduled_tasks_path(guild_id)
+        with open(path, "w") as f:
+            json.dump(tasks, f, indent=2)
+
+    def add_scheduled_task(self, guild_id: str, task: dict) -> str:
+        """Add a scheduled task. Returns 'ok' or error string.
+        task: {"action": str, "channel_id": str, "due_at": float (unix ts), "context": str}
+        """
+        tasks = self.load_scheduled_tasks(guild_id)
+        max_pending = CONFIG.get("scheduled_tasks_max_pending", 10)
+        if len(tasks) >= max_pending:
+            return f"Task limit reached ({max_pending} pending). Complete or cancel existing tasks first."
+        task["created_at"] = _now_iso()
+        task["id"] = f"task_{int(datetime.now(timezone.utc).timestamp())}_{len(tasks)}"
+        tasks.append(task)
+        self.save_scheduled_tasks(guild_id, tasks)
+        return "ok"
+
+    def pop_due_tasks(self, guild_id: str) -> list[dict]:
+        """Remove and return all tasks whose due_at has passed."""
+        tasks = self.load_scheduled_tasks(guild_id)
+        now = datetime.now(timezone.utc).timestamp()
+        due = [t for t in tasks if t.get("due_at", float("inf")) <= now]
+        remaining = [t for t in tasks if t.get("due_at", float("inf")) > now]
+        if due:
+            self.save_scheduled_tasks(guild_id, remaining)
+        return due

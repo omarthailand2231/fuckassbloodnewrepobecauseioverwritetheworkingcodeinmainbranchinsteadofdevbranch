@@ -1,17 +1,18 @@
 import os
 import time
 import logging
+import asyncio
 from dotenv import load_dotenv
-from config import CONFIG
+from config import CONFIG, USE_GROQ_API
 
-log = logging.getLogger("blood.openrouter")
+log = logging.getLogger("blood.provider")
 
 load_dotenv()
 
+# ── Groq (legacy) ────────────────────────────────────────────────────────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-BASE_URL = "https://api.groq.com/openai/v1/chat/completions"
-
-HEADERS = {
+GROQ_BASE_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_HEADERS = {
     "Authorization": f"Bearer {GROQ_API_KEY}",
     "Content-Type": "application/json",
 }
@@ -20,22 +21,24 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = CONFIG.get("deepseek_model", "deepseek-chat")
 
-MODELS = CONFIG["models"]
+GROQ_MODELS = CONFIG["models"]
+
+# ── Moonshot (Kimi K2.5) ─────────────────────────────────────────────────────
+MOONSHOT_API_KEY = os.getenv("MOONSHOT_API_KEY")
+MOONSHOT_BASE_URL = CONFIG["moonshot_base_url"]
+MOONSHOT_MODEL = CONFIG["moonshot_model"]
 
 # ── Rate limit tracker ────────────────────────────────────────────────────────
-# Groq returns these headers on every response. We store the last known values
-# per model so !debug limits can show a status bar without an extra API call.
 _rate_limits: dict[str, dict] = {}
 
 def get_rate_limits() -> dict[str, dict]:
     """Return last known rate limit state for all models."""
     return dict(_rate_limits)
 
-def _parse_headers(model: str, headers):
+def _parse_groq_headers(model: str, headers):
     """Extract and store Groq rate limit headers with robust fallback."""
-    # Convert all headers to lowercase for reliable matching
     h = {k.lower(): v for k, v in headers.items()}
-    
+
     def _get(*keys):
         for k in keys:
             if k in h: return h[k]
@@ -52,7 +55,6 @@ def _parse_headers(model: str, headers):
 
 def _sanitize_messages(msgs: list[dict]) -> list[dict]:
     """Remove orphaned tool messages AND orphaned assistant tool_calls without matching tool responses."""
-    # Pass 1: collect valid tool_call_ids that have a tool response
     tool_response_ids = set()
     for m in msgs:
         if m.get("role") == "tool" and m.get("tool_call_id"):
@@ -61,7 +63,6 @@ def _sanitize_messages(msgs: list[dict]) -> list[dict]:
     clean = []
     for m in msgs:
         if m.get("role") == "tool":
-            # Keep tool message only if it traces back to an assistant with tool_calls
             has_parent = False
             for c in reversed(clean):
                 if c.get("role") == "tool":
@@ -72,7 +73,6 @@ def _sanitize_messages(msgs: list[dict]) -> list[dict]:
             if has_parent:
                 clean.append(m)
         elif m.get("role") == "assistant" and m.get("tool_calls"):
-            # Check if ALL tool_calls in this message have matching tool responses
             calls = m["tool_calls"]
             all_have_responses = all(
                 tc.get("id") in tool_response_ids for tc in calls
@@ -80,23 +80,107 @@ def _sanitize_messages(msgs: list[dict]) -> list[dict]:
             if all_have_responses:
                 clean.append(m)
             elif m.get("content"):
-                # Keep the text content but strip the tool_calls
                 clean.append({"role": "assistant", "content": m["content"]})
-            # else: drop entirely — orphaned tool_calls with no text
         else:
             clean.append(m)
     return clean
 
 
-async def call_ai(system: str, messages: list[dict], tools: list[dict] | None = None) -> dict:
+def _extract_response(data: dict, model: str, fallbacks: list) -> dict:
+    """Normalize a ChatCompletion response dict into our internal format."""
+    choice = data["choices"][0]
+    ai_message = choice.get("message", {})
+    finish_reason = choice.get("finish_reason", "stop")
+    if ai_message.get("tool_calls"):
+        finish_reason = "tool_calls"
+    usage = data.get("usage", {})
+    usage["model_used"] = model
+    usage["fallbacks"] = fallbacks
+    return {"finish_reason": finish_reason, "message": ai_message, "usage": usage}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MOONSHOT PATH — single model for everything
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _moonshot_call(system: str, messages: list[dict],
+                         tools: list[dict] | None = None,
+                         temperature: float | None = None,
+                         max_tokens: int | None = None) -> dict:
+    """Call Kimi K2.5 via OpenAI-compatible API."""
+    import aiohttp
+
+    if not MOONSHOT_API_KEY:
+        raise RuntimeError("MOONSHOT_API_KEY not set")
+
+    headers = {
+        "Authorization": f"Bearer {MOONSHOT_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": MOONSHOT_MODEL,
+        "messages": [{"role": "system", "content": system}] + _sanitize_messages(messages),
+        "temperature": temperature or CONFIG["main_temperature"],
+        "max_tokens": max_tokens or CONFIG["main_max_tokens"],
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+
+    url = f"{MOONSHOT_BASE_URL}/chat/completions"
+
+    for attempt in range(3):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=payload,
+                                        timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                    if resp.status == 429:
+                        retry_after = float(resp.headers.get("Retry-After", 2))
+                        log.warning("Moonshot 429, retrying after %.1fs", retry_after)
+                        await asyncio.sleep(min(retry_after, 10))
+                        continue
+                    if resp.status == 400:
+                        err_body = await resp.text()
+                        log.warning("Moonshot 400: %s", err_body[:500])
+                        # Retry with trimmed history
+                        payload["messages"] = (
+                            [{"role": "system", "content": system}]
+                            + _sanitize_messages(messages[-3:] if len(messages) > 3 else messages)
+                        )
+                        if tools:
+                            payload.pop("tools", None)
+                            payload.pop("tool_choice", None)
+                        continue
+                    if resp.status != 200:
+                        text = await resp.text()
+                        raise RuntimeError(f"Moonshot error {resp.status}: {text[:300]}")
+
+                    data = await resp.json()
+                    return _extract_response(data, MOONSHOT_MODEL, [])
+        except RuntimeError:
+            raise
+        except Exception as e:
+            if attempt >= 2:
+                raise RuntimeError(f"Moonshot failed after 3 attempts: {e}")
+            await asyncio.sleep(1)
+
+    raise RuntimeError("Moonshot: max retries exceeded")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GROQ PATH — fallback chain (legacy)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _groq_call(system: str, messages: list[dict],
+                     tools: list[dict] | None = None) -> dict:
+    """Groq fallback chain with DeepSeek last resort."""
     import aiohttp
 
     last_err = None
     fallbacks = []
-    
-    for model in MODELS:
-        # ── Smart Selection ───────────────────────────────────────────────────
-        # Skip if we already know (from recent pulse) that this model is empty.
+
+    for model in GROQ_MODELS:
         limit_info = _rate_limits.get(model, {})
         rem = limit_info.get("remaining_tokens_day") or limit_info.get("remaining_tokens_minute")
         if rem is not None and str(rem) == "0":
@@ -117,16 +201,15 @@ async def call_ai(system: str, messages: list[dict], tools: list[dict] | None = 
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(BASE_URL, headers=HEADERS, json=payload) as resp:
-                    _parse_headers(model, resp.headers)
-                    
+                async with session.post(GROQ_BASE_URL, headers=GROQ_HEADERS, json=payload) as resp:
+                    _parse_groq_headers(model, resp.headers)
+
                     if resp.status == 429:
                         fallbacks.append(f"{model.split('/')[-1]}: Busy")
                         continue
                     if resp.status == 400:
                         err_body = await resp.text()
                         log.warning("400 from %s: %s", model, err_body[:300])
-                        # Retry same model with stripped payload
                         slim_payload = {
                             "model": model,
                             "messages": [{'role': 'system', 'content': system}] + _sanitize_messages(messages[-3:] if len(messages) > 3 else messages),
@@ -135,17 +218,11 @@ async def call_ai(system: str, messages: list[dict], tools: list[dict] | None = 
                         }
                         try:
                             async with aiohttp.ClientSession() as s2:
-                                async with s2.post(BASE_URL, headers=HEADERS, json=slim_payload) as r2:
-                                    _parse_headers(model, r2.headers)
+                                async with s2.post(GROQ_BASE_URL, headers=GROQ_HEADERS, json=slim_payload) as r2:
+                                    _parse_groq_headers(model, r2.headers)
                                     if r2.status == 200:
                                         data = await r2.json()
-                                        choice = data["choices"][0]
-                                        ai_message = choice.get("message", {})
-                                        finish_reason = choice.get("finish_reason", "stop")
-                                        usage = data.get("usage", {})
-                                        usage["model_used"] = model
-                                        usage["fallbacks"] = fallbacks + [f"{model.split('/')[-1]}: retried-slim"]
-                                        return {"finish_reason": finish_reason, "message": ai_message, "usage": usage}
+                                        return _extract_response(data, model, fallbacks + [f"{model.split('/')[-1]}: retried-slim"])
                         except Exception:
                             pass
                         fallbacks.append(f"{model.split('/')[-1]}: Bad request")
@@ -153,14 +230,13 @@ async def call_ai(system: str, messages: list[dict], tools: list[dict] | None = 
                             messages = messages[-3:]
                         continue
                     if resp.status == 413:
-                        # Request too large — trim history for remaining models
                         fallbacks.append(f"{model.split('/')[-1]}: Too large")
                         if len(messages) > 4:
                             messages = messages[-3:]
                         elif len(messages) > 1:
                             messages = messages[-1:]
                         continue
-                    if resp.status == 503 or resp.status == 502:
+                    if resp.status in (502, 503):
                         fallbacks.append(f"{model.split('/')[-1]}: Overloaded")
                         continue
                     if resp.status != 200:
@@ -168,18 +244,10 @@ async def call_ai(system: str, messages: list[dict], tools: list[dict] | None = 
                         fallbacks.append(f"{model.split('/')[-1]}: Error {resp.status}")
                         last_err = RuntimeError(f"Groq error {resp.status}: {text}")
                         continue
-                    
+
                     data = await resp.json()
 
-            choice = data["choices"][0]
-            ai_message = choice.get("message", {})
-            finish_reason = choice.get("finish_reason", "stop")
-            if ai_message.get("tool_calls"):
-                finish_reason = "tool_calls"
-            usage = data.get("usage", {})
-            usage["model_used"] = model
-            usage["fallbacks"] = fallbacks
-            return {"finish_reason": finish_reason, "message": ai_message, "usage": usage}
+            return _extract_response(data, model, fallbacks)
 
         except Exception as e:
             fallbacks.append(f"{model.split('/')[-1]}: Failed")
@@ -189,9 +257,7 @@ async def call_ai(system: str, messages: list[dict], tools: list[dict] | None = 
     # ── Last resort: DeepSeek (paid API) ──────────────────────────────────
     if DEEPSEEK_API_KEY:
         try:
-            import aiohttp
             ds_headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
-            # Use trimmed messages, strip orphaned tool messages
             ds_msgs = _sanitize_messages(messages[-3:] if len(messages) > 3 else messages)
             ds_payload = {
                 "model": DEEPSEEK_MODEL,
@@ -207,19 +273,10 @@ async def call_ai(system: str, messages: list[dict], tools: list[dict] | None = 
                                         timeout=aiohttp.ClientTimeout(total=30)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        choice = data["choices"][0]
-                        ai_message = choice.get("message", {})
-                        finish_reason = choice.get("finish_reason", "stop")
-                        if ai_message.get("tool_calls"):
-                            finish_reason = "tool_calls"
-                        usage = data.get("usage", {})
-                        usage["model_used"] = DEEPSEEK_MODEL
-                        usage["fallbacks"] = fallbacks + ["groq-exhausted"]
-                        return {"finish_reason": finish_reason, "message": ai_message, "usage": usage}
+                        return _extract_response(data, DEEPSEEK_MODEL, fallbacks + ["groq-exhausted"])
                     else:
                         err_body = await resp.text()
                         log.warning("DeepSeek %s: %s", resp.status, err_body[:300])
-                        # Retry without tools
                         if tools:
                             ds_payload.pop("tools", None)
                             ds_payload.pop("tool_choice", None)
@@ -228,18 +285,11 @@ async def call_ai(system: str, messages: list[dict], tools: list[dict] | None = 
                                                    timeout=aiohttp.ClientTimeout(total=30)) as r2:
                                     if r2.status == 200:
                                         data = await r2.json()
-                                        choice = data["choices"][0]
-                                        ai_message = choice.get("message", {})
-                                        finish_reason = choice.get("finish_reason", "stop")
-                                        usage = data.get("usage", {})
-                                        usage["model_used"] = DEEPSEEK_MODEL
-                                        usage["fallbacks"] = fallbacks + ["groq-exhausted", "deepseek-slim"]
-                                        return {"finish_reason": finish_reason, "message": ai_message, "usage": usage}
+                                        return _extract_response(data, DEEPSEEK_MODEL, fallbacks + ["groq-exhausted", "deepseek-slim"])
                         fallbacks.append(f"deepseek: {resp.status}")
         except Exception as e:
             fallbacks.append(f"deepseek: {e}")
 
-    # Graceful fallback if everything including DeepSeek fails
     fb_str = ", ".join(fallbacks) if fallbacks else "unknown"
     return {
         "finish_reason": "error",
@@ -248,66 +298,62 @@ async def call_ai(system: str, messages: list[dict], tools: list[dict] | None = 
                   "model_used": "none", "fallbacks": fallbacks},
     }
 
-async def call_vision(image_url: str, prompt: str) -> str:
-    """Specialized endpoint call for Vision capabilities using Llama 3.2 11B Vision."""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PUBLIC API — dispatches to Moonshot or Groq based on toggle
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def call_ai(system: str, messages: list[dict], tools: list[dict] | None = None) -> dict:
+    if USE_GROQ_API:
+        return await _groq_call(system, messages, tools)
+    return await _moonshot_call(system, messages, tools)
+
+
+async def call_vision(image_url: str, prompt: str) -> dict:
+    """Vision analysis — Moonshot uses kimi-k2.5 natively, Groq uses dedicated vision model."""
+    if not USE_GROQ_API:
+        # Moonshot: kimi-k2.5 handles vision natively
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ]
+        }]
+        return await _moonshot_call(
+            system="You analyze images accurately and concisely.",
+            messages=messages,
+            temperature=CONFIG["vision_temperature"],
+            max_tokens=CONFIG["vision_max_tokens"],
+        )
+
+    # Groq: dedicated vision model
     import aiohttp
-    
     model = CONFIG["vision_model"]
-    
     payload = {
         "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                ]
-            }
-        ],
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ]
+        }],
         "temperature": CONFIG["vision_temperature"],
         "max_tokens": CONFIG["vision_max_tokens"],
     }
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(BASE_URL, headers=HEADERS, json=payload) as resp:
-                _parse_headers(model, resp.headers)
+            async with session.post(GROQ_BASE_URL, headers=GROQ_HEADERS, json=payload) as resp:
+                _parse_groq_headers(model, resp.headers)
                 if resp.status != 200:
                     text = await resp.text()
                     raise RuntimeError(f"Vision API Error {resp.status}: {text}")
                 data = await resp.json()
-                
                 usage = data.get("usage", {})
                 usage["model_used"] = model
                 ai_message = data["choices"][0]["message"]
-                
                 return {"message": ai_message, "usage": usage}
     except Exception as e:
         return {"message": {"content": f"Error analyzing image: {str(e)}"}, "usage": {}}
-
-async def call_ai_fast(system: str, prompt: str) -> str:
-    """Minimalist, cheap, and fast AI call for Pass 2 (meme checking). Uses Scout model."""
-    import aiohttp
-    model = CONFIG["fast_model"]
-    
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": CONFIG["fast_temperature"],
-        "max_tokens": CONFIG["fast_max_tokens"],
-    }
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(BASE_URL, headers=HEADERS, json=payload, timeout=aiohttp.ClientTimeout(total=CONFIG["fast_timeout_sec"])) as resp:
-                _parse_headers(model, resp.headers)
-                if resp.status != 200:
-                    return "NONE"
-                data = await resp.json()
-                return data["choices"][0]["message"]["content"].strip()
-    except Exception:
-        return "NONE"

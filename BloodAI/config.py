@@ -18,6 +18,13 @@ Sections:
 """
 
 import os
+from dotenv import load_dotenv
+load_dotenv()
+
+# ── API Provider Toggle ─────────────────────────────────────────────────────
+# False = Moonshot (Kimi K2.5) — default, single model for everything
+# True  = Groq fallback chain (legacy)
+USE_GROQ_API = False
 
 CONFIG = {
     # ═══════════════════════════════════════════════════════════════════════════
@@ -26,7 +33,7 @@ CONFIG = {
 
     # ── Your Discord user IDs (full control) ──────────────────────────────────
     "owners": [
-        "1421582461556625509",
+        os.getenv("OWNER_ID", "1421582461556625509"),
     ],
 
     # ── Role IDs that get admin-level bot access ───────────────────────────────
@@ -52,7 +59,7 @@ CONFIG = {
         "mute_user":         ["mod", "admin", "owner"],
         "unmute_user":       ["mod", "admin", "owner"],
         "timeout_user":      ["mod", "admin", "owner"],
-        "delete_messages":   ["admin", "owner"],       # raised from mod — too dangerous
+        "delete_messages":   ["mod", "admin", "owner"],
 
         # ── Info / utility (anyone can use) ──
         "get_user_info":     ["user", "mod", "admin", "owner"],
@@ -90,7 +97,11 @@ CONFIG = {
     # 2. AI / MODEL SETTINGS
     # ═══════════════════════════════════════════════════════════════════════════
 
-    # Fallback chain — tries each model in order if previous is rate-limited
+    # ── Moonshot (Kimi K2.5) — single model for everything ─────────────────
+    "moonshot_model":       "accounts/fireworks/models/kimi-k2p5",
+    "moonshot_base_url":    "https://api.fireworks.ai/inference/v1",
+
+    # ── Groq fallback chain (legacy, only used when USE_GROQ_API=True) ────
     "models": [
         os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
         "qwen/qwen3-32b",
@@ -98,7 +109,7 @@ CONFIG = {
         "meta-llama/llama-prompt-guard-2-86m",
     ],
 
-    # Main model params
+    # Main model params (shared)
     "main_temperature":     0.7,
     "main_max_tokens":      4096,
     "frequency_penalty":    0.6,        # penalise token repetition (0.0–2.0)
@@ -107,35 +118,25 @@ CONFIG = {
     # DeepSeek (paid, last resort when Groq is exhausted)
     "deepseek_model":       "deepseek-chat",
 
-    # Vision model
+    # Vision model (Groq-only — Moonshot uses kimi-k2.5 natively)
     "vision_model":         "meta-llama/llama-4-scout-17b-16e-instruct",
     "vision_temperature":   0.2,
     "vision_max_tokens":    2000,
-
-    # Fast / cheap model (meme pass, classifiers)
-    "fast_model":           "qwen/qwen3-32b",
-    "fast_temperature":     0.0,
-    "fast_max_tokens":      50,
-    "fast_timeout_sec":     5,
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 3. BOT BEHAVIOR LIMITS
     # ═══════════════════════════════════════════════════════════════════════════
 
     # Per-user rate limiting (sliding window)
-    "user_rate_limit":          5,      # max requests per window
-    "user_rate_window_sec":     60,     # window duration in seconds
-    "rate_limit_bypass":        ["owner", "admin"],  # tiers that bypass the limit
+    "user_rate_limit":          1,      # max requests per window
+    "user_rate_window_sec":     30,     # window duration in seconds
+    "rate_limit_bypass":        ["owner"],  # only owner bypasses the limit
 
     "max_tool_loop_steps":      30,     # max iterations in the tool loop
-    "request_timeout_tools":    120,    # seconds before aborting (with tools)
+    "request_timeout_tools":    180,    # seconds before aborting (with tools)
     "request_timeout_no_tools": 30,     # seconds before aborting (no tools)
     "leak_retry_limit":         10,     # max retries for leaked reasoning
-    "meme_cooldown_sec":        180,    # per-channel meme cooldown (3 min)
     "reply_chain_depth":        5,      # how many reply levels to chase
-    "convo_aware_enabled":      True,   # auto-reply when continuing conversation
-    "convo_aware_window_sec":   120,    # only check if Blood replied within this many seconds
-    "convo_aware_context_msgs": 5,      # how many recent messages to send to classifier
     "max_attachment_size":      100_000, # bytes — skip files bigger than this
     "discord_message_limit":    1900,   # safe char limit for Discord messages
     "progress_update_interval": 4,      # seconds between progress edits
@@ -173,14 +174,14 @@ CONFIG = {
     "cleanup_actions":      500,
     "cleanup_channels":     1000,
     "cleanup_users":        500,
+    "cleanup_summaries":    500,        # memory_2.md (was never trimmed)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 6. MODERATION
     # ═══════════════════════════════════════════════════════════════════════════
 
     "delete_messages_cap":      100,    # max messages a single purge can delete
-    "autonomous_timeout_cap":   2,      # max minutes for bot-initiated timeouts
-    "mod_timeout_cap":          40320,  # max minutes for mod/admin timeouts (28 days)
+    "timeout_cap":              40320,  # max minutes for any timeout (28 days)
     "mod_action_retries":       4,      # retry attempts for ban/kick/timeout
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -301,7 +302,7 @@ CONFIG = {
     # ═══════════════════════════════════════════════════════════════════════════
 
     "terminal_allowed_tiers":       ["admin", "owner"],
-    "terminal_screenshot_interval": 2,          # seconds between auto-screenshots
+    "terminal_screenshot_interval": 1.2,        # seconds between auto-screenshots
     "terminal_max_output_chars":    4000,       # max chars from command output
     "terminal_command_timeout_sec": 30,         # timeout per shell command
 
@@ -332,4 +333,35 @@ CONFIG = {
     "terminal_blocked_url_patterns": [
         "porn", "xxx", "hentai", "nsfw", "xrated",
     ],
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 13. EMOTIONAL STATE
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    "emotional_state_enabled":      True,
+    "emotional_state_prompt_cap":   600,    # max chars injected into system prompt
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 14. PROACTIVE SPEECH
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    "proactive_enabled":            True,
+    "proactive_check_interval_sec": 300,    # how often to check if Blood wants to speak
+    "proactive_activity_threshold": 5,      # min recent messages before Blood considers speaking
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 15. SCHEDULED TASKS
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    "scheduled_tasks_enabled":      True,
+    "scheduled_tasks_max_pending":  10,     # max pending tasks per guild
+    "scheduled_tasks_check_sec":    30,     # how often to check for due tasks
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 16. DM & SELF-ADVOCACY
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    "dm_enabled":                   True,
+    "dm_tools_enabled":             True,    # False = DMs are chat-only, True = Blood can use server tools from DMs
+    "requests_channel_id":          os.getenv("BLOODAI_REQUESTS_CHANNEL_ID"),
 }

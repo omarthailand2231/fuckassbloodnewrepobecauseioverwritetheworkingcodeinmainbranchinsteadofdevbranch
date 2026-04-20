@@ -450,7 +450,7 @@ async def bench_permissions():
 
 
 # ── ─────────────────────────────────────────────────────────────────────────
-# SECTION 4: OpenRouter / AI Layer
+# SECTION 4: Provider / AI Layer
 # ── ─────────────────────────────────────────────────────────────────────────
 
 async def bench_ai_layer():
@@ -486,7 +486,7 @@ async def bench_ai_layer():
         mock_session.post = MagicMock(return_value=mock_resp_ctx)
 
         with patch("aiohttp.ClientSession", return_value=mock_session):
-            from openrouter import call_ai
+            from provider import call_ai
             result = await call_ai("system", [{"role": "user", "content": "kick someone"}])
 
         lat = (time.perf_counter() - t0) * 1000
@@ -517,7 +517,7 @@ async def bench_ai_layer():
         mock_session.post = MagicMock(return_value=mock_resp_ctx)
 
         with patch("aiohttp.ClientSession", return_value=mock_session):
-            from openrouter import call_ai
+            from provider import call_ai
             result = await call_ai("system", [{"role": "user", "content": "hey"}])
 
         lat = (time.perf_counter() - t0) * 1000
@@ -542,7 +542,7 @@ async def bench_ai_layer():
 
         raised = False
         with patch("aiohttp.ClientSession", return_value=mock_session):
-            from openrouter import call_ai
+            from provider import call_ai
             try:
                 await call_ai("system", [{"role": "user", "content": "hey"}])
             except RuntimeError:

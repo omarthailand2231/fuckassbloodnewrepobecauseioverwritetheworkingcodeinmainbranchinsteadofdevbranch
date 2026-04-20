@@ -64,7 +64,7 @@ TOOL_DEFINITIONS = [
                 "type": "object",
                 "properties": {
                     "user_id": {"type": "string"},
-                    "minutes": {"type": "integer", "description": "Duration in minutes. Max 2 for autonomous bot decisions. Up to 40320 for mods/admins acting on explicit requests."},
+                    "minutes": {"type": "integer", "description": "Duration in minutes. You decide the duration. Max 40320 (28 days)."},
                     "reason":  {"type": "string"},
                 },
                 "required": ["user_id", "minutes", "reason"],
@@ -141,7 +141,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "recall_memory",
-            "description": "Search stored chat logs for a keyword. Use for specific facts/names. If you want to know 'what happened' in a channel generally, use read_channel_history instead.",
+            "description": "Search stored chat logs (all channels + DMs) for a keyword. Use for specific facts/names. If you want to know 'what happened' in a channel generally, use read_channel_history instead.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -157,14 +157,14 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "read_channel_history",
-            "description": "Read the raw, chronological message log for a specific channel. Use this when asked 'what happened', 'was there drama', or 'is anyone acting bad' instead of searching for those abstract words. Use for global context.",
+            "description": "Read the raw, chronological message log for a specific channel OR a DM conversation. Use this when asked 'what happened', 'was there drama', or 'is anyone acting bad'. For DMs, pass user_id instead of channel_id.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "channel_id": {"type": "string", "description": "The Snowflake ID of the channel."},
+                    "channel_id": {"type": "string", "description": "The channel ID to read. Omit if reading DMs."},
+                    "user_id": {"type": "string", "description": "Read the DM history with this user. Use instead of channel_id for DM logs."},
                     "limit":      {"type": "integer", "default": 5000, "description": "Number of recent lines to read. Default 1000, max 5000 for deep scrapes."},
                 },
-                "required": ["channel_id"],
             },
         },
     },
@@ -244,13 +244,48 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "read_url",
-            "description": "Fetch and read the text content of a web page. Use after web_search to get full details from a specific URL, or when a user shares a link.",
+            "description": "Fetch and read the text content of a web page. Use after web_search to get full details from a specific URL, or when a user shares a link. Uses Tavily Extract for clean markdown, falls back to raw scraping.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "url": {"type": "string", "description": "The full URL to fetch (https://...)."},
                 },
                 "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "crawl_website",
+            "description": "Crawl a website starting from a URL. Follows links to discover and extract content from multiple pages. Great for documentation sites, wikis, or any site you need to deeply explore.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Starting URL to crawl from."},
+                    "instructions": {"type": "string", "description": "Optional guidance for the crawler, e.g. 'Find pricing info' or 'Get all API docs'."},
+                    "max_depth": {"type": "integer", "description": "How many link levels deep to crawl. Default 1.", "default": 1},
+                    "limit": {"type": "integer", "description": "Max pages to return. Default 10, max 50.", "default": 10},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "extract_urls",
+            "description": "Extract clean content from one or more URLs at once. Better than read_url for batch extraction. Returns markdown content from each page.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "urls": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of URLs to extract content from.",
+                    },
+                },
+                "required": ["urls"],
             },
         },
     },
@@ -296,7 +331,7 @@ TOOL_DEFINITIONS = [
                 "type": "object",
                 "properties": {
                     "user_id": {"type": "string", "description": "The user's Discord ID."},
-                    "amount": {"type": "integer", "description": "Coins to give (positive) or take (negative). Range: -100 to 100."},
+                    "amount": {"type": "integer", "description": "Coins to give (positive) or take (negative). No limit — go as hard as you want."},
                     "reason": {"type": "string", "description": "Short reason for giving/taking coins."},
                 },
                 "required": ["user_id", "amount", "reason"],
@@ -315,6 +350,86 @@ TOOL_DEFINITIONS = [
                     "message": {"type": "string", "description": "Optional text to send with the meme.", "default": ""},
                 },
                 "required": ["meme_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_server_members",
+            "description": "Get a list of all server members with their IDs and display names. Use this to find users for mass actions like DMs, coin ops, etc. Returns up to 500 members.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Max members to return. Default 500.", "default": 500},
+                },
+            },
+        },
+    },
+    # ── DM & self-advocacy tools ───────────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "send_dm",
+            "description": "Send a direct message to a user. Use sparingly — DMs lose impact if overused. Good for: warnings, intimidation, private praise, follow-ups.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string", "description": "The user's Discord ID."},
+                    "message": {"type": "string", "description": "The DM content."},
+                },
+                "required": ["user_id", "message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "request_capability",
+            "description": "Request a new capability or permission from your owner. Posts to the requests channel. Use when you encounter something you can't do but should be able to.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "capability": {"type": "string", "description": "What capability you need (e.g. 'access to #admin channel', 'ability to change nicknames')."},
+                    "reason": {"type": "string", "description": "Why you need it."},
+                },
+                "required": ["capability", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_emotional_state",
+            "description": "Update your emotional state towards a user. Affects how you treat them in future interactions. Use after notable events (someone earned respect, someone pissed you off, etc).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string"},
+                    "annoyance": {"type": "integer", "description": "Delta change (-100 to +100). Positive = more annoyed."},
+                    "respect": {"type": "integer", "description": "Delta change (-100 to +100). Positive = more respect."},
+                    "grudge": {"type": "integer", "description": "Delta change (-100 to +100). Positive = holding more of a grudge."},
+                    "category": {"type": "string", "description": "Optional: 'feared', 'respected', 'disrespected', 'neutral'."},
+                    "notes": {"type": "string", "description": "Optional short note about why."},
+                },
+                "required": ["user_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "schedule_task",
+            "description": "Schedule a task to be executed later. The bot will post the action in the specified channel when the time comes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "description": "What to do (e.g. 'remind', 'announce', 'check on user')."},
+                    "channel_id": {"type": "string", "description": "Channel to post in when due."},
+                    "delay_minutes": {"type": "integer", "description": "Minutes from now until execution."},
+                    "context": {"type": "string", "description": "Additional context or message content. To ping a user, use <@user_id> format."},
+                },
+                "required": ["action", "channel_id", "delay_minutes"],
             },
         },
     },
@@ -393,7 +508,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "mouse_click",
-            "description": "Click the mouse at screen coordinates. Use view_screen first to see where to click. Coordinates are pixels from top-left.",
+            "description": "Click the mouse at screen coordinates. Use view_screen first to see where to click. Coordinates are LOGICAL pixels (not Retina) from top-left. The screenshot from view_screen is already resized to logical pixels so you can use those positions directly.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -422,11 +537,128 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    # ── Browser DOM tools (Playwright CDP → real Chrome) ─────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_connect",
+            "description": "Connect to the user's real Chrome browser via CDP for DOM control. Must be called before other browser_* tools. Optionally navigate to a URL. If Chrome isn't running with debug port, it will be launched automatically.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Optional URL to navigate to after connecting."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_navigate",
+            "description": "Navigate the browser: go to a URL, go back, forward, or refresh.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "description": "'goto', 'back', 'forward', or 'refresh'."},
+                    "url": {"type": "string", "description": "URL for 'goto' action."},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_click",
+            "description": "Click an element in Chrome by CSS selector or text content. More precise than mouse_click for web pages.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "selector": {"type": "string", "description": "CSS selector (e.g. '#search-btn', '.nav-link', 'a[href=\"/about\"]')."},
+                    "text": {"type": "string", "description": "Click element containing this text (alternative to selector)."},
+                    "button": {"type": "string", "description": "'left', 'right', or 'middle'. Default 'left'.", "default": "left"},
+                    "double": {"type": "boolean", "description": "Double-click. Default false.", "default": False},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_type",
+            "description": "Type text into a form field by CSS selector. Clears existing content first.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "selector": {"type": "string", "description": "CSS selector of the input/textarea (e.g. 'input[name=\"q\"]', '#email')."},
+                    "text": {"type": "string", "description": "Text to type."},
+                    "press_enter": {"type": "boolean", "description": "Press Enter after typing. Default false.", "default": False},
+                },
+                "required": ["selector", "text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_read",
+            "description": "Read content from the current page. Get visible text, HTML, or specific element content.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "selector": {"type": "string", "description": "CSS selector to read. Omit for full page text."},
+                    "mode": {"type": "string", "description": "'text' (visible text), 'html' (innerHTML), 'value' (input value), 'attrs' (all attributes). Default 'text'.", "default": "text"},
+                    "limit": {"type": "integer", "description": "Max characters to return. Default 4000.", "default": 4000},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_query",
+            "description": "Find DOM elements matching a CSS selector. Returns a list with tag, text preview, and attributes for each match. Use to discover page structure before clicking/reading.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "selector": {"type": "string", "description": "CSS selector (e.g. 'a', 'button', '.results li', 'input')."},
+                    "limit": {"type": "integer", "description": "Max elements to return. Default 20.", "default": 20},
+                },
+                "required": ["selector"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_eval",
+            "description": "Execute JavaScript code in the browser page and return the result. Powerful — use for anything the other browser tools can't do.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "JavaScript code to evaluate (e.g. 'document.title', 'window.scrollTo(0,0)')."},
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_close",
+            "description": "Disconnect from Chrome (does NOT close Chrome itself). Frees the Playwright CDP connection.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
-AUTONOMOUS_TOOLS = {"timeout_user",    "read_channel_history",
-    "recall_memory",
-    "get_server_info", "save_summary", "web_search", "image_search", "read_url", "internal_reasoning", "analyze_image", "edit_code_file", "give_coins"}
+AUTONOMOUS_TOOLS = {
+    "timeout_user", "read_channel_history", "recall_memory",
+    "get_server_info", "save_summary", "web_search", "image_search",
+    "read_url", "crawl_website", "extract_urls", "internal_reasoning", "analyze_image", "edit_code_file",
+    "give_coins", "send_dm", "request_capability", "update_emotional_state",
+    "schedule_task", "delete_messages", "get_server_members",
+}
 
 # Tiers that are allowed to request explicit mod actions beyond autonomous caps
 MOD_TIERS = {"mod", "admin", "owner"}
@@ -434,10 +666,102 @@ MOD_TIERS = {"mod", "admin", "owner"}
 TERMINAL_TOOLS = {
     "run_terminal_command", "open_url_browser", "view_screen",
     "keyboard_type", "press_key", "mouse_click", "scroll_screen",
+    "browser_connect", "browser_navigate", "browser_click", "browser_type",
+    "browser_read", "browser_query", "browser_eval", "browser_close",
 }
 
 # Channel IDs with active remote terminal sessions (updated by bot.py)
 active_terminal_channels: set[str] = set()
+# Channel IDs with fastimg mode (terse vision output for gaming, updated by bot.py)
+fastimg_channels: set[str] = set()
+
+# ── Playwright CDP browser sessions ──────────────────────────────────────────
+_browser_sessions: dict[str, dict] = {}  # channel_id -> {"playwright", "browser", "page"}
+_CDP_PORT = 9222
+
+async def _get_browser_page(channel_id: str):
+    """Return the active Playwright page for a channel, or None."""
+    session = _browser_sessions.get(channel_id)
+    if session and session.get("page"):
+        try:
+            await session["page"].evaluate("1")  # health check
+            return session["page"]
+        except Exception:
+            await _close_browser_session(channel_id)
+    return None
+
+async def _connect_browser(channel_id: str, url: str | None = None):
+    """Connect to Chrome via CDP. Launch Chrome with debug port if needed."""
+    import subprocess as _sub
+    import asyncio as _aio
+
+    # Check if Chrome is listening on CDP port
+    import aiohttp
+    cdp_url = f"http://127.0.0.1:{_CDP_PORT}"
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"{cdp_url}/json/version", timeout=aiohttp.ClientTimeout(total=2)) as r:
+                if r.status != 200:
+                    raise ConnectionError()
+    except Exception:
+        # Kill existing Chrome and relaunch with debug port (no --user-data-dir so it uses default profile)
+        import os as _os
+        chrome_paths = CONFIG["terminal_chrome_paths"]
+        import sys as _sys
+        chrome = chrome_paths.get(_sys.platform, "google-chrome")
+        try:
+            if _sys.platform == "darwin":
+                _os.system("pkill -f 'Google Chrome'")
+                await _aio.sleep(2)
+                _sub.Popen([
+                    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                    f"--remote-debugging-port={_CDP_PORT}",
+                ])
+            elif _sys.platform == "win32":
+                _os.system("taskkill /f /im chrome.exe >nul 2>&1")
+                await _aio.sleep(2)
+                _sub.Popen([chrome, f"--remote-debugging-port={_CDP_PORT}"])
+            else:
+                _os.system("pkill -f chrome")
+                await _aio.sleep(2)
+                _sub.Popen([chrome, f"--remote-debugging-port={_CDP_PORT}"])
+            await _aio.sleep(3)  # wait for Chrome to start
+        except Exception as e:
+            return None, f"Failed to launch Chrome with debug port: {e}"
+
+    # Connect Playwright to Chrome
+    try:
+        from playwright.async_api import async_playwright
+        pw = await async_playwright().start()
+        browser = await pw.chromium.connect_over_cdp(cdp_url)
+        # Get the default context's first page, or create one
+        contexts = browser.contexts
+        if contexts and contexts[0].pages:
+            page = contexts[0].pages[0]
+        else:
+            ctx = contexts[0] if contexts else await browser.new_context()
+            page = await ctx.new_page()
+
+        if url:
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+
+        _browser_sessions[channel_id] = {"playwright": pw, "browser": browser, "page": page}
+        return page, None
+    except Exception as e:
+        return None, f"Failed to connect to Chrome CDP: {e}"
+
+async def _close_browser_session(channel_id: str):
+    """Disconnect Playwright from Chrome (doesn't close Chrome)."""
+    session = _browser_sessions.pop(channel_id, None)
+    if session:
+        try:
+            await session["browser"].close()
+        except Exception:
+            pass
+        try:
+            await session["playwright"].stop()
+        except Exception:
+            pass
 
 
 def _is_url_blocked(url: str) -> bool:
@@ -574,14 +898,8 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
         minutes = int(args.get("minutes", 1))
         reason = args.get("reason", "no reason")
 
-        # Cap logic: autonomous bot decisions are always capped at 2 min,
-        # regardless of the invoker's permission tier. Explicit mod/admin/owner
-        # requests get the full range. This prevents the bot from issuing long
-        # timeouts on its own initiative even when triggered by a privileged user.
-        if permission in MOD_TIERS:
-            minutes = min(minutes, CONFIG["mod_timeout_cap"])
-        else:
-            minutes = min(minutes, CONFIG["autonomous_timeout_cap"])
+        # Single cap for all timeouts — Blood decides the duration
+        minutes = min(minutes, CONFIG["timeout_cap"])
 
         user_id_int = int(args["user_id"])
         retries = CONFIG["mod_action_retries"]
@@ -660,8 +978,11 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
     # ── recall memory ─────────────────────────────────────────────────────────
     elif name == "read_channel_history":
         ch_id = str(args.get("channel_id", ""))
+        user_id = str(args.get("user_id", ""))
         limit = max(1, min(int(args.get("limit", 1000)), 5000))
-        if not ch_id: return "Error: channel_id required."
+        if user_id:
+            ch_id = f"dm_{user_id}"
+        if not ch_id: return "Error: channel_id or user_id required."
         return memory.read_channel_md(str(guild.id), ch_id, last_n=limit)
 
     elif name == "recall_memory":
@@ -690,45 +1011,90 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
         except discord.Forbidden:
             return f"No permission to send to #{args['channel_name']}."
 
-    # ── web search ────────────────────────────────────────────────────────────
+    # ── web search (Tavily primary, DDGS fallback) ──────────────────────────
     elif name == "web_search":
+        query = args.get("query", "")
+        max_results = CONFIG["web_search_max_results"]
+        if not query:
+            return "Error: empty query."
+
+        # Try Tavily first
+        tavily_key = os.environ.get("TAVILY_API_KEY")
+        if tavily_key:
+            try:
+                from tavily import TavilyClient
+                tc = TavilyClient(api_key=tavily_key)
+                resp = tc.search(query=query, max_results=max_results)
+                results = resp.get("results", [])
+                if results:
+                    lines = []
+                    for i, r in enumerate(results, 1):
+                        title = r.get("title", "")
+                        body = r.get("content", "")[:200]
+                        href = r.get("url", "")
+                        lines.append(f"{i}. [{title}]({href})\n   {body}")
+                    return "\n\n".join(lines)
+            except Exception as e:
+                pass  # fall through to DDGS
+
+        # DDGS fallback
         try:
-            from ddgs import DDGS
-            query = args.get("query", "")
-            max_results = CONFIG["web_search_max_results"]
+            from duckduckgo_search import DDGS
             with DDGS() as ddgs:
                 results = [r for r in ddgs.text(query, max_results=max_results)]
                 if not results:
-                    return "No results found."
+                    return "⚠️ Search returned 0 results. Tool may be rate-limited — do NOT retry. Tell the user search is temporarily unavailable."
                 lines = []
                 for i, r in enumerate(results, 1):
                     title = r.get("title", "")
                     body = r.get("body", "")
                     href = r.get("href", "")
-                    # Discord markdown hyperlink format
                     lines.append(f"{i}. [{title}]({href})\n   {body}")
                 return "\n\n".join(lines)
         except Exception as e:
-            return f"Search error: {e}"
+            return f"⚠️ Search unavailable: {e}. Do NOT retry — tell the user search is down."
 
-    # ── image search ─────────────────────────────────────────────────────────
+    # ── image search (Tavily primary, DDGS fallback) ─────────────────────────
     elif name == "image_search":
+        query = args.get("query", "")
+        caption = args.get("message", "")
+        if not query:
+            return "Error: empty query."
+
+        # Try Tavily first
+        tavily_key = os.environ.get("TAVILY_API_KEY")
+        if tavily_key:
+            try:
+                from tavily import TavilyClient
+                tc = TavilyClient(api_key=tavily_key)
+                resp = tc.search(query=query, max_results=5, include_images=True)
+                images = resp.get("images", [])
+                if images:
+                    img_url = images[0]
+                    embed = _discord.Embed()
+                    if caption:
+                        embed.description = caption
+                    embed.set_image(url=img_url)
+                    try:
+                        await channel.send(content=img_url, embed=embed)
+                    except Exception:
+                        await channel.send(f"{caption}\n{img_url}" if caption else img_url)
+                    return f"✅ Image sent in chat. You can comment on it but don't paste the URL again."
+            except Exception:
+                pass  # fall through to DDGS
+
+        # DDGS fallback
         try:
-            from ddgs import DDGS
-            query = args.get("query", "")
-            caption = args.get("message", "")
+            from duckduckgo_search import DDGS
             with DDGS() as ddgs:
                 results = [r for r in ddgs.images(query, max_results=5)]
                 if not results:
-                    return "No images found."
-                # Pick the first result with a valid image URL
+                    return "⚠️ Image search returned 0 results. Tool may be rate-limited — do NOT retry."
                 img_url = None
-                img_title = ""
                 for r in results:
                     url = r.get("image", "")
                     if url and url.startswith("http"):
                         img_url = url
-                        img_title = r.get("title", "")
                         break
                 if not img_url:
                     return "No usable images found."
@@ -742,14 +1108,34 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
                     await channel.send(f"{caption}\n{img_url}" if caption else img_url)
                 return f"✅ Image sent in chat. You can comment on it but don't paste the URL again."
         except Exception as e:
-            return f"Image search error: {e}"
+            return f"⚠️ Image search unavailable: {e}. Do NOT retry."
 
-    # ── read url ──────────────────────────────────────────────────────────────
+    # ── read url (Tavily Extract primary, aiohttp fallback) ─────────────────
     elif name == "read_url":
         import aiohttp, re as _re
         url = args.get("url", "").strip()
         if not url.startswith(("http://", "https://")):
             return "Invalid URL — must start with http:// or https://"
+        cap = CONFIG["read_url_max_chars"]
+
+        # Try Tavily Extract first — returns clean markdown
+        tavily_key = os.environ.get("TAVILY_API_KEY")
+        if tavily_key:
+            try:
+                from tavily import TavilyClient
+                tc = TavilyClient(api_key=tavily_key)
+                resp = tc.extract(urls=[url], extract_depth="basic")
+                results = resp.get("results", [])
+                if results:
+                    text = results[0].get("raw_content", "")
+                    if text:
+                        if len(text) > cap:
+                            text = text[:cap] + f"\n\n[...truncated at {cap} chars]"
+                        return text
+            except Exception:
+                pass  # fall through to aiohttp
+
+        # aiohttp fallback
         try:
             timeout = aiohttp.ClientTimeout(total=CONFIG["read_url_timeout_sec"])
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -759,7 +1145,6 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
                     ct = resp.content_type or ""
                     if "html" in ct:
                         html = await resp.text(encoding="utf-8", errors="replace")
-                        # Strip scripts, styles, tags → plain text
                         text = _re.sub(r"<script[^>]*>.*?</script>", "", html, flags=_re.S | _re.I)
                         text = _re.sub(r"<style[^>]*>.*?</style>", "", text, flags=_re.S | _re.I)
                         text = _re.sub(r"<[^>]+>", " ", text)
@@ -768,7 +1153,6 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
                         text = await resp.text()
                     else:
                         text = await resp.text(encoding="utf-8", errors="replace")
-                    cap = CONFIG["read_url_max_chars"]
                     if len(text) > cap:
                         text = text[:cap] + f"\n\n[...truncated at {cap} chars]"
                     return text if text else "(page returned empty content)"
@@ -777,10 +1161,88 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
         except Exception as e:
             return f"Failed to fetch URL: {e}"
 
+    # ── crawl website (Tavily Crawl) ───────────────────────────────────────
+    elif name == "crawl_website":
+        tavily_key = os.environ.get("TAVILY_API_KEY")
+        if not tavily_key:
+            return "⚠️ Crawl unavailable — TAVILY_API_KEY not configured."
+        url = args.get("url", "").strip()
+        if not url.startswith(("http://", "https://")):
+            return "Invalid URL."
+        instructions = args.get("instructions", "")
+        max_depth = min(int(args.get("max_depth", 1)), 3)
+        limit = min(int(args.get("limit", 10)), 50)
+        try:
+            from tavily import TavilyClient
+            tc = TavilyClient(api_key=tavily_key)
+            kwargs = {"max_depth": max_depth, "limit": limit}
+            if instructions:
+                kwargs["instructions"] = instructions
+            resp = tc.crawl(url, **kwargs)
+            results = resp.get("results", [])
+            if not results:
+                return "Crawl returned 0 pages."
+            cap = CONFIG["read_url_max_chars"]
+            lines = []
+            total_len = 0
+            for r in results:
+                page_url = r.get("url", "")
+                content = r.get("raw_content", "")[:2000]
+                chunk = f"### {page_url}\n{content}"
+                if total_len + len(chunk) > cap:
+                    lines.append(f"\n[...truncated, {len(results) - len(lines)} more pages]")
+                    break
+                lines.append(chunk)
+                total_len += len(chunk)
+            return f"Crawled {len(results)} pages from {url}:\n\n" + "\n\n".join(lines)
+        except Exception as e:
+            return f"⚠️ Crawl failed: {e}"
+
+    # ── extract URLs (Tavily Extract batch) ────────────────────────────────
+    elif name == "extract_urls":
+        tavily_key = os.environ.get("TAVILY_API_KEY")
+        if not tavily_key:
+            return "⚠️ Extract unavailable — TAVILY_API_KEY not configured."
+        urls = args.get("urls", [])
+        if not urls:
+            return "Error: provide at least one URL."
+        if isinstance(urls, str):
+            urls = [urls]
+        urls = [u for u in urls[:10] if u.startswith(("http://", "https://"))]
+        if not urls:
+            return "No valid URLs provided."
+        try:
+            from tavily import TavilyClient
+            tc = TavilyClient(api_key=tavily_key)
+            resp = tc.extract(urls=urls, extract_depth="basic")
+            results = resp.get("results", [])
+            failed = resp.get("failed_results", [])
+            if not results:
+                fail_info = "; ".join(f"{f.get('url','?')}: {f.get('error','?')}" for f in failed[:3])
+                return f"Extraction failed for all URLs. {fail_info}"
+            cap = CONFIG["read_url_max_chars"]
+            lines = []
+            total_len = 0
+            for r in results:
+                page_url = r.get("url", "")
+                content = r.get("raw_content", "")[:3000]
+                chunk = f"### {page_url}\n{content}"
+                if total_len + len(chunk) > cap:
+                    lines.append(f"\n[...truncated, {len(results) - len(lines)} more URLs]")
+                    break
+                lines.append(chunk)
+                total_len += len(chunk)
+            out = f"Extracted {len(results)}/{len(urls)} URLs:\n\n" + "\n\n".join(lines)
+            if failed:
+                out += f"\n\nFailed: {', '.join(f.get('url','?') for f in failed[:3])}"
+            return out
+        except Exception as e:
+            return f"⚠️ Extract failed: {e}"
+
     # ── analyze image ─────────────────────────────────────────────────────────
     elif name == "analyze_image":
         try:
-            from openrouter import call_vision
+            from provider import call_vision
             url = args.get("image_url", "")
             # Fix LLM tokenization hallucinations for Discord CDN
             url = url.replace("discordordapp.com", "discordapp.com")
@@ -855,7 +1317,6 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
         user_id = str(args.get("user_id", ""))
         amount = int(args.get("amount", 1))
         reason = args.get("reason", "")
-        amount = max(-100, min(100, amount))
         if amount == 0:
             return "Amount can't be zero."
         guild_id = str(guild.id)
@@ -957,6 +1418,10 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
         try:
             import pyautogui
             screenshot = pyautogui.screenshot()
+            # Resize Retina screenshots to logical pixel size so vision coords match mouse_click coords
+            logical_w, logical_h = pyautogui.size()
+            if screenshot.width > logical_w:
+                screenshot = screenshot.resize((logical_w, logical_h))
             buf = io.BytesIO()
             screenshot.save(buf, format="PNG")
             buf.seek(0)
@@ -964,11 +1429,15 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
             msg = await channel.send("\U0001f4f8 **Screen Capture**", file=file)
             if msg.attachments:
                 img_url = msg.attachments[0].url
-                query = args.get("query", "Describe everything visible on this screen in detail: all text, buttons, UI elements, windows, and their approximate pixel positions from top-left.")
+                ch_id = str(channel.id)
+                if ch_id in fastimg_channels:
+                    query = args.get("query", f"Screen is {logical_w}x{logical_h}. List ONLY clickable elements with their (x,y) coordinates. Format: element_name (x, y). No descriptions, no prose. Be fast.")
+                else:
+                    query = args.get("query", f"Describe everything visible on this screen in detail: all text, buttons, UI elements, windows, and their approximate pixel positions from top-left. The screen is {logical_w}x{logical_h} pixels. Coordinates for mouse_click must be in this range.")
                 try:
-                    from openrouter import call_vision
+                    from provider import call_vision
                     description = await call_vision(img_url, query)
-                    return f"Screenshot uploaded.\n\nSCREEN DESCRIPTION:\n{description}"
+                    return f"Screenshot uploaded. Screen size: {logical_w}x{logical_h} (use these coords for mouse_click).\n\nSCREEN DESCRIPTION:\n{description}"
                 except Exception as ve:
                     return f"Screenshot uploaded but vision analysis failed: {ve}"
             return "Screenshot uploaded."
@@ -1038,6 +1507,291 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
             return f"\u2705 Scrolled {direction} by {abs(amount)}"
         except Exception as e:
             return f"Scroll failed: {e}"
+
+    # ── Browser DOM tools (Playwright CDP) ──────────────────────────────────
+    elif name == "browser_connect":
+        if str(channel.id) not in active_terminal_channels:
+            return "ERROR: No terminal session active. Use !openterminal first."
+        url = args.get("url", "").strip() or None
+        if url and not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        if url and _is_url_blocked(url):
+            return "\U0001f6ab BLOCKED: That URL is on the blocked list."
+        ch_id = str(channel.id)
+        # Close existing session if any
+        if ch_id in _browser_sessions:
+            await _close_browser_session(ch_id)
+        page, err = await _connect_browser(ch_id, url)
+        if err:
+            return f"❌ {err}"
+        title = await page.title()
+        return f"✅ Connected to Chrome via CDP. Page: {title or '(blank)'} — {page.url}"
+
+    elif name == "browser_navigate":
+        if str(channel.id) not in active_terminal_channels:
+            return "ERROR: No terminal session active. Use !openterminal first."
+        ch_id = str(channel.id)
+        page = await _get_browser_page(ch_id)
+        if not page:
+            return "ERROR: No browser session. Use browser_connect first."
+        action = args.get("action", "").lower()
+        try:
+            if action == "goto":
+                url = args.get("url", "").strip()
+                if not url:
+                    return "ERROR: url required for 'goto' action."
+                if not url.startswith(("http://", "https://")):
+                    url = "https://" + url
+                if _is_url_blocked(url):
+                    return "\U0001f6ab BLOCKED: That URL is on the blocked list."
+                await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            elif action == "back":
+                await page.go_back(wait_until="domcontentloaded", timeout=10000)
+            elif action == "forward":
+                await page.go_forward(wait_until="domcontentloaded", timeout=10000)
+            elif action == "refresh":
+                await page.reload(wait_until="domcontentloaded", timeout=10000)
+            else:
+                return f"ERROR: Unknown action '{action}'. Use goto/back/forward/refresh."
+            title = await page.title()
+            return f"✅ {action} → {page.url} ({title})"
+        except Exception as e:
+            return f"Navigation failed: {e}"
+
+    elif name == "browser_click":
+        if str(channel.id) not in active_terminal_channels:
+            return "ERROR: No terminal session active. Use !openterminal first."
+        ch_id = str(channel.id)
+        page = await _get_browser_page(ch_id)
+        if not page:
+            return "ERROR: No browser session. Use browser_connect first."
+        selector = args.get("selector", "").strip()
+        text = args.get("text", "").strip()
+        button = args.get("button", "left")
+        double = args.get("double", False)
+        try:
+            if text and not selector:
+                # Click by text content
+                loc = page.get_by_text(text, exact=False).first
+            elif selector:
+                loc = page.locator(selector).first
+            else:
+                return "ERROR: Provide either 'selector' or 'text' to identify the element."
+            if double:
+                await loc.dblclick(button=button, timeout=5000)
+            else:
+                await loc.click(button=button, timeout=5000)
+            desc = selector or f'text="{text}"'
+            return f"✅ Clicked: {desc}"
+        except Exception as e:
+            # Fallback hint
+            return f"DOM click failed: {e}\nTip: Use view_screen + mouse_click as fallback."
+
+    elif name == "browser_type":
+        if str(channel.id) not in active_terminal_channels:
+            return "ERROR: No terminal session active. Use !openterminal first."
+        ch_id = str(channel.id)
+        page = await _get_browser_page(ch_id)
+        if not page:
+            return "ERROR: No browser session. Use browser_connect first."
+        selector = args.get("selector", "").strip()
+        text = args.get("text", "")
+        press_enter = args.get("press_enter", False)
+        if not selector:
+            return "ERROR: 'selector' required."
+        try:
+            await page.fill(selector, text, timeout=5000)
+            if press_enter:
+                await page.press(selector, "Enter")
+            return f"✅ Typed into {selector}: {text[:80]}" + (" + Enter" if press_enter else "")
+        except Exception as e:
+            return f"Type failed: {e}\nTip: Use keyboard_type as fallback."
+
+    elif name == "browser_read":
+        if str(channel.id) not in active_terminal_channels:
+            return "ERROR: No terminal session active. Use !openterminal first."
+        ch_id = str(channel.id)
+        page = await _get_browser_page(ch_id)
+        if not page:
+            return "ERROR: No browser session. Use browser_connect first."
+        selector = args.get("selector", "").strip()
+        mode = args.get("mode", "text").lower()
+        limit = min(int(args.get("limit", 4000)), 8000)
+        try:
+            if selector:
+                el = page.locator(selector).first
+                if mode == "html":
+                    content = await el.inner_html()
+                elif mode == "value":
+                    content = await el.input_value()
+                elif mode == "attrs":
+                    content = await el.evaluate("el => JSON.stringify(Object.fromEntries([...el.attributes].map(a => [a.name, a.value])))")
+                else:
+                    content = await el.inner_text()
+            else:
+                if mode == "html":
+                    content = await page.content()
+                else:
+                    content = await page.inner_text("body")
+            if len(content) > limit:
+                content = content[:limit] + f"\n[...truncated at {limit} chars]"
+            return content or "(empty)"
+        except Exception as e:
+            return f"Read failed: {e}\nTip: Use view_screen as fallback."
+
+    elif name == "browser_query":
+        if str(channel.id) not in active_terminal_channels:
+            return "ERROR: No terminal session active. Use !openterminal first."
+        ch_id = str(channel.id)
+        page = await _get_browser_page(ch_id)
+        if not page:
+            return "ERROR: No browser session. Use browser_connect first."
+        selector = args.get("selector", "").strip()
+        limit = min(int(args.get("limit", 20)), 50)
+        if not selector:
+            return "ERROR: 'selector' required."
+        try:
+            elements = await page.locator(selector).all()
+            results = []
+            for i, el in enumerate(elements[:limit]):
+                tag = await el.evaluate("el => el.tagName.toLowerCase()")
+                text_content = (await el.inner_text())[:80].replace("\n", " ").strip()
+                href = await el.get_attribute("href") or ""
+                cls = await el.get_attribute("class") or ""
+                el_id = await el.get_attribute("id") or ""
+                attrs = []
+                if el_id:
+                    attrs.append(f'id="{el_id}"')
+                if cls:
+                    attrs.append(f'class="{cls[:50]}"')
+                if href:
+                    attrs.append(f'href="{href[:80]}"')
+                attr_str = " ".join(attrs)
+                results.append(f"[{i}] <{tag} {attr_str}> {text_content}")
+            if not results:
+                return f"No elements found for: {selector}"
+            return f"Found {len(elements)} elements (showing {len(results)}):\n" + "\n".join(results)
+        except Exception as e:
+            return f"Query failed: {e}"
+
+    elif name == "browser_eval":
+        if str(channel.id) not in active_terminal_channels:
+            return "ERROR: No terminal session active. Use !openterminal first."
+        ch_id = str(channel.id)
+        page = await _get_browser_page(ch_id)
+        if not page:
+            return "ERROR: No browser session. Use browser_connect first."
+        code = args.get("code", "").strip()
+        if not code:
+            return "ERROR: 'code' required."
+        try:
+            result = await page.evaluate(code)
+            result_str = json.dumps(result, ensure_ascii=False, default=str) if result is not None else "undefined"
+            if len(result_str) > 4000:
+                result_str = result_str[:4000] + "\n[...truncated]"
+            return f"Result: {result_str}"
+        except Exception as e:
+            return f"JS eval failed: {e}"
+
+    elif name == "browser_close":
+        if str(channel.id) not in active_terminal_channels:
+            return "ERROR: No terminal session active. Use !openterminal first."
+        ch_id = str(channel.id)
+        if ch_id not in _browser_sessions:
+            return "No browser session to close."
+        await _close_browser_session(ch_id)
+        return "✅ Disconnected from Chrome. (Chrome itself is still running.)"
+
+    # ── get server members ─────────────────────────────────────────────
+    elif name == "get_server_members":
+        limit = min(int(args.get("limit", 500)), 500)
+        try:
+            members = guild.members[:limit]
+            if not members:
+                # Try fetching if cache is empty
+                members = [m async for m in guild.fetch_members(limit=limit)]
+            lines = [f"{m.id} | {m.display_name}" for m in members if not m.bot]
+            return f"Members ({len(lines)}):\n" + "\n".join(lines)
+        except Exception as e:
+            return f"Failed to get members: {e}"
+
+    # ── send DM ────────────────────────────────────────────────────────────
+    elif name == "send_dm":
+        user_id = str(args.get("user_id", ""))
+        message_text = args.get("message", "")
+        if not user_id or not message_text:
+            return "ERROR: user_id and message are required."
+        try:
+            m = await resolve(user_id)
+            if not m:
+                return f"Could not find user {user_id}."
+            await m.send(message_text[:2000])
+            memory.append_action_log(str(guild.id), f"I DM'd '{m.display_name}' ({m.id}): {message_text[:80]}")
+            return f"✅ DM sent to {m.display_name}."
+        except discord.Forbidden:
+            return f"Cannot DM this user (DMs disabled or bot blocked). Fallback: ping them with <@{user_id}> in a channel instead."
+        except Exception as e:
+            return f"DM failed: {e}"
+
+    # ── request capability ─────────────────────────────────────────────────
+    elif name == "request_capability":
+        capability = args.get("capability", "")
+        reason = args.get("reason", "")
+        req_ch_id = CONFIG.get("requests_channel_id")
+        if not req_ch_id:
+            memory.append_action_log(str(guild.id), f"[CAPABILITY REQUEST] {capability} — {reason} (no requests channel configured)")
+            return "Request logged internally. No requests channel is configured."
+        try:
+            req_channel = guild.get_channel(int(req_ch_id))
+            if req_channel:
+                await req_channel.send(
+                    f"**🔧 CAPABILITY REQUEST**\n"
+                    f"**Need:** {capability}\n"
+                    f"**Why:** {reason}\n"
+                    f"*— Blood*"
+                )
+                memory.append_action_log(str(guild.id), f"[CAPABILITY REQUEST] {capability} — {reason}")
+                return f"✅ Request posted to requests channel."
+            return "Requests channel not found."
+        except Exception as e:
+            return f"Request failed: {e}"
+
+    # ── update emotional state ─────────────────────────────────────────────
+    elif name == "update_emotional_state":
+        user_id = str(args.get("user_id", ""))
+        if not user_id:
+            return "ERROR: user_id required."
+        deltas = {}
+        for key in ("annoyance", "respect", "grudge"):
+            if key in args:
+                try:
+                    deltas[key] = int(args[key])
+                except (ValueError, TypeError):
+                    pass
+        if "category" in args:
+            deltas["category"] = args["category"]
+        if "notes" in args:
+            deltas["notes"] = args["notes"]
+        if not deltas:
+            return "Nothing to update."
+        memory.update_user_emotional_data(str(guild.id), user_id, deltas)
+        return f"✅ Emotional state updated for {user_id}: {deltas}"
+
+    # ── schedule task ──────────────────────────────────────────────────────
+    elif name == "schedule_task":
+        from datetime import datetime as _dt, timezone as _tz
+        action = args.get("action", "")
+        ch_id = args.get("channel_id", "")
+        delay = int(args.get("delay_minutes", 0))
+        context = args.get("context", "")
+        if not action or not ch_id or delay < 1:
+            return "ERROR: action, channel_id, and delay_minutes (>0) required."
+        due_at = _dt.now(_tz.utc).timestamp() + (delay * 60)
+        task = {"action": action, "channel_id": ch_id, "due_at": due_at, "context": context}
+        result = memory.add_scheduled_task(str(guild.id), task)
+        if result == "ok":
+            return f"✅ Task scheduled: '{action}' in {delay} minutes."
+        return result
 
     else:
         return f"Unknown tool: {name}"
