@@ -234,6 +234,7 @@ class MemoryManager:
         entry = f"\n[{_now_str()}] {text.strip()}\n"
         with open(path, "a", encoding="utf-8") as f:
             f.write(entry)
+        self.vector_add(guild_id, entry.strip(), {"source": "summary"})
 
     # ── Per-server personality config ──────────────────────────────────────────
 
@@ -509,6 +510,13 @@ class MemoryManager:
         root = self._load_xml(guild_id)
         self._upsert_user(root.find("users"), user_id, username)
         self._save_xml(guild_id, root)
+        # Index into vector memory for semantic search
+        if len(content) > 15:
+            line = f"[{_now_str()}] #{channel} {username}: {content[:300]}"
+            self.vector_add(guild_id, line, {
+                "source": "channel", "channel_id": channel_id or "unknown",
+                "user_id": user_id, "username": username,
+            })
 
     def record_interaction(self, guild_id: str,
                            user_a_id: str, user_a_name: str,
@@ -749,3 +757,223 @@ class MemoryManager:
         if due:
             self.save_scheduled_tasks(guild_id, remaining)
         return due
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # VECTOR MEMORY — semantic search via sentence-transformers + ChromaDB
+    # ══════════════════════════════════════════════════════════════════════════
+
+    _vector_ready = False
+    _chroma_client = None
+    _embed_model = None
+
+    def _init_vector(self):
+        """Lazy-init: load the embedding model + ChromaDB on first use."""
+        if self._vector_ready:
+            return True
+        try:
+            import chromadb
+            from chromadb.config import Settings
+            from sentence_transformers import SentenceTransformer
+
+            vector_dir = os.path.join(self.dir, "_vectordb")
+            os.makedirs(vector_dir, exist_ok=True)
+
+            self.__class__._chroma_client = chromadb.PersistentClient(
+                path=vector_dir,
+                settings=Settings(anonymized_telemetry=False),
+            )
+            model_name = CONFIG.get("vector_model", "all-MiniLM-L6-v2")
+            self.__class__._embed_model = SentenceTransformer(model_name)
+            self.__class__._vector_ready = True
+            log.info("Vector memory initialized (model=%s, db=%s)", model_name, vector_dir)
+            return True
+        except Exception as e:
+            log.warning("Vector memory init failed (will use keyword fallback): %s", e)
+            return False
+
+    def _get_collection(self, guild_id: str):
+        """Get or create a ChromaDB collection for a guild."""
+        if not self._vector_ready:
+            return None
+        name = f"guild_{guild_id}"
+        return self._chroma_client.get_or_create_collection(
+            name=name,
+            metadata={"hnsw:space": "cosine"},
+        )
+
+    def vector_add(self, guild_id: str, text: str, metadata: dict | None = None):
+        """Embed and store a single text chunk."""
+        if not self._init_vector():
+            return
+        text = text.strip()
+        if not text or len(text) < 10:
+            return
+        col = self._get_collection(guild_id)
+        if col is None:
+            return
+        # Deterministic ID to avoid duplicates
+        import hashlib
+        doc_id = hashlib.sha256(text.encode()).hexdigest()[:24]
+        meta = metadata or {}
+        meta["timestamp"] = _now_iso()
+        # Truncate text for embedding (model max ~256 tokens ≈ 1000 chars)
+        embed_text = text[:1000]
+        try:
+            embedding = self._embed_model.encode(embed_text).tolist()
+            col.upsert(
+                ids=[doc_id],
+                embeddings=[embedding],
+                documents=[text[:2000]],
+                metadatas=[meta],
+            )
+        except Exception as e:
+            log.warning("Vector add failed: %s", e)
+
+    def vector_search(self, guild_id: str, query: str, n_results: int = 15) -> list[dict]:
+        """Semantic search. Returns [{text, score, metadata}, ...]."""
+        if not self._init_vector():
+            return []
+        col = self._get_collection(guild_id)
+        if col is None:
+            return []
+        try:
+            log.info("\033[36m[VECTOR] Searching: \"%s\" (guild=%s, top=%d)\033[0m", query, guild_id, n_results)
+            embedding = self._embed_model.encode(query[:1000]).tolist()
+            results = col.query(
+                query_embeddings=[embedding],
+                n_results=n_results,
+                include=["documents", "distances", "metadatas"],
+            )
+            hits = []
+            for i, doc in enumerate(results["documents"][0]):
+                distance = results["distances"][0][i]
+                score = 1.0 - distance  # cosine distance → similarity
+                meta = results["metadatas"][0][i] if results["metadatas"] else {}
+                hits.append({"text": doc, "score": score, "metadata": meta})
+            # Log top hits
+            for i, h in enumerate(hits[:5]):
+                src = h['metadata'].get('source', '?')
+                log.info("\033[33m  #%d [%s %.0f%%] %s\033[0m", i+1, src, h['score']*100, h['text'][:120])
+            if len(hits) > 5:
+                log.info("\033[33m  ... +%d more hits\033[0m", len(hits)-5)
+            if not hits:
+                log.info("\033[31m  No vector hits\033[0m")
+            return hits
+        except Exception as e:
+            log.warning("Vector search failed: %s", e)
+            return []
+
+    def vector_index_existing(self, guild_id: str) -> int:
+        """Re-index all existing .md memory files for a guild. Returns count indexed."""
+        if not self._init_vector():
+            return 0
+        count = 0
+
+        # Channel logs
+        channels_dir = os.path.join(self.dir, str(guild_id), "channels")
+        if os.path.isdir(channels_dir):
+            for fname in os.listdir(channels_dir):
+                if not fname.endswith(".md"):
+                    continue
+                ch_id = fname[:-3]
+                fpath = os.path.join(channels_dir, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if len(line) > 15:
+                                self.vector_add(guild_id, line, {"source": "channel", "channel_id": ch_id})
+                                count += 1
+                except Exception:
+                    pass
+
+        # User logs
+        users_dir = os.path.join(self.dir, str(guild_id), "users")
+        if os.path.isdir(users_dir):
+            for fname in os.listdir(users_dir):
+                if not fname.endswith(".md"):
+                    continue
+                uid = fname[:-3]
+                fpath = os.path.join(users_dir, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if len(line) > 15:
+                                self.vector_add(guild_id, line, {"source": "user", "user_id": uid})
+                                count += 1
+                except Exception:
+                    pass
+
+        # Summaries
+        summary_path = _md_path(guild_id, 2)
+        if os.path.exists(summary_path):
+            try:
+                with open(summary_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if len(line) > 15:
+                            self.vector_add(guild_id, line, {"source": "summary"})
+                            count += 1
+            except Exception:
+                pass
+
+        # Actions
+        actions_path = _md_path(guild_id, 3)
+        if os.path.exists(actions_path):
+            try:
+                with open(actions_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if len(line) > 15:
+                            self.vector_add(guild_id, line, {"source": "action"})
+                            count += 1
+            except Exception:
+                pass
+
+        log.info("Vector indexed %d entries for guild %s", count, guild_id)
+        return count
+
+    def hybrid_search(self, guild_id: str, query: str, limit: int = 30,
+                      channel_id: str | None = None,
+                      user_id: str | None = None) -> str:
+        """Hybrid search: vector semantic + keyword, merged and deduped."""
+        log.info("\033[35m[HYBRID] query=\"%s\" limit=%d ch=%s\033[0m", query, limit, channel_id)
+        # 1. Vector results
+        vector_hits = self.vector_search(guild_id, query, n_results=limit)
+        results = []
+        for hit in vector_hits:
+            if hit["score"] >= 0.25:  # minimum relevance threshold
+                src = hit["metadata"].get("source", "?")
+                score_pct = f"{hit['score']:.0%}"
+                results.append(f"[{src} {score_pct}] {hit['text'][:220]}")
+
+        # 2. Keyword results (existing logic)
+        keyword_results = self.search_memory(guild_id, query, limit=limit,
+                                             user_id=user_id, channel_id=channel_id)
+        kw_count = len(keyword_results.split("\n")) if keyword_results and keyword_results != f"Nothing found for '{query}'." else 0
+
+        # 3. Merge: vector first (sorted by relevance), then keyword additions
+        seen_texts = set()
+        merged = []
+        for r in results:
+            # Extract the text portion for dedup
+            text_part = r.split("] ", 1)[-1].strip().lower()[:100]
+            if text_part not in seen_texts:
+                seen_texts.add(text_part)
+                merged.append(r)
+
+        if keyword_results and keyword_results != f"Nothing found for '{query}'.":
+            for line in keyword_results.split("\n"):
+                text_part = line.split("] ", 1)[-1].strip().lower()[:100] if "] " in line else line.strip().lower()[:100]
+                if text_part and text_part not in seen_texts:
+                    seen_texts.add(text_part)
+                    merged.append(line)
+
+        log.info("\033[35m[HYBRID] Results: %d vector (≥25%%), %d keyword, %d merged (deduped)\033[0m",
+                 len(results), kw_count, len(merged))
+
+        if not merged:
+            return f"Nothing found for '{query}'."
+
+        return "\n".join(merged[:limit])

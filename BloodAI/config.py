@@ -73,7 +73,10 @@ CONFIG = {
 
         # ── Admin-only ──
         "send_announcement": ["admin", "owner"],
-        "create_role":       ["admin", "owner"],
+        "manage_role":       ["admin", "owner"],
+        "manage_channel":    ["admin", "owner"],
+        "join_voice":        ["mod", "admin", "owner"],
+        "set_nickname":      ["mod", "admin", "owner"],
 
         # ── Terminal / remote control (admin/owner only) ──
         "run_terminal_command":  ["admin", "owner"],
@@ -123,6 +126,11 @@ CONFIG = {
     "vision_temperature":   0.2,
     "vision_max_tokens":    2000,
 
+    # ── Fast vision model (gaming / fastimg — cheap & fast on Fireworks) ───
+    "fast_vision_model":    "accounts/fireworks/models/qwen3-vl-30b-a3b-instruct",
+    "fast_vision_temp":     0.1,
+    "fast_vision_max_tok":  800,
+
     # ═══════════════════════════════════════════════════════════════════════════
     # 3. BOT BEHAVIOR LIMITS
     # ═══════════════════════════════════════════════════════════════════════════
@@ -162,7 +170,7 @@ CONFIG = {
     # ═══════════════════════════════════════════════════════════════════════════
 
     "memory_days": 1,
-    "memory_dir": "./memory",
+    "memory_dir": os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "memory"),
 
     # Rolling log sizes (lines kept)
     "trim_global_ledger":   80000,      # memory.md

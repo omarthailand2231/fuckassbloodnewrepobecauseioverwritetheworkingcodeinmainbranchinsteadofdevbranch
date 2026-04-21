@@ -40,9 +40,7 @@ memory = MemoryManager()
 
 if discord and commands:
     from discord.ext import tasks
-    intents = discord.Intents.default()
-    intents.message_content = True
-    intents.members = True
+    intents = discord.Intents.all()
     bot = commands.Bot(command_prefix="!", intents=intents)
 else:
     intents = None
@@ -125,6 +123,21 @@ def _compact_history(messages: list[dict],
         c = m.get("content", "")
         if c is None:
             c = ""
+        elif isinstance(c, list):
+            # Multimodal content (text + images) — preserve structure, trim text parts only
+            compacted = []
+            for part in c:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    compacted.append({"type": "text", "text": part.get("text", "")[:CONFIG["compact_content_cap"]]})
+                else:
+                    compacted.append(part)  # keep image_url parts intact
+            m["content"] = compacted
+            msg_len = sum(len(p.get("text", "")) for p in compacted if isinstance(p, dict) and p.get("type") == "text")
+            if used + msg_len > max_chars:
+                continue
+            used += msg_len
+            out.append(m)
+            continue
         elif not isinstance(c, str):
             c = json.dumps(c, ensure_ascii=False)[:CONFIG["compact_non_str_cap"]]
         c = c[:CONFIG["compact_content_cap"]]
@@ -144,6 +157,15 @@ _trace_channel_ctx: str | None = None  # set during on_message to auto-buffer tr
 _fastdebug_msg: dict[str, object] = {}  # channel_id -> discord.Message for live editing
 _cancel_requested: set[str] = set()  # channel_ids where /cancel was issued
 _fastimg_channels: set[str] = set()  # channel_ids with fastimg mode (terse vision for gaming)
+
+# ── Concurrency control ──────────────────────────────────────────────────────
+_active_users: set[str] = set()  # user IDs with an in-flight request
+_channel_locks: dict[str, asyncio.Lock] = {}  # per-channel locks for history safety
+
+def _get_channel_lock(channel_id: str) -> asyncio.Lock:
+    if channel_id not in _channel_locks:
+        _channel_locks[channel_id] = asyncio.Lock()
+    return _channel_locks[channel_id]
 
 async def _push_trace_live(channel_id: str, line: str):
     """Collect trace lines and live-update the fastdebug message."""
@@ -464,35 +486,35 @@ def _terminal_mode_block(channel) -> str:
     ch_id = str(channel.id)
     if ch_id not in active_terminal_channels:
         return ""
-    return """
+    fastimg_on = ch_id in _fastimg_channels
+    mode_note = "\n⚡ FASTIMG MODE ON — Vision uses fast cheap model. Outputs coords only, no descriptions." if fastimg_on else ""
+    return f"""
 
-TERMINAL MODE ACTIVE — You have full control of this computer.
+TERMINAL MODE ACTIVE — You have full control of this computer.{mode_note}
 
-VISION TOOLS (screen-based, works on anything):
-- view_screen: Take a screenshot and get AI description with coordinates. YOUR EYES — call often.
-- mouse_click: Click at (x,y) coordinates from view_screen. Coords are logical pixels (1440x900 on this Mac).
+TOOLS:
+- view_screen: Screenshot + AI vision analysis. YOUR EYES — call often to see what's on screen.
+  {'In fastimg mode: returns ONLY clickable elements with (x,y) coords. Optimised for speed.' if fastimg_on else 'Returns detailed description of everything visible with positions.'}
+- mouse_click: Smoothly glide mouse to (x,y) then click. Duration auto-scales: short distance = fast, long = slow (0.3s–1.5s). Ease in/out.
+- mouse_move: Smoothly move mouse to (x,y) WITHOUT clicking. Use for hovering, aiming, positioning. Same auto-scaling duration.
 - keyboard_type: Type text at cursor position. Click a text field first.
 - press_key: Press keys/combos (enter, tab, ctrl+c, command+space, etc).
-- scroll_screen: Scroll up/down.
+- scroll_screen: Scroll up/down at optional position.
 - run_terminal_command: Execute shell commands.
-- open_url_browser: Open a URL in Chrome (quick launch, no DOM control).
+- open_url_browser: Open a URL in Chrome.
 
-DOM TOOLS (browser-based, surgical precision in Chrome):
-- browser_connect: Connect to Chrome via CDP. MUST call first before other browser_* tools. Auto-launches Chrome if needed.
-- browser_navigate: goto URL, back, forward, refresh.
-- browser_click: Click element by CSS selector or text content. Way more precise than mouse_click for web pages.
-- browser_type: Type into input fields by CSS selector. Clears existing text first.
-- browser_read: Read page text, HTML, input values, or element attributes.
-- browser_query: Find elements by CSS selector — returns tag, text, id, class, href. Use to discover page structure.
-- browser_eval: Run any JavaScript on the page.
-- browser_close: Disconnect from Chrome (doesn't close it).
+MOUSE BEHAVIOUR:
+- Mouse movements are smooth with ease in/out — looks human, not instant teleport.
+- Short moves (~50px) take ~0.3s, long moves (full screen) take ~1.5s.
+- Always use view_screen FIRST to get coordinates, then mouse_click/mouse_move to interact.
+- Coordinates are LOGICAL pixels (1440x900 on this Mac, not Retina).
 
-STRATEGY — PICK THE RIGHT TOOL:
-- For Chrome/web tasks: PREFER DOM tools (browser_*). They're instant, precise, and don't need screenshots.
-  Flow: browser_connect → browser_query to find elements → browser_click/browser_type → browser_read to verify.
-- For desktop/non-browser tasks: Use vision tools (view_screen + mouse_click + keyboard_type).
-- If DOM fails (element not found, dynamic page): Fall back to view_screen + mouse_click.
-- You can MIX both: use browser_read to get page data, then mouse_click for things DOM can't reach.
+STRATEGY:
+1. view_screen to see what's on screen
+2. Identify the target element and its (x,y) position
+3. mouse_click to interact, or mouse_move to hover first
+4. view_screen again to verify the result
+5. Repeat — always re-check after actions
 
 BROWSER: Chrome only. Porn/adult sites are BLOCKED.
 AUTONOMY: You are an autonomous agent. Make decisions and execute multi-step tasks without asking. The user trusts you.
@@ -839,6 +861,16 @@ if bot:
             await terminal_push(g, f"[BOOT] Server: {g.name} | Members: {g.member_count}")
             await terminal_push(g, f"[BOOT] Channels: {len(g.text_channels)} text | {len(g.voice_channels)} voice")
         memory.cleanup_old_entries()
+        # Background vector index for existing memory files (threaded to avoid blocking)
+        async def _bg_vector_index():
+            for g in bot.guilds:
+                try:
+                    count = await asyncio.to_thread(memory.vector_index_existing, str(g.id))
+                    if count > 0:
+                        log.info("Vector indexed %d entries for %s", count, g.name)
+                except Exception as e:
+                    log.warning("Vector indexing failed for %s: %s", g.name, e)
+        asyncio.create_task(_bg_vector_index())
         dashboard_loop.start()
         if CONFIG.get("scheduled_tasks_enabled"):
             scheduled_tasks_loop.start()
@@ -916,6 +948,13 @@ if bot:
                 await message.reply("yeah?")
                 return
 
+            # Per-user concurrency gate for DMs
+            dm_uid = str(message.author.id)
+            if dm_uid in _active_users:
+                await message.reply("i'm still working on your last request. wait.")
+                return
+            _active_users.add(dm_uid)
+
             # DM tools: toggled by config — chat-only or full server tools
             if CONFIG.get("dm_tools_enabled"):
                 dm_allowed_tools = [t for t in get_allowed_tools(perm) if t["function"]["name"] not in TERMINAL_TOOLS]
@@ -982,18 +1021,24 @@ if bot:
             except Exception as e:
                 log.error("DM error: %s", e, exc_info=True)
                 await message.reply("something broke. try again.")
+            finally:
+                _active_users.discard(dm_uid)
             return
 
         channel_id = str(message.channel.id)
 
-        memory.store_message(
-            guild_id=str(guild.id),
-            user_id=str(message.author.id),
-            username=message.author.display_name,
-            content=message.content,
-            channel=message.channel.name,
-            channel_id=str(message.channel.id),
-        )
+        # Skip storing bot commands in memory/vector index
+        _msg_lower = message.content.strip().lower()
+        _skip_prefixes = ("!", "/", "!vsearch", "!vs ", "/vsearch", "/vs ")
+        if not _msg_lower.startswith(_skip_prefixes):
+            memory.store_message(
+                guild_id=str(guild.id),
+                user_id=str(message.author.id),
+                username=message.author.display_name,
+                content=message.content,
+                channel=message.channel.name,
+                channel_id=str(message.channel.id),
+            )
 
         bot_mentioned = bot.user in message.mentions
         if not bot_mentioned:
@@ -1020,6 +1065,12 @@ if bot:
                 return
             recent.append(now)
             _user_requests[uid] = recent
+
+        # ── Per-user concurrency gate (one request at a time) ────────────
+        if uid in _active_users:
+            await message.reply("i'm still working on your last request. wait.")
+            return
+        _active_users.add(uid)
 
         base_content = re.sub(r"<@!?{}>".format(bot.user.id), "", message.content).strip()
 
@@ -1122,15 +1173,23 @@ if bot:
         )
         mention_block = f"MENTIONS:\n{mention_lines}" if mention_lines else "MENTIONS: none"
 
-        tagged_content = (
+        tagged_text = (
             f"[user_id:{message.author.id} name:{message.author.display_name}]\n"
             f"{mention_block}\n"
             f"MESSAGE:\n{content}"
         )
+        # Build multimodal content if images are attached
+        if image_urls:
+            tagged_content = [{"type": "text", "text": tagged_text}]
+            for url in image_urls:
+                tagged_content.append({"type": "image_url", "image_url": {"url": url}})
+        else:
+            tagged_content = tagged_text
         allowed_tools = get_allowed_tools(perm)
 
         try:
-          async with message.channel.typing():
+          async with _get_channel_lock(channel_id):
+           async with message.channel.typing():
             global _trace_channel_ctx
             _trace_channel_ctx = channel_id
             _request_trace.pop(channel_id, None)  # clear previous trace
@@ -1482,6 +1541,8 @@ if bot:
                 await message.reply("something broke internally. try again.")
             except Exception:
                 pass
+        finally:
+            _active_users.discard(uid)
 
         await bot.process_commands(message)
 
@@ -2104,10 +2165,10 @@ if bot:
             await ctx.reply("no.")
             return
         memory._convo_history.clear()
-        memory._summaries.clear()
         memory._ledger_cache.clear()
         memory.file_cache.clear()
         _user_requests.clear()
+        _active_users.clear()
         await ctx.reply("```ansi\n\u001b[1;31m[HARD RESET]\u001b[0m All memory, history, caches, and rate limits wiped.\n```")
         await send_trace_log(ctx.guild, f"[HARD RESET] by {ctx.author.display_name}")
 
@@ -2133,6 +2194,48 @@ if bot:
         else:
             fastimg_channels.add(ch_id)
             await ctx.reply("```fastimg ON — vision will only output clickable coords (gaming mode)```")
+
+    @bot.hybrid_command(name="vsearch", aliases=["vs"], description="Visual vector memory search")
+    async def vsearch_cmd(ctx, *, query: str):
+        perm = get_user_permission(ctx.author)
+        if perm not in ("owner", "admin", "mod"):
+            await ctx.reply("admin/mod only.")
+            return
+        guild_id = str(ctx.guild.id)
+        await ctx.defer()
+
+        hits = memory.vector_search(guild_id, query, n_results=15)
+        if not hits:
+            await ctx.reply("```ansi\n\u001b[1;31m[VSEARCH]\u001b[0m No results.\n```")
+            return
+
+        embed = discord.Embed(
+            title=f"🔍 Vector Search: \"{query[:80]}\"",
+            color=0x7289da,
+            description=f"**{len(hits)}** results from semantic memory",
+        )
+
+        for i, hit in enumerate(hits[:10]):
+            score = hit.get("score", 0)
+            src = hit.get("metadata", {}).get("source", "?")
+            text = hit["text"][:180].replace("\n", " ")
+
+            # Visual score bar
+            filled = round(score * 20)
+            bar = "█" * filled + "░" * (20 - filled)
+            pct = f"{score:.0%}"
+
+            # Source emoji
+            src_emoji = {"channel": "💬", "user": "👤", "action": "⚡", "summary": "📝"}.get(src, "📄")
+
+            embed.add_field(
+                name=f"#{i+1} {src_emoji} {src} — {pct}",
+                value=f"`{bar}` {pct}\n{text}",
+                inline=False,
+            )
+
+        embed.set_footer(text=f"Query: {query[:100]} | Model: all-MiniLM-L6-v2")
+        await ctx.reply(embed=embed)
 
     @bot.event
     async def on_command_error(ctx, error):

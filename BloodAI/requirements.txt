@@ -8,3 +8,5 @@ duckduckgo-search>=5.0
 tavily-python>=0.7
 pyautogui>=0.9
 playwright>=1.40
+chromadb>=1.0
+sentence-transformers>=3.0

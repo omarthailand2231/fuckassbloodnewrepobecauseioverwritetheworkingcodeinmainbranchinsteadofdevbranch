@@ -141,13 +141,13 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "recall_memory",
-            "description": "Search stored chat logs (all channels + DMs) for a keyword. Use for specific facts/names. If you want to know 'what happened' in a channel generally, use read_channel_history instead.",
+            "description": "Semantic + keyword search across all stored chat logs, DMs, summaries, and actions. Understands meaning — not just exact words. Use for facts, names, events, vibes. If you want raw chronological logs, use read_channel_history instead.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "keyword": {"type": "string"},
                     "channel": {"type": ["string", "null"], "description": "Optional channel ID to search."},
-                    "limit":   {"type": "integer", "default": 1000, "description": "Number of matches to return. Search depth up to 5000 messages."},
+                    "limit":   {"type": "integer", "default": 30, "description": "Max results to return (default 30, max 100). Uses semantic ranking."},
                 },
                 "required": ["keyword"],
             },
@@ -208,6 +208,69 @@ TOOL_DEFINITIONS = [
                     "message":      {"type": "string"},
                 },
                 "required": ["channel_name", "message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_role",
+            "description": "Add or remove a role from a user. Can also create a new role if it doesn't exist.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string", "description": "The user to modify."},
+                    "role_name": {"type": "string", "description": "Name of the role to add/remove."},
+                    "action": {"type": "string", "enum": ["add", "remove", "create"], "description": "'add' to assign, 'remove' to strip, 'create' to make a new role."},
+                    "color": {"type": "string", "description": "Hex color for new role (e.g. '#ff0000'). Only used with 'create'.", "default": ""},
+                },
+                "required": ["role_name", "action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_channel",
+            "description": "Create, delete, or rename a text/voice channel.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["create", "delete", "rename"], "description": "What to do."},
+                    "channel_name": {"type": "string", "description": "Name of the channel (existing for delete/rename, new for create)."},
+                    "new_name": {"type": "string", "description": "New name (only for rename action).", "default": ""},
+                    "channel_type": {"type": "string", "enum": ["text", "voice"], "description": "Type of channel to create.", "default": "text"},
+                },
+                "required": ["action", "channel_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "join_voice",
+            "description": "Join or leave a voice channel.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_name": {"type": "string", "description": "Name of the voice channel to join. Use 'leave' to disconnect."},
+                },
+                "required": ["channel_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_nickname",
+            "description": "Change a user's nickname in the server.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string", "description": "The user whose nickname to change."},
+                    "nickname": {"type": "string", "description": "New nickname. Empty string to reset."},
+                },
+                "required": ["user_id", "nickname"],
             },
         },
     },
@@ -524,6 +587,22 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "mouse_move",
+            "description": "Smoothly move the mouse to screen coordinates WITHOUT clicking. Use for hovering, aiming, or positioning before a drag.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "integer", "description": "X coordinate (pixels from left edge)."},
+                    "y": {"type": "integer", "description": "Y coordinate (pixels from top edge)."},
+                    "duration": {"type": "number", "description": "Seconds to glide. Default 0.4. Use 0.1 for fast, 1.0 for slow.", "default": 0.4},
+                },
+                "required": ["x", "y"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "scroll_screen",
             "description": "Scroll the screen. Positive = scroll up, negative = scroll down.",
             "parameters": {
@@ -537,119 +616,9 @@ TOOL_DEFINITIONS = [
             },
         },
     },
-    # ── Browser DOM tools (Playwright CDP → real Chrome) ─────────────────────
-    {
-        "type": "function",
-        "function": {
-            "name": "browser_connect",
-            "description": "Connect to the user's real Chrome browser via CDP for DOM control. Must be called before other browser_* tools. Optionally navigate to a URL. If Chrome isn't running with debug port, it will be launched automatically.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "Optional URL to navigate to after connecting."},
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "browser_navigate",
-            "description": "Navigate the browser: go to a URL, go back, forward, or refresh.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "description": "'goto', 'back', 'forward', or 'refresh'."},
-                    "url": {"type": "string", "description": "URL for 'goto' action."},
-                },
-                "required": ["action"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "browser_click",
-            "description": "Click an element in Chrome by CSS selector or text content. More precise than mouse_click for web pages.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "selector": {"type": "string", "description": "CSS selector (e.g. '#search-btn', '.nav-link', 'a[href=\"/about\"]')."},
-                    "text": {"type": "string", "description": "Click element containing this text (alternative to selector)."},
-                    "button": {"type": "string", "description": "'left', 'right', or 'middle'. Default 'left'.", "default": "left"},
-                    "double": {"type": "boolean", "description": "Double-click. Default false.", "default": False},
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "browser_type",
-            "description": "Type text into a form field by CSS selector. Clears existing content first.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "selector": {"type": "string", "description": "CSS selector of the input/textarea (e.g. 'input[name=\"q\"]', '#email')."},
-                    "text": {"type": "string", "description": "Text to type."},
-                    "press_enter": {"type": "boolean", "description": "Press Enter after typing. Default false.", "default": False},
-                },
-                "required": ["selector", "text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "browser_read",
-            "description": "Read content from the current page. Get visible text, HTML, or specific element content.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "selector": {"type": "string", "description": "CSS selector to read. Omit for full page text."},
-                    "mode": {"type": "string", "description": "'text' (visible text), 'html' (innerHTML), 'value' (input value), 'attrs' (all attributes). Default 'text'.", "default": "text"},
-                    "limit": {"type": "integer", "description": "Max characters to return. Default 4000.", "default": 4000},
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "browser_query",
-            "description": "Find DOM elements matching a CSS selector. Returns a list with tag, text preview, and attributes for each match. Use to discover page structure before clicking/reading.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "selector": {"type": "string", "description": "CSS selector (e.g. 'a', 'button', '.results li', 'input')."},
-                    "limit": {"type": "integer", "description": "Max elements to return. Default 20.", "default": 20},
-                },
-                "required": ["selector"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "browser_eval",
-            "description": "Execute JavaScript code in the browser page and return the result. Powerful — use for anything the other browser tools can't do.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "code": {"type": "string", "description": "JavaScript code to evaluate (e.g. 'document.title', 'window.scrollTo(0,0)')."},
-                },
-                "required": ["code"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "browser_close",
-            "description": "Disconnect from Chrome (does NOT close Chrome itself). Frees the Playwright CDP connection.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
+    # ── Browser DOM tools (DISABLED — buggy, re-enable later) ─────────────────
+    # browser_connect, browser_navigate, browser_click, browser_type,
+    # browser_read, browser_query, browser_eval, browser_close
 ]
 
 AUTONOMOUS_TOOLS = {
@@ -665,9 +634,10 @@ MOD_TIERS = {"mod", "admin", "owner"}
 
 TERMINAL_TOOLS = {
     "run_terminal_command", "open_url_browser", "view_screen",
-    "keyboard_type", "press_key", "mouse_click", "scroll_screen",
-    "browser_connect", "browser_navigate", "browser_click", "browser_type",
-    "browser_read", "browser_query", "browser_eval", "browser_close",
+    "keyboard_type", "press_key", "mouse_click", "mouse_move", "scroll_screen",
+    # browser DOM tools disabled for now
+    # "browser_connect", "browser_navigate", "browser_click", "browser_type",
+    # "browser_read", "browser_query", "browser_eval", "browser_close",
 }
 
 # Channel IDs with active remote terminal sessions (updated by bot.py)
@@ -987,9 +957,9 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
 
     elif name == "recall_memory":
         keyword = args.get("keyword", "")
-        limit = max(1, min(int(args.get("limit", 1000)), 5000))
+        limit = max(1, min(int(args.get("limit", 30)), 100))
         ch = args.get("channel") or None
-        return memory.search_memory(str(guild.id), keyword, limit=limit, channel_id=ch)
+        return memory.hybrid_search(str(guild.id), keyword, limit=limit, channel_id=ch)
 
     # ── user history ──────────────────────────────────────────────────────────
     elif name == "get_user_history":
@@ -1010,6 +980,143 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
             return f"Sent to #{args['channel_name']}."
         except discord.Forbidden:
             return f"No permission to send to #{args['channel_name']}."
+
+    # ── manage role ─────────────────────────────────────────────────────────
+    elif name == "manage_role":
+        action = args.get("action", "add")
+        role_name = args.get("role_name", "").strip()
+        if not role_name:
+            return "Error: role_name required."
+
+        if action == "create":
+            color_hex = args.get("color", "").strip().lstrip("#")
+            try:
+                color = discord.Colour(int(color_hex, 16)) if color_hex else discord.Colour.default()
+            except ValueError:
+                color = discord.Colour.default()
+            try:
+                new_role = await guild.create_role(name=role_name, colour=color, reason=f"[Blood] Created by {invoker}")
+                memory.append_action_log(str(guild.id), f"I created role '{role_name}'.")
+                return f"✅ Created role '{new_role.name}'."
+            except discord.Forbidden:
+                return "No permission to create roles."
+            except Exception as e:
+                return f"Failed to create role: {e}"
+
+        user_id = args.get("user_id", "")
+        if not user_id:
+            return "Error: user_id required for add/remove."
+        m = await resolve(user_id)
+        if not m:
+            return f"Could not find user {user_id}."
+        role = discord.utils.get(guild.roles, name=role_name)
+        if not role:
+            return f"Role '{role_name}' not found. Use action='create' first."
+        try:
+            if action == "add":
+                await m.add_roles(role, reason=f"[Blood] Added by {invoker}")
+                memory.append_action_log(str(guild.id), f"I gave '{role_name}' to {m.display_name}.")
+                return f"✅ Added role '{role_name}' to {m.display_name}."
+            elif action == "remove":
+                await m.remove_roles(role, reason=f"[Blood] Removed by {invoker}")
+                memory.append_action_log(str(guild.id), f"I removed '{role_name}' from {m.display_name}.")
+                return f"✅ Removed role '{role_name}' from {m.display_name}."
+            else:
+                return f"Unknown action '{action}'. Use 'add', 'remove', or 'create'."
+        except discord.Forbidden:
+            return f"No permission to manage role '{role_name}'. Is it above Blood's role?"
+        except Exception as e:
+            return f"Failed: {e}"
+
+    # ── manage channel ────────────────────────────────────────────────────────
+    elif name == "manage_channel":
+        action = args.get("action", "create")
+        ch_name = args.get("channel_name", "").strip()
+        if not ch_name:
+            return "Error: channel_name required."
+
+        if action == "create":
+            ch_type = args.get("channel_type", "text")
+            try:
+                if ch_type == "voice":
+                    new_ch = await guild.create_voice_channel(name=ch_name, reason=f"[Blood] Created by {invoker}")
+                else:
+                    new_ch = await guild.create_text_channel(name=ch_name, reason=f"[Blood] Created by {invoker}")
+                memory.append_action_log(str(guild.id), f"I created {ch_type} channel '#{ch_name}'.")
+                return f"✅ Created {ch_type} channel #{new_ch.name}."
+            except discord.Forbidden:
+                return "No permission to create channels."
+            except Exception as e:
+                return f"Failed: {e}"
+
+        elif action == "delete":
+            target = discord.utils.get(guild.channels, name=ch_name)
+            if not target:
+                return f"Channel '{ch_name}' not found."
+            try:
+                await target.delete(reason=f"[Blood] Deleted by {invoker}")
+                memory.append_action_log(str(guild.id), f"I deleted channel '#{ch_name}'.")
+                return f"✅ Deleted channel #{ch_name}."
+            except discord.Forbidden:
+                return "No permission to delete channels."
+            except Exception as e:
+                return f"Failed: {e}"
+
+        elif action == "rename":
+            new_name = args.get("new_name", "").strip()
+            if not new_name:
+                return "Error: new_name required for rename."
+            target = discord.utils.get(guild.channels, name=ch_name)
+            if not target:
+                return f"Channel '{ch_name}' not found."
+            try:
+                old_name = target.name
+                await target.edit(name=new_name, reason=f"[Blood] Renamed by {invoker}")
+                memory.append_action_log(str(guild.id), f"I renamed #{old_name} to #{new_name}.")
+                return f"✅ Renamed #{old_name} → #{new_name}."
+            except discord.Forbidden:
+                return "No permission to rename channels."
+            except Exception as e:
+                return f"Failed: {e}"
+        else:
+            return f"Unknown action '{action}'. Use 'create', 'delete', or 'rename'."
+
+    # ── join voice ────────────────────────────────────────────────────────────
+    elif name == "join_voice":
+        ch_name = args.get("channel_name", "").strip()
+        if ch_name.lower() == "leave":
+            if guild.voice_client:
+                await guild.voice_client.disconnect(force=True)
+                return "✅ Left voice channel."
+            return "Not in a voice channel."
+        vc = discord.utils.get(guild.voice_channels, name=ch_name)
+        if not vc:
+            return f"Voice channel '{ch_name}' not found."
+        try:
+            if guild.voice_client:
+                await guild.voice_client.move_to(vc)
+            else:
+                await vc.connect()
+            return f"✅ Joined voice channel '{vc.name}'."
+        except discord.Forbidden:
+            return "No permission to join that voice channel."
+        except Exception as e:
+            return f"Failed to join VC: {e}"
+
+    # ── set nickname ──────────────────────────────────────────────────────────
+    elif name == "set_nickname":
+        m = await resolve(args["user_id"])
+        if not m:
+            return f"Could not find user {args['user_id']}."
+        nick = args.get("nickname", "")
+        try:
+            await m.edit(nick=nick if nick else None, reason=f"[Blood] Nickname change by {invoker}")
+            memory.append_action_log(str(guild.id), f"I changed {m.display_name}'s nickname to '{nick or '(reset)'}.'")
+            return f"✅ {m.display_name}'s nickname → '{nick or '(reset)'}'."
+        except discord.Forbidden:
+            return "No permission to change that user's nickname. Is their role higher?"
+        except Exception as e:
+            return f"Failed: {e}"
 
     # ── web search (Tavily primary, DDGS fallback) ──────────────────────────
     elif name == "web_search":
@@ -1432,6 +1539,12 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
                 ch_id = str(channel.id)
                 if ch_id in fastimg_channels:
                     query = args.get("query", f"Screen is {logical_w}x{logical_h}. List ONLY clickable elements with their (x,y) coordinates. Format: element_name (x, y). No descriptions, no prose. Be fast.")
+                    try:
+                        from provider import call_fast_vision
+                        description = await call_fast_vision(img_url, query)
+                        return f"Screenshot uploaded. Screen size: {logical_w}x{logical_h} (use these coords for mouse_click).\n\nSCREEN DESCRIPTION:\n{description}"
+                    except Exception as ve:
+                        return f"Screenshot uploaded but fast vision failed: {ve}"
                 else:
                     query = args.get("query", f"Describe everything visible on this screen in detail: all text, buttons, UI elements, windows, and their approximate pixel positions from top-left. The screen is {logical_w}x{logical_h} pixels. Coordinates for mouse_click must be in this range.")
                 try:
@@ -1485,10 +1598,34 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
             y = int(args.get("y", 0))
             button = args.get("button", "left")
             clicks = int(args.get("clicks", 1))
+            cx, cy = pyautogui.position()
+            dist = ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
+            max_dist = (pyautogui.size()[0] ** 2 + pyautogui.size()[1] ** 2) ** 0.5
+            dur = 0.3 + (dist / max_dist) * (1.5 - 0.3)
+            dur = max(0.3, min(1.5, dur))
+            pyautogui.moveTo(x, y, duration=dur, tween=pyautogui.easeInOutQuad)
             pyautogui.click(x=x, y=y, button=button, clicks=clicks)
-            return f"\u2705 Clicked ({x}, {y}) button={button} clicks={clicks}"
+            return f"\u2705 Moved smoothly → clicked ({x}, {y}) button={button} clicks={clicks}"
         except Exception as e:
             return f"Click failed: {e}"
+
+    # ── mouse move (smooth, no click) ─────────────────────────────────────────
+    elif name == "mouse_move":
+        if str(channel.id) not in active_terminal_channels:
+            return "ERROR: No terminal session active. Use !openterminal first."
+        try:
+            import pyautogui
+            x = int(args.get("x", 0))
+            y = int(args.get("y", 0))
+            cx, cy = pyautogui.position()
+            dist = ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
+            max_dist = (pyautogui.size()[0] ** 2 + pyautogui.size()[1] ** 2) ** 0.5
+            dur = 0.3 + (dist / max_dist) * (1.5 - 0.3)
+            dur = max(0.3, min(1.5, float(args.get("duration", dur))))
+            pyautogui.moveTo(x, y, duration=dur, tween=pyautogui.easeInOutQuad)
+            return f"\u2705 Mouse moved smoothly to ({x}, {y}) over {dur:.2f}s"
+        except Exception as e:
+            return f"Mouse move failed: {e}"
 
     # ── scroll screen ─────────────────────────────────────────────────────────
     elif name == "scroll_screen":

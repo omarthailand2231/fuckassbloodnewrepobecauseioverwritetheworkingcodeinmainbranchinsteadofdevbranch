@@ -309,6 +309,43 @@ async def call_ai(system: str, messages: list[dict], tools: list[dict] | None = 
     return await _moonshot_call(system, messages, tools)
 
 
+async def call_fast_vision(image_url: str, prompt: str) -> dict:
+    """Fast + cheap vision for gaming/fastimg — uses Qwen3-VL-8B on Fireworks."""
+    import aiohttp
+    model = CONFIG["fast_vision_model"]
+    base_url = CONFIG["moonshot_base_url"]
+    api_key = os.environ.get("FIREWORKS_API_KEY") or os.environ.get("MOONSHOT_API_KEY", "")
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You analyze game screenshots. Output ONLY clickable elements with (x,y) coordinates. Be extremely concise. No prose."},
+            {"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ]}
+        ],
+        "temperature": CONFIG["fast_vision_temp"],
+        "max_tokens": CONFIG["fast_vision_max_tok"],
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=payload,
+            ) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    raise RuntimeError(f"Fast vision API {resp.status}: {text}")
+                data = await resp.json()
+                usage = data.get("usage", {})
+                usage["model_used"] = model
+                ai_message = data["choices"][0]["message"]
+                return {"message": ai_message, "usage": usage}
+    except Exception as e:
+        return {"message": {"content": f"Fast vision error: {e}"}, "usage": {}}
+
+
 async def call_vision(image_url: str, prompt: str) -> dict:
     """Vision analysis — Moonshot uses kimi-k2.5 natively, Groq uses dedicated vision model."""
     if not USE_GROQ_API:
