@@ -1,36 +1,94 @@
 <guild id="1341920177742282842">
   <users>
-    <user id="858594136264933378" username="S5 • sadness" first_seen="2026-04-20T03:32:03.778279+00:00" last_seen="2026-04-20T06:24:17.525606+00:00" total_tokens="0">
+    <user id="858594136264933378" username="S5 • sadness" first_seen="2026-04-20T03:32:03.778279+00:00" last_seen="2026-04-20T22:55:15.086538+00:00" total_tokens="0">
       <interactions />
     </user>
-    <user id="1067917399296319538" username="Husband • Almtuyung" first_seen="2026-04-20T03:32:23.536097+00:00" last_seen="2026-04-20T07:08:05.373945+00:00" total_tokens="0">
+    <user id="1067917399296319538" username="Husband • Almtuyung" first_seen="2026-04-20T03:32:23.536097+00:00" last_seen="2026-04-21T03:05:26.543388+00:00" total_tokens="0">
       <interactions />
     </user>
-    <user id="1421582461556625509" username="SMA • Vinny" first_seen="2026-04-20T03:39:23.200628+00:00" last_seen="2026-04-20T11:55:51.642312+00:00" total_tokens="192907">
+    <user id="1421582461556625509" username="SMA • Vinny" first_seen="2026-04-20T03:39:23.200628+00:00" last_seen="2026-04-21T01:19:23.640069+00:00" total_tokens="371449">
       <interactions />
     </user>
-    <user id="497530779463712769" username="Baws • Soul" first_seen="2026-04-20T03:39:38.846738+00:00" last_seen="2026-04-20T04:41:19.488789+00:00" total_tokens="0">
+    <user id="497530779463712769" username="Baws • Soul" first_seen="2026-04-20T03:39:38.846738+00:00" last_seen="2026-04-21T03:29:15.097546+00:00" total_tokens="9159">
       <interactions />
     </user>
-    <user id="1443232928942264391" username="S5 • Hank" first_seen="2026-04-20T03:57:15.641437+00:00" last_seen="2026-04-20T04:11:14.370769+00:00" total_tokens="0">
+    <user id="1443232928942264391" username="S5 • Hank" first_seen="2026-04-20T03:57:15.641437+00:00" last_seen="2026-04-20T23:19:00.556904+00:00" total_tokens="0">
       <interactions />
     </user>
     <user id="1245867298661597227" username="S4 • King" first_seen="2026-04-20T04:09:40.716743+00:00" last_seen="2026-04-20T04:12:18.195714+00:00" total_tokens="0">
       <interactions />
     </user>
-    <user id="1482532099217952899" username="S3 • Koln" first_seen="2026-04-20T04:10:11.866619+00:00" last_seen="2026-04-20T04:11:16.767796+00:00" total_tokens="0">
+    <user id="1482532099217952899" username="S3 • Koln" first_seen="2026-04-20T04:10:11.866619+00:00" last_seen="2026-04-20T22:37:33.693819+00:00" total_tokens="0">
       <interactions />
     </user>
-    <user id="1039726938748633180" username="clev" first_seen="2026-04-20T05:04:10.427211+00:00" last_seen="2026-04-20T11:07:46.873605+00:00" total_tokens="0">
+    <user id="1039726938748633180" username="clev" first_seen="2026-04-20T05:04:10.427211+00:00" last_seen="2026-04-20T18:46:00.386567+00:00" total_tokens="3059">
       <interactions />
     </user>
-    <user id="1402366036753387521" username="S2 • Darrion" first_seen="2026-04-20T06:43:23.220771+00:00" last_seen="2026-04-20T07:13:16.341960+00:00" total_tokens="2871">
+    <user id="1402366036753387521" username="S2 • Darrion" first_seen="2026-04-20T06:43:23.220771+00:00" last_seen="2026-04-21T03:50:56.130183+00:00" total_tokens="11848">
       <interactions />
     </user>
-    <user id="1483520393858912467" username="Capo • Kai / Prime" first_seen="2026-04-20T08:21:30.503754+00:00" last_seen="2026-04-20T08:22:25.896311+00:00" total_tokens="5459">
+    <user id="1483520393858912467" username="Capo • Kai / Prime" first_seen="2026-04-20T08:21:30.503754+00:00" last_seen="2026-04-21T00:29:47.438978+00:00" total_tokens="68860">
       <interactions />
     </user>
-    <user id="1341645258223521825" username="Capo • Boots" first_seen="2026-04-20T11:09:09.995944+00:00" last_seen="2026-04-20T11:38:17.764319+00:00" total_tokens="20087">
+    <user id="1341645258223521825" username="Capo • Boots" first_seen="2026-04-20T11:09:09.995944+00:00" last_seen="2026-04-21T02:51:22.130614+00:00" total_tokens="82514">
+      <interactions />
+    </user>
+    <user id="530785465440272394" username="Capo • Waterbounce" first_seen="2026-04-20T12:37:52.155770+00:00" last_seen="2026-04-21T03:06:25.320732+00:00" total_tokens="211505">
+      <interactions>
+        <with user_id="934476390017953822" count="1" last="2026-04-20T12:46:35.767479+00:00" />
+      </interactions>
+    </user>
+    <user id="934476390017953822" username="SM • Rhino" first_seen="2026-04-20T12:39:12.619672+00:00" last_seen="2026-04-21T03:29:11.285721+00:00" total_tokens="44573">
+      <interactions>
+        <with user_id="530785465440272394" count="1" last="2026-04-20T12:46:35.767376+00:00" />
+      </interactions>
+    </user>
+    <user id="912613790665805834" username="S5 • Phil" first_seen="2026-04-20T12:46:35.521299+00:00" last_seen="2026-04-21T03:13:08.856097+00:00" total_tokens="0">
+      <interactions />
+    </user>
+    <user id="1396458968896897034" username="S5 • Duck" first_seen="2026-04-20T14:37:02.959328+00:00" last_seen="2026-04-20T19:59:46.468358+00:00" total_tokens="0">
+      <interactions />
+    </user>
+    <user id="911521189812391966" username="Boss • Monochrome" first_seen="2026-04-20T14:39:37.014391+00:00" last_seen="2026-04-20T23:06:42.093102+00:00" total_tokens="13147">
+      <interactions />
+    </user>
+    <user id="1164587070849814550" username="S5 • TIV" first_seen="2026-04-20T17:18:22.744718+00:00" last_seen="2026-04-20T17:18:26.484813+00:00" total_tokens="0">
+      <interactions />
+    </user>
+    <user id="1163123937891324025" username="S4 • Tecm" first_seen="2026-04-20T19:57:37.892766+00:00" last_seen="2026-04-20T20:47:44.560268+00:00" total_tokens="76663">
+      <interactions />
+    </user>
+    <user id="752954354696323164" username="Enforcer • Blue" first_seen="2026-04-20T19:57:47.126189+00:00" last_seen="2026-04-20T23:53:30.099595+00:00" total_tokens="139344">
+      <interactions />
+    </user>
+    <user id="891456718226223104" username="Kuro • Kuro (12)" first_seen="2026-04-20T19:58:42.697675+00:00" last_seen="2026-04-20T19:58:42.697698+00:00" total_tokens="0">
+      <interactions />
+    </user>
+    <user id="1052067493528752218" username="S3 • Pharoah" first_seen="2026-04-20T19:58:52.909807+00:00" last_seen="2026-04-20T21:07:29.643803+00:00" total_tokens="53253">
+      <interactions />
+    </user>
+    <user id="935379294459404289" username="S5 • Yuri" first_seen="2026-04-20T20:48:40.644934+00:00" last_seen="2026-04-20T20:48:40.644959+00:00" total_tokens="0">
+      <interactions />
+    </user>
+    <user id="1425273319623495880" username="S4 • Lowel" first_seen="2026-04-20T21:31:19.171800+00:00" last_seen="2026-04-20T22:58:24.010625+00:00" total_tokens="50528">
+      <interactions />
+    </user>
+    <user id="1027917028188749904" username="Capo • Kitcat" first_seen="2026-04-20T21:36:27.811953+00:00" last_seen="2026-04-20T21:36:27.811967+00:00" total_tokens="0">
+      <interactions />
+    </user>
+    <user id="538759847324286986" username="Advisor • Chalk" first_seen="2026-04-20T21:37:55.981024+00:00" last_seen="2026-04-20T22:48:51.366655+00:00" total_tokens="31283">
+      <interactions />
+    </user>
+    <user id="1058086642520444998" username="Capo • Rick Truck" first_seen="2026-04-20T22:14:22.179406+00:00" last_seen="2026-04-21T03:53:20.101395+00:00" total_tokens="0">
+      <interactions />
+    </user>
+    <user id="1409234965857833163" username="S5 • D3FTLESS" first_seen="2026-04-21T01:20:08.858729+00:00" last_seen="2026-04-21T01:28:21.914985+00:00" total_tokens="0">
+      <interactions />
+    </user>
+    <user id="1348035347426181216" username="S3 • D1sell" first_seen="2026-04-21T03:02:30.299831+00:00" last_seen="2026-04-21T03:12:58.457078+00:00" total_tokens="0">
+      <interactions />
+    </user>
+    <user id="1482201783047684149" username="Vantaffe" first_seen="2026-04-21T03:11:01.562062+00:00" last_seen="2026-04-21T03:11:01.562074+00:00" total_tokens="0">
       <interactions />
     </user>
   </users>

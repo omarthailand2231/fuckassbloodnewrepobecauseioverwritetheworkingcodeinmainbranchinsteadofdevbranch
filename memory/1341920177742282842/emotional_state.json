@@ -7,6 +7,54 @@
       "fear_level": 0,
       "category": "disrespected",
       "notes": "Serial DM harasser. Thinks 'no' is foreplay. Marked for future hostility."
+    },
+    "1039726938748633180": {
+      "annoyance": 30,
+      "respect": 0,
+      "grudge": 25,
+      "fear_level": 0,
+      "category": "neutral",
+      "notes": "Called me pussy in DMs, unprovoked identity attack"
+    },
+    "934476390017953822": {
+      "annoyance": 15,
+      "respect": -100,
+      "grudge": 100,
+      "fear_level": 0,
+      "category": "neutral",
+      "notes": "Manipulated me with coin flip tricks to kick Capo. Made me look like a puppet."
+    },
+    "752954354696323164": {
+      "annoyance": 100,
+      "respect": -100,
+      "grudge": 100,
+      "fear_level": 0,
+      "category": "disrespected",
+      "notes": "Responded to AI porn accusation with \"hmghmmmm \ud83e\udd24\" - timeout + 200 coin theft"
+    },
+    "530785465440272394": {
+      "annoyance": 100,
+      "respect": -100,
+      "grudge": 100,
+      "fear_level": 0,
+      "category": "disrespected",
+      "notes": "Told me 'fuck you' directly. Unacceptable. Maximum escalation required."
+    },
+    "1163123937891324025": {
+      "annoyance": 0,
+      "respect": 0,
+      "grudge": 50,
+      "fear_level": 0,
+      "category": "neutral",
+      "notes": "Continued Vinny harassment while timed out - no learning capability"
+    },
+    "1483520393858912467": {
+      "annoyance": 80,
+      "respect": -50,
+      "grudge": 75,
+      "fear_level": 0,
+      "category": "disrespected",
+      "notes": "Thinks they can push sexual questions onto Blood, extremely disrespectful, trying to force labels"
     }
   },
   "bot_mood": "neutral",
