@@ -101,7 +101,7 @@ CONFIG = {
     # ═══════════════════════════════════════════════════════════════════════════
 
     # ── Moonshot (Kimi K2.5) — single model for everything ─────────────────
-    "moonshot_model":       "accounts/fireworks/models/kimi-k2p5",
+    "moonshot_model":       "accounts/fireworks/models/kimi-k2p6",
     "moonshot_base_url":    "https://api.fireworks.ai/inference/v1",
 
     # ── Groq fallback chain (legacy, only used when USE_GROQ_API=True) ────
@@ -114,8 +114,8 @@ CONFIG = {
 
     # Main model params (shared)
     "main_temperature":     0.7,
-    "main_max_tokens":      4096,
-    "frequency_penalty":    0.6,        # penalise token repetition (0.0–2.0)
+    "main_max_tokens":      16384,
+    "frequency_penalty":    0.3,        # penalise token repetition (0.0–2.0)
     "presence_penalty":     0.3,        # encourage topic diversity (0.0–2.0)
 
     # DeepSeek (paid, last resort when Groq is exhausted)
@@ -137,7 +137,7 @@ CONFIG = {
 
     # Per-user rate limiting (sliding window)
     "user_rate_limit":          1,      # max requests per window
-    "user_rate_window_sec":     30,     # window duration in seconds
+    "user_rate_window_sec":     60,     # window duration in seconds
     "rate_limit_bypass":        ["owner"],  # only owner bypasses the limit
 
     "max_tool_loop_steps":      30,     # max iterations in the tool loop

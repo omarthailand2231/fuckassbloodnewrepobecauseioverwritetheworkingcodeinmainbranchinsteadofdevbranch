@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import logging
 import asyncio
@@ -118,12 +119,17 @@ async def _moonshot_call(system: str, messages: list[dict],
         "Content-Type": "application/json",
     }
 
+    effective_max = max_tokens or CONFIG["main_max_tokens"]
+    use_stream = effective_max > 4096  # Fireworks requires stream=true for >4096
+
     payload = {
         "model": MOONSHOT_MODEL,
         "messages": [{"role": "system", "content": system}] + _sanitize_messages(messages),
         "temperature": temperature or CONFIG["main_temperature"],
-        "max_tokens": max_tokens or CONFIG["main_max_tokens"],
+        "max_tokens": effective_max,
     }
+    if use_stream:
+        payload["stream"] = True
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
@@ -133,8 +139,9 @@ async def _moonshot_call(system: str, messages: list[dict],
     for attempt in range(3):
         try:
             async with aiohttp.ClientSession() as session:
+                timeout = aiohttp.ClientTimeout(total=120 if use_stream else 60)
                 async with session.post(url, headers=headers, json=payload,
-                                        timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                                        timeout=timeout) as resp:
                     if resp.status == 429:
                         retry_after = float(resp.headers.get("Retry-After", 2))
                         log.warning("Moonshot 429, retrying after %.1fs", retry_after)
@@ -156,8 +163,74 @@ async def _moonshot_call(system: str, messages: list[dict],
                         text = await resp.text()
                         raise RuntimeError(f"Moonshot error {resp.status}: {text[:300]}")
 
-                    data = await resp.json()
-                    return _extract_response(data, MOONSHOT_MODEL, [])
+                    if not use_stream:
+                        data = await resp.json()
+                        return _extract_response(data, MOONSHOT_MODEL, [])
+
+                    # ── Reassemble streamed SSE chunks ──
+                    content_parts = []
+                    tool_calls_map: dict[int, dict] = {}
+                    finish_reason = "stop"
+                    usage = {}
+
+                    async for raw_line in resp.content:
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+                        choices = chunk.get("choices", [])
+                        if not choices:
+                            if chunk.get("usage"):
+                                usage = chunk["usage"]
+                            continue
+                        delta = choices[0].get("delta", {})
+                        fr = choices[0].get("finish_reason")
+                        if fr:
+                            finish_reason = fr
+
+                        # Content
+                        if delta.get("content"):
+                            content_parts.append(delta["content"])
+
+                        # Tool calls (streamed incrementally)
+                        for tc in delta.get("tool_calls", []):
+                            idx = tc.get("index", 0)
+                            if idx not in tool_calls_map:
+                                tool_calls_map[idx] = {
+                                    "id": tc.get("id", ""),
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                }
+                            entry = tool_calls_map[idx]
+                            if tc.get("id"):
+                                entry["id"] = tc["id"]
+                            fn = tc.get("function", {})
+                            if fn.get("name"):
+                                entry["function"]["name"] = fn["name"]
+                            if fn.get("arguments"):
+                                entry["function"]["arguments"] += fn["arguments"]
+
+                        if chunk.get("usage"):
+                            usage = chunk["usage"]
+
+                    # Build a synthetic ChatCompletion-style response
+                    message: dict = {"role": "assistant"}
+                    full_content = "".join(content_parts)
+                    if full_content:
+                        message["content"] = full_content
+                    if tool_calls_map:
+                        message["tool_calls"] = [tool_calls_map[k] for k in sorted(tool_calls_map)]
+                        finish_reason = "tool_calls"
+
+                    usage["model_used"] = MOONSHOT_MODEL
+                    usage["fallbacks"] = []
+                    return {"finish_reason": finish_reason, "message": message, "usage": usage}
         except RuntimeError:
             raise
         except Exception as e:
