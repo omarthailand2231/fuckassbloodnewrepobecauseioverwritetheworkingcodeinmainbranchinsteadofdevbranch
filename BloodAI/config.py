@@ -145,7 +145,7 @@ CONFIG = {
     "request_timeout_no_tools": 30,     # seconds before aborting (no tools)
     "leak_retry_limit":         10,     # max retries for leaked reasoning
     "reply_chain_depth":        5,      # how many reply levels to chase
-    "max_attachment_size":      100_000, # bytes — skip files bigger than this
+    "max_attachment_size":      500_000, # bytes — skip files bigger than this
     "discord_message_limit":    1900,   # safe char limit for Discord messages
     "progress_update_interval": 4,      # seconds between progress edits
     "progress_stale_interval":  10,     # seconds before "still checking" msg
@@ -282,7 +282,7 @@ CONFIG = {
     "image_extensions": [".png", ".jpg", ".jpeg", ".webp", ".gif"],
 
     # Max chars to include from a text attachment in the prompt
-    "text_attachment_content_cap": 20000,
+    "text_attachment_content_cap": 200000,
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 10. WEB / INTERNET ACCESS

@@ -89,11 +89,12 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "delete_messages",
-            "description": "Bulk delete recent messages in the current channel.",
+            "description": "Bulk delete messages. Supports >100 via automatic pagination. Defaults to current channel unless channel_id is specified.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "count":  {"type": "integer", "description": "Number of messages to delete, max 100"},
+                    "count":  {"type": "integer", "description": "Number of messages to delete (max 500)."},
+                    "channel_id": {"type": "string", "description": "Target channel ID. Omit to use the current channel."},
                     "reason": {"type": "string"},
                 },
                 "required": ["count"],
@@ -141,7 +142,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "recall_memory",
-            "description": "Semantic + keyword search across all stored chat logs, DMs, summaries, and actions. Understands meaning — not just exact words. Use for facts, names, events, vibes. If you want raw chronological logs, use read_channel_history instead.",
+            "description": "Semantic + keyword search across all stored chat logs, DMs, summaries, and actions. Understands meaning — not just exact words. IMPORTANT: Results are APPROXIMATE matches, NOT proof. Do NOT use recall_memory results alone to justify punishments — cross-reference with read_channel_history for exact quotes before taking mod actions.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -373,15 +374,16 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "edit_code_file",
-            "description": "Edit or completely rewrite a code/text file that the user attached. Returns a colored animated diff in chat. Send the ENTIRE modified file content.",
+            "description": "Edit a code/text file. Two modes: (1) PATCH mode — provide find_replace with search/replace pairs for surgical edits. (2) FULL mode — provide new_content with the entire file (only for small files or full rewrites). Prefer PATCH mode for large files to avoid truncation.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "filename": {"type": "string", "description": "The exact name of the file to edit."},
-                    "new_content": {"type": "string", "description": "The ENTIRE new file content. CRITICAL: DO NOT truncate or omit unchanged code. You must input the complete, functional file from top to bottom."},
+                    "find_replace": {"type": "array", "description": "Array of {find, replace} objects. Each 'find' must be a unique exact substring from the original file. Preferred for large files.", "items": {"type": "object", "properties": {"find": {"type": "string"}, "replace": {"type": "string"}}, "required": ["find", "replace"]}},
+                    "new_content": {"type": "string", "description": "Full file rewrite. Only use for small files or when replacing everything."},
                     "summary_of_changes": {"type": "string", "description": "One sentence summary of the change."},
                 },
-                "required": ["filename", "new_content"],
+                "required": ["filename"],
             },
         },
     },
@@ -778,7 +780,14 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
     if discord is None:
         discord = _Stub
 
+    def _clean_id(raw: str) -> str:
+        """Strip <@!...>, <@...>, and whitespace so mentions and raw IDs both work."""
+        import re as _re_id
+        m = _re_id.search(r"(\d{17,20})", str(raw))
+        return m.group(1) if m else str(raw).strip()
+
     async def resolve(user_id: str):
+        user_id = _clean_id(user_id)
         if user_id in mentioned_members:
             return mentioned_members[user_id]
         try:
@@ -830,7 +839,7 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
         m = await resolve(args["user_id"])
         if not m: return f"Could not find user {args['user_id']}."
         reason = args.get("reason", "no reason")
-        user_id_int = int(args["user_id"])
+        user_id_int = int(_clean_id(args["user_id"]))
         retries = CONFIG["mod_action_retries"]
         for attempt in range(1, retries + 1):
             try:
@@ -871,7 +880,7 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
         # Single cap for all timeouts — Blood decides the duration
         minutes = min(minutes, CONFIG["timeout_cap"])
 
-        user_id_int = int(args["user_id"])
+        user_id_int = int(_clean_id(args["user_id"]))
         retries = CONFIG["mod_action_retries"]
         for attempt in range(1, retries + 1):
             until = discord.utils.utcnow() + timedelta(minutes=minutes)
@@ -918,12 +927,30 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
 
     # ── delete messages ───────────────────────────────────────────────────────
     elif name == "delete_messages":
-        count = min(int(args.get("count", 5)), CONFIG["delete_messages_cap"])
+        count = min(int(args.get("count", 5)), 500)
+        # Resolve target channel — default to current
+        target_ch = channel
+        if args.get("channel_id"):
+            ch_id = _clean_id(args["channel_id"])
+            resolved_ch = guild.get_channel(int(ch_id))
+            if resolved_ch is None:
+                return f"Could not find channel {args['channel_id']}."
+            target_ch = resolved_ch
         try:
-            deleted = await channel.purge(limit=count)
-            memory.append_action_log(str(guild.id), f"I purged {len(deleted)} messages in #{channel.name}. Triggered by {invoker.display_name}.")
-            await mod_log(f"{invoker.mention} deleted {len(deleted)} msgs in #{channel.name}")
-            return f"✅ Deleted {len(deleted)} messages."
+            total_deleted = 0
+            remaining = count
+            while remaining > 0:
+                batch = min(remaining, 100)
+                deleted = await target_ch.purge(limit=batch)
+                total_deleted += len(deleted)
+                remaining -= len(deleted)
+                if len(deleted) < batch:
+                    break  # no more messages to delete
+                if remaining > 0:
+                    await asyncio.sleep(1)  # rate-limit courtesy
+            memory.append_action_log(str(guild.id), f"I purged {total_deleted} messages in #{target_ch.name}. Triggered by {invoker.display_name}.")
+            await mod_log(f"{invoker.mention} deleted {total_deleted} msgs in #{target_ch.name}")
+            return f"✅ Deleted {total_deleted} messages in #{target_ch.name}."
         except discord.Forbidden:
             return "No permission to delete messages here."
         except Exception as e:
@@ -959,7 +986,10 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
         keyword = args.get("keyword", "")
         limit = max(1, min(int(args.get("limit", 30)), 100))
         ch = args.get("channel") or None
-        return memory.hybrid_search(str(guild.id), keyword, limit=limit, channel_id=ch)
+        results = memory.hybrid_search(str(guild.id), keyword, limit=limit, channel_id=ch)
+        if results and results != f"Nothing found for '{keyword}'.":
+            results = "⚠️ CONFIDENCE NOTE: These are approximate semantic matches, NOT exact evidence. Do NOT punish users based solely on these results. Use read_channel_history to verify exact quotes before taking mod actions.\n\n" + results
+        return results
 
     # ── user history ──────────────────────────────────────────────────────────
     elif name == "get_user_history":
@@ -1247,8 +1277,14 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
             timeout = aiohttp.ClientTimeout(total=CONFIG["read_url_timeout_sec"])
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; BloodBot/1.0)"}) as resp:
+                    if resp.status == 404:
+                        return "⚠️ HTTP 404 — page not found. This URL is dead or wrong. Do NOT treat this as factual content."
+                    if resp.status == 403:
+                        return "⚠️ HTTP 403 — access forbidden (likely paywalled or bot-blocked). Content is NOT available."
+                    if resp.status == 401:
+                        return "⚠️ HTTP 401 — authentication required. Cannot read this page."
                     if resp.status != 200:
-                        return f"HTTP {resp.status} — could not fetch URL."
+                        return f"⚠️ HTTP {resp.status} — could not fetch URL. Do NOT treat error pages as real content."
                     ct = resp.content_type or ""
                     if "html" in ct:
                         html = await resp.text(encoding="utf-8", errors="replace")
@@ -1260,9 +1296,20 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
                         text = await resp.text()
                     else:
                         text = await resp.text(encoding="utf-8", errors="replace")
+                    # Detect paywall / login wall patterns
+                    text_lower = text[:2000].lower()
+                    paywall_signals = ["subscribe to continue", "sign in to read", "create a free account",
+                                       "paywall", "premium content", "members only", "login to view",
+                                       "access denied", "please log in", "register to read"]
+                    paywall_hits = [s for s in paywall_signals if s in text_lower]
+                    warning = ""
+                    if paywall_hits:
+                        warning = f"⚠️ PAYWALL/LOGIN WALL DETECTED (signals: {', '.join(paywall_hits[:3])}). Content below may be incomplete or just a login page. Do NOT treat as factual.\n\n"
+                    if len(text) < 200 and not text.strip():
+                        return "⚠️ Page returned empty or near-empty content. Likely a redirect, login wall, or bot block."
                     if len(text) > cap:
                         text = text[:cap] + f"\n\n[...truncated at {cap} chars]"
-                    return text if text else "(page returned empty content)"
+                    return (warning + text) if text else "⚠️ Page returned empty content."
         except asyncio.TimeoutError:
             return f"Timed out after {CONFIG['read_url_timeout_sec']}s."
         except Exception as e:
@@ -1367,16 +1414,46 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
     # ── edit code file ────────────────────────────────────────────────────────
     elif name == "edit_code_file":
         filename = args.get("filename", "file.txt")
-        new_content = args.get("new_content", "")
         summary = args.get("summary_of_changes", "Edited file.")
-
         old_content = memory.file_cache.get(filename, "")
-        
+        find_replace = args.get("find_replace")
+
+        # ── PATCH mode: surgical find/replace ──
+        if find_replace and isinstance(find_replace, list):
+            if not old_content:
+                return f"ERROR: No cached content for '{filename}'. Upload the file first so I can patch it."
+            new_content = old_content
+            applied = 0
+            errors = []
+            for i, patch in enumerate(find_replace):
+                find_str = patch.get("find", "")
+                replace_str = patch.get("replace", "")
+                if not find_str:
+                    errors.append(f"Patch #{i+1}: empty 'find' string.")
+                    continue
+                if find_str not in new_content:
+                    errors.append(f"Patch #{i+1}: 'find' string not found in file.")
+                    continue
+                if new_content.count(find_str) > 1:
+                    errors.append(f"Patch #{i+1}: 'find' string matches {new_content.count(find_str)} locations — must be unique. Add more context.")
+                    continue
+                new_content = new_content.replace(find_str, replace_str, 1)
+                applied += 1
+
+            if applied == 0:
+                return f"ERROR: No patches applied. Issues: {'; '.join(errors)}"
+
+        # ── FULL mode: complete rewrite ──
+        elif args.get("new_content"):
+            new_content = args["new_content"]
+        else:
+            return "ERROR: Provide either 'find_replace' (patch mode) or 'new_content' (full rewrite)."
+
+        # Generate diff for display
         old_lines = old_content.splitlines()
         new_lines = new_content.splitlines()
-        
         diff = list(difflib.unified_diff(old_lines, new_lines, fromfile=filename, tofile=filename, lineterm=""))
-        
+
         if not diff:
             return "No changes detected between the original file and new_content."
 
@@ -1391,7 +1468,7 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
         if current_block:
             blocks.append(current_block)
 
-        blocks_to_animate = blocks[:2] 
+        blocks_to_animate = blocks[:2]
         msg = None
         for block in blocks_to_animate:
             state1 = [line for line in block if not line.startswith("+")]
@@ -1399,7 +1476,7 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
             if not msg: msg = await channel.send(text1)
             else: await msg.edit(content=text1)
             await asyncio.sleep(1.5)
-            
+
             state2 = [line for line in block if not line.startswith("-")]
             text2 = f"```diff\n--- Editing {filename} ---\n" + "\n".join(state2)[:1900] + "\n```"
             await msg.edit(content=text2)
@@ -1414,10 +1491,15 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
             await channel.send(final_text, file=discord_file)
         except discord.Forbidden:
             await channel.send(final_text + "\n\n*(Error: File upload blocked)*")
-        
+
         if msg: await msg.edit(content=f"```diff\n--- Finished {filename} ---\n```")
         memory.file_cache[filename] = new_content
-        return f"Successfully edited {filename}."
+        result = f"Successfully edited {filename}."
+        if find_replace:
+            result += f" ({applied}/{len(find_replace)} patches applied)"
+            if errors:
+                result += f" Warnings: {'; '.join(errors)}"
+        return result
 
     # ── give coins ─────────────────────────────────────────────────────────────
     elif name == "give_coins":
@@ -1524,32 +1606,67 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
             return "ERROR: No terminal session active. Use !openterminal first."
         try:
             import pyautogui
+            from PIL import ImageDraw, ImageFont
             screenshot = pyautogui.screenshot()
             # Resize Retina screenshots to logical pixel size so vision coords match mouse_click coords
             logical_w, logical_h = pyautogui.size()
             if screenshot.width > logical_w:
                 screenshot = screenshot.resize((logical_w, logical_h))
-            buf = io.BytesIO()
-            screenshot.save(buf, format="PNG")
-            buf.seek(0)
-            file = discord.File(buf, filename="screen_capture.png")
+
+            # Draw coordinate grid overlay so vision model can read exact positions
+            grid_img = screenshot.copy()
+            draw = ImageDraw.Draw(grid_img, "RGBA")
+            grid_spacing = 100  # pixels between grid lines
+            label_color = (255, 0, 0, 200)
+            line_color = (255, 0, 0, 60)
+            try:
+                font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 11)
+            except Exception:
+                font = ImageFont.load_default()
+            for x in range(0, logical_w, grid_spacing):
+                draw.line([(x, 0), (x, logical_h)], fill=line_color, width=1)
+                if x > 0:
+                    draw.text((x + 2, 2), str(x), fill=label_color, font=font)
+            for y in range(0, logical_h, grid_spacing):
+                draw.line([(0, y), (logical_w, y)], fill=line_color, width=1)
+                if y > 0:
+                    draw.text((2, y + 2), str(y), fill=label_color, font=font)
+
+            # Send clean screenshot to chat (no grid)
+            buf_clean = io.BytesIO()
+            screenshot.save(buf_clean, format="PNG")
+            buf_clean.seek(0)
+            file = discord.File(buf_clean, filename="screen_capture.png")
             msg = await channel.send("\U0001f4f8 **Screen Capture**", file=file)
-            if msg.attachments:
-                img_url = msg.attachments[0].url
+
+            # Send gridded version to vision model (not shown to user)
+            buf_grid = io.BytesIO()
+            grid_img.save(buf_grid, format="PNG")
+            buf_grid.seek(0)
+            grid_file = discord.File(buf_grid, filename="screen_grid.png")
+            grid_msg = await channel.send(file=grid_file)
+            vision_url = grid_msg.attachments[0].url if grid_msg.attachments else (msg.attachments[0].url if msg.attachments else None)
+            # Delete the grid image from chat — it was only needed for the vision URL
+            try:
+                await grid_msg.delete()
+            except Exception:
+                pass
+
+            if vision_url:
                 ch_id = str(channel.id)
                 if ch_id in fastimg_channels:
-                    query = args.get("query", f"Screen is {logical_w}x{logical_h}. List ONLY clickable elements with their (x,y) coordinates. Format: element_name (x, y). No descriptions, no prose. Be fast.")
+                    query = args.get("query", f"This screenshot has a red coordinate grid overlay with labels every {grid_spacing}px. Screen is {logical_w}x{logical_h}. Use the grid numbers to determine EXACT (x,y) positions. List ONLY clickable elements with their (x,y) coordinates. Format: element_name (x, y). No descriptions, no prose. Be fast.")
                     try:
                         from provider import call_fast_vision
-                        description = await call_fast_vision(img_url, query)
+                        description = await call_fast_vision(vision_url, query)
                         return f"Screenshot uploaded. Screen size: {logical_w}x{logical_h} (use these coords for mouse_click).\n\nSCREEN DESCRIPTION:\n{description}"
                     except Exception as ve:
                         return f"Screenshot uploaded but fast vision failed: {ve}"
                 else:
-                    query = args.get("query", f"Describe everything visible on this screen in detail: all text, buttons, UI elements, windows, and their approximate pixel positions from top-left. The screen is {logical_w}x{logical_h} pixels. Coordinates for mouse_click must be in this range.")
+                    query = args.get("query", f"This screenshot has a red coordinate grid overlay with labels every {grid_spacing}px. The screen is {logical_w}x{logical_h} pixels. Use the grid numbers to determine EXACT (x,y) pixel positions of all visible UI elements, buttons, text fields, links, and windows. Coordinates must be precise — read them from the grid, do not estimate.")
                 try:
                     from provider import call_vision
-                    description = await call_vision(img_url, query)
+                    description = await call_vision(vision_url, query)
                     return f"Screenshot uploaded. Screen size: {logical_w}x{logical_h} (use these coords for mouse_click).\n\nSCREEN DESCRIPTION:\n{description}"
                 except Exception as ve:
                     return f"Screenshot uploaded but vision analysis failed: {ve}"

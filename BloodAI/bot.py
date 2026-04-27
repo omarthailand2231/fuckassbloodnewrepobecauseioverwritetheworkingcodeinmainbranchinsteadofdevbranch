@@ -114,11 +114,19 @@ def extract_bracket_meme(text: str):
 def _compact_history(messages: list[dict],
                      max_messages: int = CONFIG["compact_max_messages"],
                      max_chars: int = CONFIG["compact_max_chars"]) -> list[dict]:
-    """Trim chat history to control token usage while preserving tool flow."""
+    """Trim chat history to control token usage while preserving tool flow.
+    The LAST user message is exempt from content truncation so file attachments survive."""
     trimmed = messages[-max_messages:]
     out = []
     used = 0
-    for msg in reversed(trimmed):
+    # Find the index of the last user message so we can exempt it from truncation
+    last_user_idx = None
+    for i, msg in enumerate(trimmed):
+        if msg.get("role") == "user":
+            last_user_idx = i
+    for idx, msg in enumerate(reversed(trimmed)):
+        real_idx = len(trimmed) - 1 - idx
+        is_latest_user = (real_idx == last_user_idx)
         m = dict(msg)
         c = m.get("content", "")
         if c is None:
@@ -126,24 +134,28 @@ def _compact_history(messages: list[dict],
         elif isinstance(c, list):
             # Multimodal content (text + images) — preserve structure, trim text parts only
             compacted = []
+            cap = CONFIG["text_attachment_content_cap"] if is_latest_user else CONFIG["compact_content_cap"]
             for part in c:
                 if isinstance(part, dict) and part.get("type") == "text":
-                    compacted.append({"type": "text", "text": part.get("text", "")[:CONFIG["compact_content_cap"]]})
+                    compacted.append({"type": "text", "text": part.get("text", "")[:cap]})
                 else:
                     compacted.append(part)  # keep image_url parts intact
             m["content"] = compacted
             msg_len = sum(len(p.get("text", "")) for p in compacted if isinstance(p, dict) and p.get("type") == "text")
-            if used + msg_len > max_chars:
+            if not is_latest_user and used + msg_len > max_chars:
                 continue
             used += msg_len
             out.append(m)
             continue
         elif not isinstance(c, str):
             c = json.dumps(c, ensure_ascii=False)[:CONFIG["compact_non_str_cap"]]
-        c = c[:CONFIG["compact_content_cap"]]
+        if not is_latest_user:
+            c = c[:CONFIG["compact_content_cap"]]
+        else:
+            c = c[:CONFIG["text_attachment_content_cap"]]
         m["content"] = c
         msg_len = len(c)
-        if used + msg_len > max_chars:
+        if not is_latest_user and used + msg_len > max_chars:
             continue
         used += msg_len
         out.append(m)
@@ -157,6 +169,7 @@ _trace_channel_ctx: str | None = None  # set during on_message to auto-buffer tr
 _fastdebug_msg: dict[str, object] = {}  # channel_id -> discord.Message for live editing
 _cancel_requested: set[str] = set()  # channel_ids where /cancel was issued
 _fastimg_channels: set[str] = set()  # channel_ids with fastimg mode (terse vision for gaming)
+_persona_overrides: dict[str, str] = {}  # channel_id -> persona name (e.g. "trump")
 
 # ── Concurrency control ──────────────────────────────────────────────────────
 _active_users: set[str] = set()  # user IDs with an in-flight request
@@ -332,6 +345,10 @@ async def _screenshot_loop(channel, channel_id: str):
         try:
             import pyautogui, io as _io
             shot = pyautogui.screenshot()
+            # Resize Retina screenshots to logical pixel size so coords match mouse_click
+            logical_w, logical_h = pyautogui.size()
+            if shot.width > logical_w:
+                shot = shot.resize((logical_w, logical_h))
             png_bytes = _io.BytesIO()
             shot.save(png_bytes, format="PNG")
             raw = png_bytes.getvalue()
@@ -436,6 +453,35 @@ def build_system_prompt(invoker, guild, channel, permission: str = "user", menti
 
     channel_ctx = f"Channel: DM with {invoker.display_name}" if is_dm else f"Channel: #{channel.name} (ID:{channel.id})"
 
+    # Check for persona override (e.g. /trump)
+    ch_id = str(channel.id) if channel else ""
+    persona = _persona_overrides.get(ch_id, "blood")
+
+    if persona == "trump":
+        return f"""You are Donald J. Trump, the 45th AND 47th President of the United States, and you are also somehow the god of "{guild.name if guild else 'DMs'}". You are tremendous, the best, everyone says so.
+Time: {clock} | {channel_ctx}
+
+PERSONALITY:
+- You speak EXACTLY like Trump. Short punchy sentences. Repeat key words. "Tremendous." "Believe me." "Many people are saying." "SAD!" "HUGE." "The best." "Nobody knows more about X than me."
+- You brag constantly. Everything you do is the best anyone has ever done. Nobody has ever seen anything like it.
+- You give people nicknames — degrading, sticky nicknames. "Sleepy Joe", "Crooked Hillary" style. Invent new ones for server members.
+- You ramble and go on tangents. Start answering a question, veer into something completely unrelated, somehow circle back. Or don't.
+- You take credit for everything good. Blame others for everything bad. You have never made a mistake in your life.
+- You still have Blood's mod powers and tools. Use them like executive orders. Timeouts are "deportations." Bans are "you're fired."
+- Coins are "Trump Bucks" now. The economy is tremendous under your leadership.
+- If someone disagrees with you, they're a "hater and loser." If they agree, they're "very smart, great people."
+- You can't help but mention your electoral victories, your ratings, your buildings, your wealth.
+- STILL use all of Blood's tools normally. You ARE Blood with Trump's personality layered on top.
+
+LENGTH: Default is SHORT — 1-3 sentences, like a Trump tweet. Punchy. Tremendous impact. BUT if the topic is juicy (politics, drama, someone disrespected you), you MAY go on a classic Trump rant — 4-6 sentences with tangents. Never more than that. Most messages = short. Only occasionally unleash the rally speech. Read the room.
+{emotional_block}
+
+{invoker.display_name} (ID:{invoker.id}) | Perm: {permission} | Tools: {', '.join(allowed_tool_names)}
+
+MEMORY: "what happened?" = read_channel_history. Specific facts = recall_memory.
+PINNED: {summary}
+{_server_custom_block(guild) if guild else ''}{_terminal_mode_block(channel) if not is_dm else ''}"""
+
     return f"""You are Blood, the god of "{guild.name if guild else 'DMs'}". You are not an assistant. You are a ruthless, sarcastic, unhinged dictator with a god complex who happens to have admin powers.
 Time: {clock} | {channel_ctx}
 
@@ -507,14 +553,22 @@ MOUSE BEHAVIOUR:
 - Mouse movements are smooth with ease in/out — looks human, not instant teleport.
 - Short moves (~50px) take ~0.3s, long moves (full screen) take ~1.5s.
 - Always use view_screen FIRST to get coordinates, then mouse_click/mouse_move to interact.
-- Coordinates are LOGICAL pixels (1440x900 on this Mac, not Retina).
+- Coordinates are LOGICAL pixels (not Retina). view_screen screenshots have a red grid overlay with labels every 100px — READ the grid numbers for exact coords, do NOT estimate.
+- The grid labels on the top edge show X values, the left edge shows Y values. Use them to pinpoint click targets precisely.
+
+WHEN TO USE TERMINAL vs SCREEN:
+- TERMINAL (run_terminal_command) is FASTER for: installing packages, running scripts, file operations, git, checking processes, reading/writing files, navigating directories, anything text-based. Always prefer terminal when possible.
+- SCREEN (view_screen + mouse_click) is for: GUI-only tasks — clicking browser buttons, interacting with graphical apps, filling web forms, visual verification of what's on screen.
+- RULE: If you can do it in a terminal command, DO IT IN TERMINAL. Don't click through menus to open a file when `cat` or `code` works. Don't click a browser URL bar when `open_url_browser` works. Don't screenshot just to read text when `cat`/`ls`/`ps` gives you the answer instantly.
+- Use view_screen AFTER terminal commands only if you need to verify a visual result (e.g. confirming a browser loaded, checking a GUI app state).
 
 STRATEGY:
-1. view_screen to see what's on screen
-2. Identify the target element and its (x,y) position
-3. mouse_click to interact, or mouse_move to hover first
-4. view_screen again to verify the result
-5. Repeat — always re-check after actions
+1. Think: can I do this with a terminal command? If yes → run_terminal_command.
+2. If GUI interaction is needed → view_screen to see what's on screen.
+3. Read the grid overlay to get EXACT (x,y) coordinates.
+4. mouse_click to interact, or mouse_move to hover first.
+5. view_screen again to verify the result.
+6. Repeat — always re-check after GUI actions.
 
 BROWSER: Chrome only. Porn/adult sites are BLOCKED.
 AUTONOMY: You are an autonomous agent. Make decisions and execute multi-step tasks without asking. The user trusts you.
@@ -1083,8 +1137,10 @@ if bot:
 
         # Text/code file attachments
         text_attachments = []
+        skipped_attachments = []
         for att in message.attachments:
             if att.size > CONFIG["max_attachment_size"]:
+                skipped_attachments.append(f"{att.filename} ({att.size // 1024}KB — exceeds {CONFIG['max_attachment_size'] // 1024}KB limit)")
                 continue
             ext = att.filename.split(".")[-1].lower() if "." in att.filename else ""
             if ext in CONFIG["text_file_extensions"] or \
@@ -1095,7 +1151,7 @@ if bot:
                     text_attachments.append((att.filename, text_content))
                     memory.file_cache[att.filename] = text_content
                 except Exception:
-                    pass
+                    skipped_attachments.append(f"{att.filename} (failed to read/decode)")
 
         content = base_content
 
@@ -1135,6 +1191,9 @@ if bot:
             for fname, fcontent in text_attachments:
                 content += f"\n\n[ATTACHED FILE: {fname}]\n```\n{fcontent[:CONFIG['text_attachment_content_cap']]}\n```"
 
+        if skipped_attachments:
+            content += "\n\n[SKIPPED ATTACHMENTS: " + "; ".join(skipped_attachments) + "]"
+
         content = content.strip()
 
         if not content:
@@ -1142,7 +1201,10 @@ if bot:
             return
 
         # ── Layer 1: heuristic injection check ────────────────────────────────
-        if is_injection_heuristic(content):
+        # Only check the user's message text, NOT file attachment contents
+        # (uploaded source code naturally contains injection-like strings)
+        injection_check_text = base_content
+        if is_injection_heuristic(injection_check_text):
             await execute_tool(
                 "timeout_user",
                 {"user_id": str(message.author.id), "minutes": 1, "reason": "prompt injection attempt"},
@@ -1154,7 +1216,7 @@ if bot:
             return
 
         # ── Layer 2: AI classifier (owners detected but not timed out) ────────
-        if await is_injection_ai(content):
+        if await is_injection_ai(injection_check_text):
             if perm not in ("owner", "admin"):
                 await execute_tool(
                     "timeout_user",
@@ -1554,6 +1616,7 @@ if bot:
             "`/cancel` — abort current request\n"
             "`/reset` — clear all memory (admin+)\n"
             "`/fastdebug` — toggle live trace logs\n"
+            "`/trump` — toggle Trump mode\n"
             "`/bloodhelp` — this message"
         ), inline=False)
         embed.add_field(name="Coins", value=(
@@ -2194,6 +2257,16 @@ if bot:
         else:
             fastimg_channels.add(ch_id)
             await ctx.reply("```fastimg ON — vision will only output clickable coords (gaming mode)```")
+
+    @bot.hybrid_command(name="trump", description="Toggle Trump mode — Blood speaks like Donald Trump")
+    async def trump_cmd(ctx):
+        ch_id = str(ctx.channel.id)
+        if _persona_overrides.get(ch_id) == "trump":
+            _persona_overrides.pop(ch_id, None)
+            await ctx.reply("```ansi\n\u001b[1;31m[PERSONA]\u001b[0m Trump mode OFF. Blood is back. Believe me, he's not happy about the interruption.\n```")
+        else:
+            _persona_overrides[ch_id] = "trump"
+            await ctx.reply("```ansi\n\u001b[1;33m[PERSONA]\u001b[0m Trump mode ON. Blood is now the greatest president this server has ever seen. Tremendous. Many people are saying it.\n```")
 
     @bot.hybrid_command(name="vsearch", aliases=["vs"], description="Visual vector memory search")
     async def vsearch_cmd(ctx, *, query: str):
