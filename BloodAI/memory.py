@@ -977,3 +977,125 @@ class MemoryManager:
             return f"Nothing found for '{query}'."
 
         return "\n".join(merged[:limit])
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # GOALS — persistent per-guild goal system
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _goals_path(self, guild_id: str) -> str:
+        return os.path.join(self.dir, guild_id, "goals.json")
+
+    def _load_goals(self, guild_id: str) -> list[dict]:
+        path = self._goals_path(guild_id)
+        if not os.path.exists(path):
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+
+    def _save_goals(self, guild_id: str, goals: list[dict]):
+        path = self._goals_path(guild_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(goals, f, indent=2, ensure_ascii=False)
+
+    def set_goal(self, guild_id: str, text: str, priority: str = "normal") -> dict:
+        goals = self._load_goals(guild_id)
+        active = [g for g in goals if g.get("status") == "active"]
+        max_goals = CONFIG.get("goals_max_per_guild", 20)
+        if len(active) >= max_goals:
+            return {"error": f"Max {max_goals} active goals. Complete some first."}
+        goal = {
+            "id": len(goals) + 1,
+            "text": text,
+            "status": "active",
+            "priority": priority,
+            "created_at": _now_iso(),
+            "completed_at": None,
+            "notes": [],
+        }
+        goals.append(goal)
+        self._save_goals(guild_id, goals)
+        return goal
+
+    def complete_goal(self, guild_id: str, goal_id: int, outcome: str = "completed") -> str:
+        goals = self._load_goals(guild_id)
+        for g in goals:
+            if g["id"] == goal_id and g["status"] == "active":
+                g["status"] = outcome  # "completed" or "abandoned"
+                g["completed_at"] = _now_iso()
+                self._save_goals(guild_id, goals)
+                return f"Goal #{goal_id} marked as {outcome}."
+        return f"Goal #{goal_id} not found or already completed."
+
+    def list_goals(self, guild_id: str, status: str = "active") -> list[dict]:
+        goals = self._load_goals(guild_id)
+        if status == "all":
+            return goals
+        return [g for g in goals if g.get("status") == status]
+
+    def get_goals_summary(self, guild_id: str, cap: int = 400) -> str:
+        active = self.list_goals(guild_id, "active")
+        if not active:
+            return ""
+        lines = []
+        for g in active:
+            prio = f" [{g['priority']}]" if g.get("priority", "normal") != "normal" else ""
+            lines.append(f"#{g['id']}{prio}: {g['text']}")
+        summary = "\n".join(lines)
+        return summary[:cap]
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # REFLECTIONS — periodic self-review journal
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _reflections_path(self, guild_id: str) -> str:
+        return os.path.join(self.dir, guild_id, "reflections.md")
+
+    def save_reflection(self, guild_id: str, content: str):
+        path = self._reflections_path(guild_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        entry = f"\n---\n[{_now_str()}]\n{content}\n"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(entry)
+
+    def get_latest_reflection(self, guild_id: str, cap: int = 300) -> str:
+        path = self._reflections_path(guild_id)
+        if not os.path.exists(path):
+            return ""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read()
+            blocks = text.strip().split("---")
+            if blocks:
+                latest = blocks[-1].strip()
+                return latest[:cap]
+        except Exception:
+            pass
+        return ""
+
+    def get_message_count_since_reflection(self, guild_id: str) -> int:
+        """Count total messages across all channels since last reflection."""
+        path = self._reflections_path(guild_id)
+        if not os.path.exists(path):
+            return 9999  # no reflections yet, trigger one
+        try:
+            mtime = os.path.getmtime(path)
+            count = 0
+            guild_dir = os.path.join(self.dir, guild_id)
+            if os.path.isdir(guild_dir):
+                for fname in os.listdir(guild_dir):
+                    if fname.startswith("ch_") and fname.endswith(".md"):
+                        ch_path = os.path.join(guild_dir, fname)
+                        try:
+                            with open(ch_path, "r", encoding="utf-8") as f:
+                                for line in f:
+                                    # Each line with timestamp after mtime counts
+                                    count += 1
+                        except Exception:
+                            pass
+            return count
+        except Exception:
+            return 0

@@ -376,10 +376,10 @@ async def _groq_call(system: str, messages: list[dict],
 # PUBLIC API — dispatches to Moonshot or Groq based on toggle
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def call_ai(system: str, messages: list[dict], tools: list[dict] | None = None) -> dict:
+async def call_ai(system: str, messages: list[dict], tools: list[dict] | None = None, max_tokens: int | None = None) -> dict:
     if USE_GROQ_API:
         return await _groq_call(system, messages, tools)
-    return await _moonshot_call(system, messages, tools)
+    return await _moonshot_call(system, messages, tools, max_tokens=max_tokens)
 
 
 async def call_fast_vision(image_url: str, prompt: str) -> dict:

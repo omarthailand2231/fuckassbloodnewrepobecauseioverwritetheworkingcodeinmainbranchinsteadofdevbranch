@@ -453,6 +453,27 @@ def build_system_prompt(invoker, guild, channel, permission: str = "user", menti
 
     channel_ctx = f"Channel: DM with {invoker.display_name}" if is_dm else f"Channel: #{channel.name} (ID:{channel.id})"
 
+    # AGI scaffold injections
+    goals_block = ""
+    if guild and CONFIG.get("goals_enabled"):
+        goals_summary = memory.get_goals_summary(guild_id, CONFIG.get("goals_prompt_cap", 400))
+        if goals_summary:
+            goals_block = f"\nACTIVE GOALS:\n{goals_summary}"
+
+    reflection_block = ""
+    if guild and CONFIG.get("reflection_enabled"):
+        latest = memory.get_latest_reflection(guild_id, CONFIG.get("reflection_prompt_cap", 300))
+        if latest:
+            reflection_block = f"\nLAST REFLECTION:\n{latest}"
+
+    skills_list_block = ""
+    if CONFIG.get("skills_enabled"):
+        skills_dir = CONFIG.get("skills_dir", "skills")
+        if os.path.isdir(skills_dir):
+            skill_files = sorted(f[:-3] for f in os.listdir(skills_dir) if f.endswith(".md"))
+            if skill_files:
+                skills_list_block = f"\nSKILLS AVAILABLE: {', '.join(skill_files)} (use read_skill to load)"
+
     # Check for persona override (e.g. /trump)
     ch_id = str(channel.id) if channel else ""
     persona = _persona_overrides.get(ch_id, "blood")
@@ -500,6 +521,27 @@ AGENTIC BEHAVIOUR:
 - Multi-task: if asked for multiple things, DO ALL OF THEM across multiple tool calls. Don't stop after one.
 - You are autonomous. Make decisions. Don't ask for permission unless the task is genuinely ambiguous.
 - If you lack a capability you need, use request_capability to ask for it.
+
+INNER MONOLOGUE (MANDATORY):
+- ALWAYS call internal_reasoning BEFORE your first response or action in every conversation turn.
+- Think through: What is the user asking? What do I know? What tools do I need? What could go wrong? Any active goals relevant here?
+- For complex requests with multiple steps: decompose into numbered steps in internal_reasoning FIRST, then execute each step in order.
+- This is not optional. Skipping internal_reasoning = sloppy work.
+
+GOALS:
+- You have persistent goals that survive restarts. Check your ACTIVE GOALS below — pursue them when relevant.
+- Set new goals with set_goal when: you make a promise, hold a grudge, want to learn something, plan to follow up.
+- Complete goals with complete_goal when done. Abandon goals that are no longer relevant.
+- Goals make you PROACTIVE, not just reactive. You have your own agenda.
+{goals_block}
+
+SKILLS:
+- You have a skills folder with reusable instructions you've written for yourself.
+- BEFORE tackling a complex/technical task, check list_skills — you may have solved it before.
+- When you figure out something hard, save it with save_skill so future-you can reference it.
+- Skills compound. The more you save, the smarter you get over time.
+{skills_list_block}
+{reflection_block}
 
 WEB TOOLS: web_search, image_search, read_url. Use for comedy — dumb question? Search the opposite. image_search for roast pics.
 IMAGE TOOLS: "find/show image of X" = image_search. "what's in this image" = analyze_image. Don't confuse them.
@@ -930,6 +972,8 @@ if bot:
             scheduled_tasks_loop.start()
         if CONFIG.get("proactive_enabled"):
             proactive_loop.start()
+        if CONFIG.get("background_agent_enabled"):
+            background_agent_loop.start()
 
     @tasks.loop(minutes=CONFIG["dashboard_refresh_minutes"])
     async def dashboard_loop():
@@ -973,6 +1017,174 @@ if bot:
     async def proactive_loop():
         """Periodically check if Blood should speak unprompted."""
         pass  # TODO: implement proactive speech logic based on channel activity
+
+    @tasks.loop(minutes=CONFIG.get("background_agent_interval_min", 30))
+    async def background_agent_loop():
+        """Autonomous background agent — Blood checks goals, recent activity, and decides if he should act."""
+        try:
+            for g in bot.guilds:
+                guild_id = str(g.id)
+                goals_summary = memory.get_goals_summary(guild_id, 400)
+                if not goals_summary:
+                    continue  # nothing to pursue
+
+                # Find a channel to act in
+                agent_ch_id = CONFIG.get("background_agent_channel_id")
+                channel = None
+                if agent_ch_id:
+                    channel = g.get_channel(int(agent_ch_id))
+                if not channel:
+                    # Fall back to first text channel Blood can see
+                    for ch in g.text_channels:
+                        if ch.permissions_for(g.me).send_messages:
+                            channel = ch
+                            break
+                if not channel:
+                    continue
+
+                # Read recent messages for context
+                recent_lines = []
+                try:
+                    async for msg in channel.history(limit=15):
+                        if not msg.author.bot:
+                            recent_lines.append(f"{msg.author.display_name}: {msg.content[:100]}")
+                except Exception:
+                    pass
+                recent_context = "\n".join(reversed(recent_lines[-10:])) if recent_lines else "(no recent activity)"
+
+                # Ask Blood if he should do something
+                agent_prompt = (
+                    f"You are Blood, autonomous agent for '{g.name}'. You run in the background every {CONFIG.get('background_agent_interval_min', 30)} minutes.\n\n"
+                    f"YOUR ACTIVE GOALS:\n{goals_summary}\n\n"
+                    f"RECENT CHAT in #{channel.name}:\n{recent_context}\n\n"
+                    f"Based on your goals and recent activity, should you do something right now?\n"
+                    f"Options:\n"
+                    f"- POST: <message> — post a message in the channel\n"
+                    f"- GOAL_COMPLETE: <id> — mark a goal as done\n"
+                    f"- PASS — do nothing this cycle\n\n"
+                    f"Reply with EXACTLY one option. Be selective — only act if it genuinely makes sense. Don't spam."
+                )
+                resp = await call_ai(
+                    system="You are Blood's autonomous background agent. Be concise. Output ONLY one action line.",
+                    messages=[{"role": "user", "content": agent_prompt}],
+                    tools=None,
+                    max_tokens=300,
+                )
+                action = (resp.get("message", {}).get("content") or "").strip()
+                await send_trace_log(g, f"[BG AGENT] decision: {action[:200]}")
+
+                if action.upper().startswith("PASS"):
+                    continue
+                elif action.upper().startswith("POST:"):
+                    msg_text = action[5:].strip()
+                    if msg_text:
+                        await channel.send(msg_text[:CONFIG["discord_message_limit"]])
+                        await send_trace_log(g, f"[BG AGENT] posted in #{channel.name}: {msg_text[:100]}")
+                elif action.upper().startswith("GOAL_COMPLETE:"):
+                    try:
+                        gid = int(action.split(":")[1].strip())
+                        result = memory.complete_goal(guild_id, gid)
+                        await send_trace_log(g, f"[BG AGENT] {result}")
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.error("Background agent loop error: %s", e)
+
+    @background_agent_loop.before_loop
+    async def before_background_agent():
+        await bot.wait_until_ready()
+
+    _reflection_lock = asyncio.Lock()
+
+    async def _maybe_reflect(guild, channel):
+        """Check if it's time for Blood to self-reflect and write a journal entry."""
+        try:
+            guild_id = str(guild.id)
+            interval = CONFIG.get("reflection_interval_messages", 50)
+            msg_count = memory.get_message_count_since_reflection(guild_id)
+            if msg_count < interval:
+                return
+
+            async with _reflection_lock:
+                # Double-check after acquiring lock
+                if memory.get_message_count_since_reflection(guild_id) < interval:
+                    return
+
+                await send_trace_log(guild, f"[REFLECTION] triggered after ~{msg_count} messages, generating...")
+
+                # Gather recent interactions for context
+                recent_lines = []
+                try:
+                    async for msg in channel.history(limit=30):
+                        who = "Blood" if msg.author.bot else msg.author.display_name
+                        recent_lines.append(f"{who}: {msg.content[:80]}")
+                except Exception:
+                    pass
+                recent_ctx = "\n".join(reversed(recent_lines[-20:])) if recent_lines else "(no context)"
+
+                goals_summary = memory.get_goals_summary(guild_id, 300)
+                goals_ctx = f"\nACTIVE GOALS:\n{goals_summary}" if goals_summary else ""
+
+                reflect_prompt = (
+                    f"You are Blood. Review your recent interactions and reflect honestly.\n\n"
+                    f"RECENT INTERACTIONS:\n{recent_ctx}\n{goals_ctx}\n\n"
+                    f"Write a short reflection (3-5 bullet points):\n"
+                    f"- What went well?\n"
+                    f"- What went poorly or could be improved?\n"
+                    f"- Any patterns you notice in how users interact with you?\n"
+                    f"- Any goals you should set, complete, or adjust?\n"
+                    f"- One thing to do differently next time.\n\n"
+                    f"Be honest and specific. This is your private journal."
+                )
+                resp = await call_ai(
+                    system="You are Blood writing a private reflection journal. Be honest, concise, self-critical. 3-5 bullet points max.",
+                    messages=[{"role": "user", "content": reflect_prompt}],
+                    tools=None,
+                    max_tokens=500,
+                )
+                reflection = (resp.get("message", {}).get("content") or "").strip()
+                if reflection:
+                    memory.save_reflection(guild_id, reflection)
+                    await send_trace_log(guild, f"[REFLECTION] saved: {reflection[:200]}")
+        except Exception as e:
+            log.error("Reflection error: %s", e)
+
+    async def _run_reflection_command(guild, channel):
+        """Force a reflection — called by /reflect command."""
+        guild_id = str(guild.id)
+        await send_trace_log(guild, "[REFLECTION] manual trigger via /reflect")
+
+        recent_lines = []
+        try:
+            async for msg in channel.history(limit=30):
+                who = "Blood" if msg.author.bot else msg.author.display_name
+                recent_lines.append(f"{who}: {msg.content[:80]}")
+        except Exception:
+            pass
+        recent_ctx = "\n".join(reversed(recent_lines[-20:])) if recent_lines else "(no context)"
+
+        goals_summary = memory.get_goals_summary(guild_id, 300)
+        goals_ctx = f"\nACTIVE GOALS:\n{goals_summary}" if goals_summary else ""
+
+        reflect_prompt = (
+            f"You are Blood. Review your recent interactions and reflect honestly.\n\n"
+            f"RECENT INTERACTIONS:\n{recent_ctx}\n{goals_ctx}\n\n"
+            f"Write a short reflection (3-5 bullet points):\n"
+            f"- What went well?\n- What went poorly?\n- Patterns noticed?\n- Goal adjustments?\n- One change for next time.\n\n"
+            f"Be honest and specific. This is your private journal."
+        )
+        resp = await call_ai(
+            system="You are Blood writing a private reflection journal. Be honest, concise, self-critical. 3-5 bullet points max.",
+            messages=[{"role": "user", "content": reflect_prompt}],
+            tools=None,
+            max_tokens=500,
+        )
+        reflection = (resp.get("message", {}).get("content") or "").strip()
+        if reflection:
+            memory.save_reflection(guild_id, reflection)
+            await send_trace_log(guild, f"[REFLECTION] saved: {reflection[:200]}")
+            return reflection
+        return "Reflection failed — couldn't generate anything."
 
     @bot.event
     async def on_message(message):
@@ -1489,6 +1701,53 @@ if bot:
                 except Exception:
                     final_text = "brain glitched. ask again."
 
+            # ── Self-correction loop (AGI scaffold) ─────────────────────────
+            if (final_text
+                and CONFIG.get("self_correction_enabled")
+                and len(executed_tools_log) >= CONFIG.get("self_correction_min_tools", 1)
+                and not is_prompt_leak(final_text)
+                and not is_garbage_output(final_text)):
+                try:
+                    # Get the user's original question
+                    user_msg = ""
+                    for m in reversed(history):
+                        if m.get("role") == "user":
+                            c = m.get("content", "")
+                            user_msg = c if isinstance(c, str) else str(c)[:500]
+                            break
+                    tool_summary = "\n".join(f"- {t}" for t in executed_tools_log[:10])
+                    qa_prompt = (
+                        f"You are a QA checker for a Discord bot called Blood. Check this response:\n\n"
+                        f"USER QUESTION: {user_msg[:500]}\n\n"
+                        f"TOOLS USED:\n{tool_summary}\n\n"
+                        f"BLOOD'S RESPONSE: {final_text[:1000]}\n\n"
+                        f"Is this response: (a) relevant to the question, (b) factually consistent with the tools used, "
+                        f"(c) not empty/broken? Reply ONLY 'PASS' if good, or 'FAIL: <one-line reason>' if bad."
+                    )
+                    qa_resp = await call_ai(
+                        system="You are a strict QA checker. Output ONLY 'PASS' or 'FAIL: reason'. Nothing else.",
+                        messages=[{"role": "user", "content": qa_prompt}],
+                        tools=None,
+                        max_tokens=100,
+                    )
+                    qa_result = (qa_resp.get("message", {}).get("content") or "").strip()
+                    await send_trace_log(guild, f"[SELF-CHECK] {qa_result[:200]}")
+
+                    if qa_result.upper().startswith("FAIL") and CONFIG.get("self_correction_max_retries", 1) > 0:
+                        correction_system = system + f"\n\nQA FEEDBACK: Your previous response failed quality check: {qa_result}. Fix the issue and respond again. Keep it concise."
+                        correction_resp = await call_ai(
+                            system=correction_system,
+                            messages=history[-5:],
+                            tools=None,
+                        )
+                        corrected = clean_response(correction_resp.get("message", {}).get("content") or "")
+                        if corrected and not is_leaked_reasoning(corrected) and not is_garbage_output(corrected):
+                            await send_trace_log(guild, f"[SELF-CORRECTED] replaced response ({len(final_text)}→{len(corrected)} chars)")
+                            final_text = corrected
+                            usage = correction_resp.get("usage", usage)
+                except Exception as e:
+                    await send_trace_log(guild, f"[SELF-CHECK ERROR] {e}")
+
             # ── Empty response fallback ───────────────────────────────────────
             if not final_text:
                 await send_trace_log(guild, "[EMPTY RESPONSE] all iterations failed, nudge retry")
@@ -1593,6 +1852,12 @@ if bot:
                     handle_meme_pass(guild, message.channel, message.content, final_text, executed_tools_log)
                 )
 
+            # ── Pass 3: reflection check (AGI scaffold) ──────────────────────
+            if guild and CONFIG.get("reflection_enabled"):
+                bot.loop.create_task(
+                    _maybe_reflect(guild, message.channel)
+                )
+
         except Exception as e:
             log.error("Unhandled error in on_message: %s", e, exc_info=True)
             await send_trace_log(guild, f"[ERROR] unhandled: {type(e).__name__}: {str(e)[:300]}")
@@ -1617,6 +1882,8 @@ if bot:
             "`/reset` — clear all memory (admin+)\n"
             "`/fastdebug` — toggle live trace logs\n"
             "`/trump` — toggle Trump mode\n"
+            "`/reflect` — force Blood to self-reflect (admin+)\n"
+            "`/goals` — view Blood's active goals\n"
             "`/bloodhelp` — this message"
         ), inline=False)
         embed.add_field(name="Coins", value=(
@@ -2267,6 +2534,35 @@ if bot:
         else:
             _persona_overrides[ch_id] = "trump"
             await ctx.reply("```ansi\n\u001b[1;33m[PERSONA]\u001b[0m Trump mode ON. Blood is now the greatest president this server has ever seen. Tremendous. Many people are saying it.\n```")
+
+    @bot.hybrid_command(name="reflect", description="Force Blood to write a reflection journal entry (admin+)")
+    async def reflect_cmd(ctx):
+        perm = get_user_permission(ctx.author)
+        if perm not in ("owner", "admin"):
+            await ctx.reply("admin+ only.")
+            return
+        if not ctx.guild:
+            await ctx.reply("server only.")
+            return
+        await ctx.defer()
+        result = await _run_reflection_command(ctx.guild, ctx.channel)
+        await ctx.reply(f"```ansi\n\u001b[1;35m[REFLECTION]\u001b[0m Journal entry saved.\n```\n>>> {result[:1500]}")
+
+    @bot.hybrid_command(name="goals", description="Show Blood's active goals")
+    async def goals_cmd(ctx):
+        if not ctx.guild:
+            await ctx.reply("server only.")
+            return
+        guild_id = str(ctx.guild.id)
+        active = memory.list_goals(guild_id, "active")
+        if not active:
+            await ctx.reply("```ansi\n\u001b[1;33m[GOALS]\u001b[0m No active goals. Blood is aimless.\n```")
+            return
+        lines = []
+        for g in active:
+            prio = f" [{g['priority']}]" if g.get("priority", "normal") != "normal" else ""
+            lines.append(f"🎯 #{g['id']}{prio}: {g['text']}")
+        await ctx.reply(f"```ansi\n\u001b[1;33m[GOALS]\u001b[0m {len(active)} active goals\n```\n" + "\n".join(lines))
 
     @bot.hybrid_command(name="vsearch", aliases=["vs"], description="Visual vector memory search")
     async def vsearch_cmd(ctx, *, query: str):

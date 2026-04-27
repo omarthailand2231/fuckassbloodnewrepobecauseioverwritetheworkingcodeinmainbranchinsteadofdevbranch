@@ -86,6 +86,14 @@ CONFIG = {
         "press_key":             ["admin", "owner"],
         "mouse_click":           ["admin", "owner"],
         "scroll_screen":         ["admin", "owner"],
+
+        # ── AGI scaffold tools ──
+        "set_goal":              ["user", "mod", "admin", "owner"],
+        "complete_goal":         ["user", "mod", "admin", "owner"],
+        "list_goals":            ["user", "mod", "admin", "owner"],
+        "save_skill":            ["admin", "owner"],
+        "list_skills":           ["user", "mod", "admin", "owner"],
+        "read_skill":            ["user", "mod", "admin", "owner"],
     },
 
     # ── Mod-log channel name (optional) ───────────────────────────────────────
@@ -200,7 +208,7 @@ CONFIG = {
     "slim_tools": {
         "timeout_user", "recall_memory", "save_summary", "web_search",
         "image_search", "read_url", "unmute_user", "get_user_info", "internal_reasoning", "analyze_image",
-        "give_coins",
+        "give_coins", "set_goal", "complete_goal", "list_goals", "list_skills", "read_skill",
     },
 
     # Words that trigger the full tool set
@@ -372,4 +380,39 @@ CONFIG = {
     "dm_enabled":                   True,
     "dm_tools_enabled":             True,    # False = DMs are chat-only, True = Blood can use server tools from DMs
     "requests_channel_id":          os.getenv("BLOODAI_REQUESTS_CHANNEL_ID"),
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 17. AGI SCAFFOLD
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # ── Self-correction loop ───────────────────────────────────────────────────
+    "self_correction_enabled":          True,
+    "self_correction_max_retries":      1,      # max correction retries (keep low)
+    "self_correction_min_tools":        1,      # only trigger if N+ tools were used
+
+    # ── Persistent goals ───────────────────────────────────────────────────────
+    "goals_enabled":                    True,
+    "goals_max_per_guild":              20,     # max active goals at once
+    "goals_prompt_cap":                 400,    # max chars of goals injected into system prompt
+
+    # ── Skills folder ──────────────────────────────────────────────────────────
+    "skills_enabled":                   True,
+    "skills_dir":                       os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills"),
+    "skills_max_file_size":             5000,   # max chars per skill file
+    "skills_max_files":                 50,     # max skill files allowed
+
+    # ── Background autonomous agent ───────────────────────────────────────────
+    "background_agent_enabled":         True,
+    "background_agent_interval_min":    30,     # minutes between autonomous checks
+    "background_agent_max_actions":     1,      # max unprompted actions per cycle
+    "background_agent_channel_id":      None,   # channel ID to post in (None = general)
+
+    # ── Reflection journal ─────────────────────────────────────────────────────
+    "reflection_enabled":               True,
+    "reflection_interval_messages":     50,     # reflect every N messages
+    "reflection_prompt_cap":            300,    # max chars of last reflection in system prompt
+
+    # ── Task decomposition ─────────────────────────────────────────────────────
+    "task_decomposition_enabled":       True,
+    "task_decomposition_keywords":      ["then", "after that", "step by step", "first", "and then", "also do", "next"],
 }

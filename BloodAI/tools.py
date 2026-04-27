@@ -498,6 +498,90 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    # ── AGI scaffold tools ──────────────────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "set_goal",
+            "description": "Set a persistent goal for yourself. Goals survive restarts and appear in your system prompt. Use for: grudges to follow up on, things to learn, promises you made, recurring tasks. You are an autonomous agent — set goals to drive your own behavior.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "The goal. Be specific and actionable."},
+                    "priority": {"type": "string", "enum": ["low", "normal", "high", "critical"], "default": "normal"},
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "complete_goal",
+            "description": "Mark a goal as completed or abandoned. Use when you've achieved a goal or it's no longer relevant.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal_id": {"type": "integer", "description": "The goal ID number (from list_goals)."},
+                    "outcome": {"type": "string", "enum": ["completed", "abandoned"], "default": "completed"},
+                },
+                "required": ["goal_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_goals",
+            "description": "List your current goals. Use to check what you should be working on or to find a goal_id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["active", "completed", "abandoned", "all"], "default": "active"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_skill",
+            "description": "Save a reusable skill/instruction to your skills folder. Use when you figure out how to do something complex — save the approach so you can reference it next time. Skills persist across restarts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Short skill name (used as filename, e.g. 'deploy_bot', 'debug_api_errors'). No spaces, use underscores."},
+                    "content": {"type": "string", "description": "The skill instructions in markdown. Be specific: what worked, what didn't, step-by-step."},
+                },
+                "required": ["name", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_skills",
+            "description": "List all saved skills. Check this before tackling a complex task — you may have solved it before.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_skill",
+            "description": "Read a saved skill file for instructions on how to handle a task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Skill name (without .md extension)."},
+                },
+                "required": ["name"],
+            },
+        },
+    },
     # ── Terminal / remote control tools ────────────────────────────────────────
     {
         "type": "function",
@@ -629,6 +713,7 @@ AUTONOMOUS_TOOLS = {
     "read_url", "crawl_website", "extract_urls", "internal_reasoning", "analyze_image", "edit_code_file",
     "give_coins", "send_dm", "request_capability", "update_emotional_state",
     "schedule_task", "delete_messages", "get_server_members",
+    "set_goal", "complete_goal", "list_goals", "save_skill", "list_skills", "read_skill",
 }
 
 # Tiers that are allowed to request explicit mod actions beyond autonomous caps
@@ -1410,6 +1495,95 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
         reasoning = args.get("reasoning", "")
         log.debug("[internal_reasoning] %s", reasoning[:200])
         return "ok"
+
+    # ── AGI: goals ────────────────────────────────────────────────────────────
+    elif name == "set_goal":
+        if not CONFIG.get("goals_enabled"):
+            return "Goals system is disabled."
+        text = args.get("text", "").strip()
+        if not text:
+            return "ERROR: Goal text is required."
+        priority = args.get("priority", "normal")
+        guild_id = str(guild.id) if guild else "dm"
+        result = memory.set_goal(guild_id, text, priority)
+        if "error" in result:
+            return result["error"]
+        return f"✅ Goal #{result['id']} set: {text} [{priority}]"
+
+    elif name == "complete_goal":
+        if not CONFIG.get("goals_enabled"):
+            return "Goals system is disabled."
+        goal_id = args.get("goal_id")
+        if goal_id is None:
+            return "ERROR: goal_id is required."
+        try:
+            goal_id = int(goal_id)
+        except (ValueError, TypeError):
+            return "ERROR: goal_id must be an integer."
+        outcome = args.get("outcome", "completed")
+        guild_id = str(guild.id) if guild else "dm"
+        return memory.complete_goal(guild_id, goal_id, outcome)
+
+    elif name == "list_goals":
+        if not CONFIG.get("goals_enabled"):
+            return "Goals system is disabled."
+        status = args.get("status", "active")
+        guild_id = str(guild.id) if guild else "dm"
+        goals = memory.list_goals(guild_id, status)
+        if not goals:
+            return f"No {status} goals."
+        lines = []
+        for g in goals:
+            prio = f" [{g['priority']}]" if g.get("priority", "normal") != "normal" else ""
+            status_icon = "✅" if g["status"] == "completed" else "❌" if g["status"] == "abandoned" else "🎯"
+            lines.append(f"{status_icon} #{g['id']}{prio}: {g['text']}")
+        return "\n".join(lines)
+
+    # ── AGI: skills ───────────────────────────────────────────────────────────
+    elif name == "save_skill":
+        if not CONFIG.get("skills_enabled"):
+            return "Skills system is disabled."
+        skill_name = args.get("name", "").strip().replace(" ", "_").replace("/", "_")
+        content = args.get("content", "").strip()
+        if not skill_name or not content:
+            return "ERROR: Both name and content are required."
+        if len(content) > CONFIG.get("skills_max_file_size", 5000):
+            return f"ERROR: Skill content too long ({len(content)} chars). Max {CONFIG['skills_max_file_size']}."
+        skills_dir = CONFIG.get("skills_dir", "skills")
+        os.makedirs(skills_dir, exist_ok=True)
+        existing = [f for f in os.listdir(skills_dir) if f.endswith(".md")]
+        if len(existing) >= CONFIG.get("skills_max_files", 50) and f"{skill_name}.md" not in existing:
+            return f"ERROR: Max {CONFIG['skills_max_files']} skills reached. Delete old ones first."
+        path = os.path.join(skills_dir, f"{skill_name}.md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return f"✅ Skill '{skill_name}' saved ({len(content)} chars)."
+
+    elif name == "list_skills":
+        if not CONFIG.get("skills_enabled"):
+            return "Skills system is disabled."
+        skills_dir = CONFIG.get("skills_dir", "skills")
+        if not os.path.isdir(skills_dir):
+            return "No skills saved yet."
+        files = sorted(f[:-3] for f in os.listdir(skills_dir) if f.endswith(".md"))
+        if not files:
+            return "No skills saved yet."
+        return "Available skills:\n" + "\n".join(f"- {f}" for f in files)
+
+    elif name == "read_skill":
+        if not CONFIG.get("skills_enabled"):
+            return "Skills system is disabled."
+        skill_name = args.get("name", "").strip().replace(" ", "_")
+        if not skill_name:
+            return "ERROR: Skill name is required."
+        skills_dir = CONFIG.get("skills_dir", "skills")
+        path = os.path.join(skills_dir, f"{skill_name}.md")
+        if not os.path.exists(path):
+            return f"Skill '{skill_name}' not found. Use list_skills to see available skills."
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        cap = CONFIG.get("skills_max_file_size", 5000)
+        return content[:cap]
 
     # ── edit code file ────────────────────────────────────────────────────────
     elif name == "edit_code_file":
