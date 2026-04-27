@@ -139,7 +139,7 @@ CONFIG = {
 
     # Per-user rate limiting (sliding window)
     "user_rate_limit":          1,      # max requests per window
-    "user_rate_window_sec":     60,     # window duration in seconds
+    "user_rate_window_sec":     10,     # window duration in seconds
     "rate_limit_bypass":        ["owner"],  # only owner bypasses the limit
 
     "max_tool_loop_steps":      30,     # max iterations in the tool loop
