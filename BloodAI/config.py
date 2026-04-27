@@ -33,23 +33,17 @@ CONFIG = {
 
     # ── Your Discord user IDs (full control) ──────────────────────────────────
     "owners": [
-        os.getenv("OWNER_ID", "1421582461556625509"),
+        os.getenv("OWNER_ID", ""),
     ],
 
     # ── Role IDs that get admin-level bot access ───────────────────────────────
-    "admin_roles": [
-        "1408992872338030663", "1457540581281497140"
-    ],
+    "admin_roles": [r for r in os.getenv("ADMIN_ROLE_IDS", "").split(",") if r.strip()],
 
     # ── Role IDs that get mod-level bot access ─────────────────────────────────
-    "mod_roles": [
-        # "123456789012345679",
-    ],
+    "mod_roles": [r for r in os.getenv("MOD_ROLE_IDS", "").split(",") if r.strip()],
 
     # ── User IDs completely blocked from using the bot ─────────────────────────
-    "blacklist": [
-        #"1039726938748633180",
-    ],
+    "blacklist": [b for b in os.getenv("BLACKLIST_IDS", "").split(",") if b.strip()],
 
     # ── Per-tool permission gates ──────────────────────────────────────────────
     "tool_permissions": {
@@ -99,9 +93,9 @@ CONFIG = {
     # ── Mod-log channel name (optional) ───────────────────────────────────────
     "mod_log_channel": "blood-log",
     # ── AI trace/log channel (thoughts/progress/errors, no memory dumps) ─────
-    "trace_channel_id": "1486780492383649893",
+    "trace_channel_id": os.getenv("TRACE_CHANNEL_ID", ""),
     # ── Live terminal channel (scrolling code block with real-time logs) ──────
-    "terminal_channel_id": "1489516406470086809",
+    "terminal_channel_id": os.getenv("TERMINAL_CHANNEL_ID", ""),
     "terminal_max_lines": 35,           # max lines visible in the code block
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -305,12 +299,12 @@ CONFIG = {
     # ═══════════════════════════════════════════════════════════════════════════
 
     # Dashboard (set to a channel ID string, or None to disable)
-    "dashboard_channel_id":         "1486952381286580234",
+    "dashboard_channel_id":         os.getenv("DASHBOARD_CHANNEL_ID", ""),
     "dashboard_refresh_minutes":    5,
     "dashboard_leaderboard_limit":  5,
 
     # Yap leaderboard (separate auto-updating message)
-    "yap_leaderboard_channel_id":   "1486952381286580234",
+    "yap_leaderboard_channel_id":   os.getenv("DASHBOARD_CHANNEL_ID", ""),
     "yap_leaderboard_limit":        10,
 
     # ═══════════════════════════════════════════════════════════════════════════

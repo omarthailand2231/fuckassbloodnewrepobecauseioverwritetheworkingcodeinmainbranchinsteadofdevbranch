@@ -1,5 +1,9 @@
 # BloodAI
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![discord.py](https://img.shields.io/badge/discord.py-2.3+-5865F2.svg)](https://discordpy.readthedocs.io/)
+
 A ruthless, autonomous Discord bot with a god complex. Powered by Kimi K2 (Fireworks), BloodAI is not an assistant — he's a sarcastic, unhinged dictator with real admin powers, a coin economy, a stock market, remote desktop control, and a full AGI-like autonomy scaffold that lets him set goals, self-correct, reflect on his behavior, and act independently.
 
 ---

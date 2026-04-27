@@ -1,5 +1,32 @@
-memory/
-.DS_Store
+# Secrets
+.env
+*.env
+
+# Runtime
 __pycache__/
 *.pyc
-.env
+*.pyo
+venv/
+.venv/
+
+# Memory / data
+memory/
+skills/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Dev notes (keep local, don't publish)
+handoff.md
+info.md
+tofix.md
+uselater.md
+test_*.py
+test_*.txt
