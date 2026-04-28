@@ -760,17 +760,23 @@ def _split_message(text: str, limit: int = 1900) -> list[str]:
             chunks.append(text)
             break
 
-        # Check if we're inside a code block
         chunk = text[:limit]
         backticks = chunk.count("```")
         inside_codeblock = backticks % 2 == 1
 
         if inside_codeblock:
-            # Don't split inside a code block — find the last newline before it
+            # Find the LAST ``` in the chunk — this is the unclosed opening delimiter
             last_triple = chunk.rfind("```")
+            # Try to split BEFORE the code block
             cut = text.rfind('\n', 0, last_triple)
-            if cut < limit // 2:
-                cut = last_triple
+            # If no good split before the code block, split WITHIN it and close/reopen
+            if cut <= 0:
+                after_open_line = text.find('\n', last_triple)
+                if after_open_line == -1:
+                    after_open_line = last_triple + 3
+                cut = text.rfind('\n', after_open_line + 1, limit)
+                if cut <= after_open_line:
+                    cut = limit
         else:
             # Normal split — prefer newline, then space, then hard cut
             cut = text.rfind('\n', 0, limit)
@@ -778,6 +784,10 @@ def _split_message(text: str, limit: int = 1900) -> list[str]:
                 cut = text.rfind(' ', 0, limit)
             if cut < limit // 2:
                 cut = limit
+
+        # Safety: ensure we always make forward progress (avoid infinite loop)
+        if cut <= 0:
+            cut = min(limit, max(1, len(text) // 2))
 
         piece = text[:cut]
         remainder = text[cut:].lstrip('\n')
