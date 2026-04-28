@@ -88,6 +88,93 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "unban_user",
+            "description": "Unban a previously banned user from the server.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["user_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lock_channel",
+            "description": "Lock a text channel — prevent @everyone from sending messages.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_id": {"type": "string", "description": "Channel to lock. Omit for current channel."},
+                    "reason": {"type": "string"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "unlock_channel",
+            "description": "Unlock a text channel — allow @everyone to send messages again.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_id": {"type": "string", "description": "Channel to unlock. Omit for current channel."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "move_member",
+            "description": "Move a user to a different voice channel.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string"},
+                    "channel_name": {"type": "string", "description": "Name of the voice channel to move them to."},
+                },
+                "required": ["user_id", "channel_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mute_voice",
+            "description": "Server mute a user in voice channels (prevent them from speaking).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["user_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "deafen_voice",
+            "description": "Server deafen a user in voice channels (prevent them from hearing).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["user_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "delete_messages",
             "description": "Bulk delete messages. Supports >100 via automatic pagination. Defaults to current channel unless channel_id is specified.",
             "parameters": {
@@ -1010,6 +1097,120 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
         except Exception as e:
             return f"Unmute failed: {e}"
 
+    # ── unban ─────────────────────────────────────────────────────────────────
+    elif name == "unban_user":
+        user_id = _clean_id(args["user_id"])
+        reason = args.get("reason", "no reason")
+        try:
+            user_obj = await guild.fetch_ban(discord.Object(id=int(user_id)))
+            if not user_obj:
+                return f"User {args['user_id']} is not banned."
+            await guild.unban(user_obj.user, reason=f"[Blood] {reason} — by {invoker}")
+            memory.append_action_log(str(guild.id), f"I unbanned '{user_obj.user.display_name}' ({user_id}). Triggered by {invoker.display_name}.")
+            await mod_log(f"Unbanned {user_obj.user.mention} — {reason} (by {invoker.mention})")
+            return f"Unbanned {user_obj.user.display_name}."
+        except discord.NotFound:
+            return f"User {args['user_id']} is not banned."
+        except discord.Forbidden:
+            return "No permission to unban."
+        except Exception as e:
+            return f"Unban failed: {e}"
+
+    # ── lock channel ────────────────────────────────────────────────────────────
+    elif name == "lock_channel":
+        target_ch = channel
+        if args.get("channel_id"):
+            ch_id = _clean_id(args["channel_id"])
+            resolved = guild.get_channel(int(ch_id))
+            if resolved is None:
+                return f"Could not find channel {args['channel_id']}."
+            target_ch = resolved
+        reason = args.get("reason", "no reason")
+        try:
+            everyone = guild.default_role
+            overwrite = target_ch.overwrites_for(everyone)
+            overwrite.send_messages = False
+            await target_ch.set_permissions(everyone, overwrite=overwrite, reason=f"[Blood] {reason} — by {invoker}")
+            memory.append_action_log(str(guild.id), f"I locked #{target_ch.name}. Triggered by {invoker.display_name}.")
+            await mod_log(f"Locked #{target_ch.name} — {reason} (by {invoker.mention})")
+            return f"🔒 Locked #{target_ch.name}."
+        except discord.Forbidden:
+            return "No permission to lock channel."
+        except Exception as e:
+            return f"Lock failed: {e}"
+
+    # ── unlock channel ──────────────────────────────────────────────────────────
+    elif name == "unlock_channel":
+        target_ch = channel
+        if args.get("channel_id"):
+            ch_id = _clean_id(args["channel_id"])
+            resolved = guild.get_channel(int(ch_id))
+            if resolved is None:
+                return f"Could not find channel {args['channel_id']}."
+            target_ch = resolved
+        try:
+            everyone = guild.default_role
+            overwrite = target_ch.overwrites_for(everyone)
+            overwrite.send_messages = None  # Reset to default
+            await target_ch.set_permissions(everyone, overwrite=overwrite, reason=f"[Blood] Unlocked by {invoker}")
+            memory.append_action_log(str(guild.id), f"I unlocked #{target_ch.name}. Triggered by {invoker.display_name}.")
+            await mod_log(f"Unlocked #{target_ch.name} (by {invoker.mention})")
+            return f"🔓 Unlocked #{target_ch.name}."
+        except discord.Forbidden:
+            return "No permission to unlock channel."
+        except Exception as e:
+            return f"Unlock failed: {e}"
+
+    # ── move member ─────────────────────────────────────────────────────────────
+    elif name == "move_member":
+        m = await resolve(args["user_id"])
+        if not m: return f"Could not find user {args['user_id']}."
+        if not m.voice or not m.voice.channel:
+            return f"{m.display_name} is not in a voice channel."
+        ch_name = args.get("channel_name", "").strip()
+        target_vc = discord.utils.get(guild.voice_channels, name=ch_name)
+        if not target_vc:
+            return f"Voice channel '{ch_name}' not found."
+        try:
+            await m.move_to(target_vc, reason=f"[Blood] Moved by {invoker}")
+            memory.append_action_log(str(guild.id), f"I moved '{m.display_name}' to #{target_vc.name}. Triggered by {invoker.display_name}.")
+            await mod_log(f"Moved {m.mention} to #{target_vc.name} (by {invoker.mention})")
+            return f"Moved {m.display_name} to #{target_vc.name}."
+        except discord.Forbidden:
+            return "No permission to move members."
+        except Exception as e:
+            return f"Move failed: {e}"
+
+    # ── mute voice ─────────────────────────────────────────────────────────────
+    elif name == "mute_voice":
+        m = await resolve(args["user_id"])
+        if not m: return f"Could not find user {args['user_id']}."
+        reason = args.get("reason", "no reason")
+        try:
+            await m.edit(mute=True, reason=f"[Blood] {reason} — by {invoker}")
+            memory.append_action_log(str(guild.id), f"I server-muted '{m.display_name}'. Triggered by {invoker.display_name}.")
+            await mod_log(f"Server-muted {m.mention} — {reason} (by {invoker.mention})")
+            return f"🔇 Server-muted {m.display_name}."
+        except discord.Forbidden:
+            return "No permission to mute."
+        except Exception as e:
+            return f"Mute failed: {e}"
+
+    # ── deafen voice ────────────────────────────────────────────────────────────
+    elif name == "deafen_voice":
+        m = await resolve(args["user_id"])
+        if not m: return f"Could not find user {args['user_id']}."
+        reason = args.get("reason", "no reason")
+        try:
+            await m.edit(deafen=True, reason=f"[Blood] {reason} — by {invoker}")
+            memory.append_action_log(str(guild.id), f"I server-deafened '{m.display_name}'. Triggered by {invoker.display_name}.")
+            await mod_log(f"Server-deafened {m.mention} — {reason} (by {invoker.mention})")
+            return f"🔇🔇 Server-deafened {m.display_name}."
+        except discord.Forbidden:
+            return "No permission to deafen."
+        except Exception as e:
+            return f"Deafen failed: {e}"
+
     # ── delete messages ───────────────────────────────────────────────────────
     elif name == "delete_messages":
         count = min(int(args.get("count", 5)), 500)
@@ -1583,7 +1784,6 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
         # Send visible message in chat
         if channel:
             try:
-                import asyncio
                 asyncio.get_event_loop().create_task(
                     channel.send(f"*reading '{skill_name}' skill...*")
                 )
