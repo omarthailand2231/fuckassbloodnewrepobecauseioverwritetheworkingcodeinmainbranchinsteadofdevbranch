@@ -572,7 +572,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "read_skill",
-            "description": "Read a saved skill file for instructions on how to handle a task.",
+            "description": "Read a saved skill file for instructions on how to handle a task. Only call this when the task clearly matches a skill's domain (e.g. frontend-design for web UI tasks). A visible '*reading X skill*' message will appear in chat.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1580,6 +1580,15 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
         path = os.path.join(skills_dir, f"{skill_name}.md")
         if not os.path.exists(path):
             return f"Skill '{skill_name}' not found. Use list_skills to see available skills."
+        # Send visible message in chat
+        if channel:
+            try:
+                import asyncio
+                asyncio.get_event_loop().create_task(
+                    channel.send(f"*reading '{skill_name}' skill...*")
+                )
+            except Exception:
+                pass
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
         cap = CONFIG.get("skills_max_file_size", 5000)

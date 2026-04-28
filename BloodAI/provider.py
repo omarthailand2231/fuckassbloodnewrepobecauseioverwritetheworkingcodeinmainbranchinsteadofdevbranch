@@ -29,6 +29,9 @@ MOONSHOT_API_KEY = os.getenv("MOONSHOT_API_KEY")
 MOONSHOT_BASE_URL = CONFIG["moonshot_base_url"]
 MOONSHOT_MODEL = CONFIG["moonshot_model"]
 
+# Global semaphore — max 3 concurrent Fireworks calls to avoid rate limit storms
+_api_semaphore = asyncio.Semaphore(3)
+
 # ── Rate limit tracker ────────────────────────────────────────────────────────
 _rate_limits: dict[str, dict] = {}
 
@@ -136,16 +139,24 @@ async def _moonshot_call(system: str, messages: list[dict],
 
     url = f"{MOONSHOT_BASE_URL}/chat/completions"
 
-    for attempt in range(3):
+    max_attempts = 5
+    for attempt in range(max_attempts):
         try:
-            async with aiohttp.ClientSession() as session:
+            async with _api_semaphore:
+              async with aiohttp.ClientSession() as session:
                 timeout = aiohttp.ClientTimeout(total=120 if use_stream else 60)
                 async with session.post(url, headers=headers, json=payload,
                                         timeout=timeout) as resp:
                     if resp.status == 429:
                         retry_after = float(resp.headers.get("Retry-After", 2))
-                        log.warning("Moonshot 429, retrying after %.1fs", retry_after)
-                        await asyncio.sleep(min(retry_after, 10))
+                        backoff = min(retry_after * (1.5 ** attempt), 30)
+                        log.warning("Moonshot 429 (attempt %d/%d), retrying after %.1fs", attempt+1, max_attempts, backoff)
+                        await asyncio.sleep(backoff)
+                        continue
+                    if resp.status in (500, 502, 503):
+                        backoff = 2 * (2 ** attempt)
+                        log.warning("Moonshot %d (attempt %d/%d), retrying after %.1fs", resp.status, attempt+1, max_attempts, backoff)
+                        await asyncio.sleep(backoff)
                         continue
                     if resp.status == 400:
                         err_body = await resp.text()
@@ -234,9 +245,11 @@ async def _moonshot_call(system: str, messages: list[dict],
         except RuntimeError:
             raise
         except Exception as e:
-            if attempt >= 2:
-                raise RuntimeError(f"Moonshot failed after 3 attempts: {e}")
-            await asyncio.sleep(1)
+            if attempt >= max_attempts - 1:
+                raise RuntimeError(f"Moonshot failed after {max_attempts} attempts: {e}")
+            backoff = 2 * (2 ** attempt)
+            log.warning("Moonshot exception (attempt %d/%d): %s — retrying in %.1fs", attempt+1, max_attempts, e, backoff)
+            await asyncio.sleep(backoff)
 
     raise RuntimeError("Moonshot: max retries exceeded")
 
