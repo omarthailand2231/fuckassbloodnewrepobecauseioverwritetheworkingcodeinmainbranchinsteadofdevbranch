@@ -750,7 +750,8 @@ async def safe_reply(message, content):
     return first_msg
 
 def _split_message(text: str, limit: int = 1900) -> list[str]:
-    """Split text into chunks that fit Discord's message limit, preferring newline breaks."""
+    """Split text into chunks that fit Discord's message limit, preferring newline breaks.
+    Preserves code blocks by closing/reopening them across chunk boundaries."""
     if len(text) <= limit:
         return [text]
     chunks = []
@@ -758,14 +759,38 @@ def _split_message(text: str, limit: int = 1900) -> list[str]:
         if len(text) <= limit:
             chunks.append(text)
             break
-        # Try to split at a newline
-        cut = text.rfind('\n', 0, limit)
-        if cut < limit // 2:  # newline too far back, try space
-            cut = text.rfind(' ', 0, limit)
-        if cut < limit // 2:  # no good break point, hard cut
-            cut = limit
-        chunks.append(text[:cut])
-        text = text[cut:].lstrip('\n')
+
+        # Check if we're inside a code block
+        chunk = text[:limit]
+        backticks = chunk.count("```")
+        inside_codeblock = backticks % 2 == 1
+
+        if inside_codeblock:
+            # Don't split inside a code block — find the last newline before it
+            last_triple = chunk.rfind("```")
+            cut = text.rfind('\n', 0, last_triple)
+            if cut < limit // 2:
+                cut = last_triple
+        else:
+            # Normal split — prefer newline, then space, then hard cut
+            cut = text.rfind('\n', 0, limit)
+            if cut < limit // 2:
+                cut = text.rfind(' ', 0, limit)
+            if cut < limit // 2:
+                cut = limit
+
+        piece = text[:cut]
+        remainder = text[cut:].lstrip('\n')
+
+        # If we were inside a code block, close it in this chunk and reopen in next
+        if inside_codeblock and "```" in piece:
+            piece += "\n```"
+            if remainder.startswith("```"):
+                remainder = remainder[3:].lstrip('\n')
+            remainder = "```\n" + remainder
+
+        chunks.append(piece)
+        text = remainder
     return chunks
 
 async def safe_progress_start(message, content):
