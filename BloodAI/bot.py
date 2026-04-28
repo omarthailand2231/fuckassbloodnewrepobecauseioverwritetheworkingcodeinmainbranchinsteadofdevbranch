@@ -1697,20 +1697,28 @@ if bot:
                         tool_result = f"PERMISSION_DENIED: {perm} cannot use {fn_name}. Tell the user in-character."
                     else:
                         await send_trace_log(guild, f"[TOOL] calling `{fn_name}` args={json.dumps(fn_args)[:700]}")
-                        tool_result = await execute_tool(
-                            fn_name, fn_args,
-                            guild=guild,
-                            invoker=message.author,
-                            channel=message.channel,
-                            mentioned_members=mentioned_members,
-                            memory=memory,
-                            permission=perm,
-                        )
+                        try:
+                            tool_result = await execute_tool(
+                                fn_name, fn_args,
+                                guild=guild,
+                                invoker=message.author,
+                                channel=message.channel,
+                                mentioned_members=mentioned_members,
+                                memory=memory,
+                                permission=perm,
+                            )
+                        except Exception as e:
+                            log.error("Tool %s failed: %s", fn_name, e, exc_info=True)
+                            await send_trace_log(guild, f"[TOOL ERROR] {fn_name}: {type(e).__name__}")
+                            tool_result = f"ERROR: {fn_name} failed ({type(e).__name__}). Tell the user what happened."
 
-                    if fn_name in {"recall_memory", "get_user_history", "save_summary", "read_channel_history", "read_url"}:
-                        await send_trace_log(guild, f"[TOOL RESULT] `{fn_name}` completed (payload omitted)")
-                    else:
-                        await send_trace_log(guild, f"[TOOL RESULT] `{fn_name}` => {str(tool_result)[:1200]}")
+                    try:
+                        if fn_name in {"recall_memory", "get_user_history", "save_summary", "read_channel_history", "read_url"}:
+                            await send_trace_log(guild, f"[TOOL RESULT] `{fn_name}` completed (payload omitted)")
+                        else:
+                            await send_trace_log(guild, f"[TOOL RESULT] `{fn_name}` => {str(tool_result)[:1200]}")
+                    except Exception:
+                        pass  # Trace log failed, continue
 
                     if fn_name != "internal_reasoning":
                         executed_tools_log.append(

@@ -1653,17 +1653,22 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
 
         blocks_to_animate = blocks[:2]
         msg = None
-        for block in blocks_to_animate:
-            state1 = [line for line in block if not line.startswith("+")]
-            text1 = f"```diff\n--- Editing {filename} ---\n" + "\n".join(state1)[:1900] + "\n```"
-            if not msg: msg = await channel.send(text1)
-            else: await msg.edit(content=text1)
-            await asyncio.sleep(1.5)
+        try:
+            for block in blocks_to_animate:
+                state1 = [line for line in block if not line.startswith("+")]
+                text1 = f"```diff\n--- Editing {filename} ---\n" + "\n".join(state1)[:1900] + "\n```"
+                if not msg:
+                    msg = await channel.send(text1)
+                else:
+                    await msg.edit(content=text1)
+                await asyncio.sleep(1.5)
 
-            state2 = [line for line in block if not line.startswith("-")]
-            text2 = f"```diff\n--- Editing {filename} ---\n" + "\n".join(state2)[:1900] + "\n```"
-            await msg.edit(content=text2)
-            await asyncio.sleep(1.5)
+                state2 = [line for line in block if not line.startswith("-")]
+                text2 = f"```diff\n--- Editing {filename} ---\n" + "\n".join(state2)[:1900] + "\n```"
+                await msg.edit(content=text2)
+                await asyncio.sleep(1.5)
+        except Exception:
+            pass  # Animation failed, continue to deliver the file/diff
 
         file_bytes = io.BytesIO(new_content.encode('utf-8'))
         discord_file = discord.File(file_bytes, filename=filename)
@@ -1674,8 +1679,14 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
             await channel.send(final_text, file=discord_file)
         except discord.Forbidden:
             await channel.send(final_text + "\n\n*(Error: File upload blocked)*")
+        except Exception:
+            await channel.send(f"**{summary}**\n(File sent without diff preview)")
 
-        if msg: await msg.edit(content=f"```diff\n--- Finished {filename} ---\n```")
+        if msg:
+            try:
+                await msg.edit(content=f"```diff\n--- Finished {filename} ---\n```")
+            except Exception:
+                pass
         memory.file_cache[filename] = new_content
         result = f"Successfully edited {filename}."
         if find_replace:
