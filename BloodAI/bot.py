@@ -997,10 +997,22 @@ if bot:
             log.info("Synced %d slash commands", len(synced))
         except Exception as e:
             log.error("Failed to sync slash commands: %s", e)
+        # Log available skills on startup
+        skills_dir = CONFIG.get("skills_dir", "skills")
+        if CONFIG.get("skills_enabled") and os.path.isdir(skills_dir):
+            skill_files = sorted(f[:-3] for f in os.listdir(skills_dir) if f.endswith(".md"))
+            if skill_files:
+                log.info("Skills loaded: %s", ", ".join(skill_files))
+            else:
+                log.info("Skills directory empty")
         for g in bot.guilds:
             await terminal_push(g, f"[BOOT] Blood online — {bot.user} ({bot.user.id})")
             await terminal_push(g, f"[BOOT] Server: {g.name} | Members: {g.member_count}")
             await terminal_push(g, f"[BOOT] Channels: {len(g.text_channels)} text | {len(g.voice_channels)} voice")
+            if CONFIG.get("skills_enabled") and os.path.isdir(skills_dir):
+                skill_files = sorted(f[:-3] for f in os.listdir(skills_dir) if f.endswith(".md"))
+                if skill_files:
+                    await terminal_push(g, f"[BOOT] Skills: {', '.join(skill_files)}")
         memory.cleanup_old_entries()
         # Background vector index for existing memory files (threaded to avoid blocking)
         async def _bg_vector_index():
