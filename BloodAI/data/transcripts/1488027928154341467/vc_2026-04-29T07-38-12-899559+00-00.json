@@ -1,0 +1,21 @@
+{
+  "channel_name": "ห้องนั่งเล่น",
+  "joined_at": "2026-04-29T07:38:12.899559+00:00",
+  "left_at": "2026-04-29T07:42:21.359177+00:00",
+  "transcript": [
+    {
+      "timestamp": "2026-04-29T07:39:23.476193+00:00",
+      "user_id": 1431278765710901323,
+      "user_name": "SAKUT310",
+      "text": "[joined voice channel]",
+      "channel_name": "ห้องนั่งเล่น"
+    },
+    {
+      "timestamp": "2026-04-29T07:39:31.346953+00:00",
+      "user_id": 1431278765710901323,
+      "user_name": "SAKUT310",
+      "text": "[left voice channel]",
+      "channel_name": "ห้องนั่งเล่น"
+    }
+  ]
+}

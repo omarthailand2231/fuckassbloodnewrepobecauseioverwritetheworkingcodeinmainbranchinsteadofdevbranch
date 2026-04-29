@@ -3005,10 +3005,33 @@ if bot:
     @bot.event
     async def on_voice_state_update(member, before, after):
         """Track VC joins/leaves for transcript and activity monitoring."""
-        if member.bot:
-            return
         guild = member.guild
         guild_id = str(guild.id)
+
+        # ── Bot itself got disconnected from voice — auto-rejoin ──
+        if member.id == bot.user.id:
+            if before.channel is not None and after.channel is None:
+                log.warning("Blood was disconnected from VC '%s' — attempting auto-rejoin", before.channel.name)
+                await asyncio.sleep(3)  # Wait for connection to stabilize
+                try:
+                    from voice import get_active_sink, get_music_queue, get_random_dj, join_and_listen
+                    sink = get_active_sink(guild_id)
+                    tc = sink.text_channel if sink else None
+                    result = await join_and_listen(guild, before.channel, tc, bot)
+                    log.info("Auto-rejoin result: %s", result[:80])
+                    # Resume DJ if it was active
+                    dj = get_random_dj(guild_id)
+                    mq = get_music_queue(guild_id)
+                    if dj.is_active and not (mq._mixer and mq._mixer.has_music):
+                        from voice import _dj_loop
+                        asyncio.create_task(_dj_loop(guild, tc))
+                        log.info("Restarted DJ loop after auto-rejoin")
+                except Exception as e:
+                    log.warning("Auto-rejoin failed: %s", e)
+            return  # Don't track bot's own state changes
+
+        if member.bot:
+            return
 
         try:
             from voice import add_transcript_entry, get_active_sink

@@ -1408,8 +1408,9 @@ class BloodAudioSink:
         mq = get_music_queue(self.guild_id)
         mixer = mq._mixer
 
-        if mixer and mixer.has_music:
-            # Music is playing — feed TTS into mixer (auto-ducks music)
+        if mixer and (mixer.has_music or vc.is_playing()):
+            # Mixer is active (music playing or mixer is current vc source)
+            # Feed TTS through mixer — auto-ducks music if any
             try:
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, mixer.feed_tts_sync, mp3_data)
@@ -1417,8 +1418,12 @@ class BloodAudioSink:
             except Exception as e:
                 log.warning("TTS via mixer failed: %s", e)
         else:
-            # No music playing — play TTS directly
+            # No mixer at all — play TTS directly
             try:
+                # Make sure nothing else is playing
+                if vc.is_playing():
+                    vc.stop()
+
                 source = FFmpegPCMAudioPipe(mp3_data)
                 source.prepare()
 
