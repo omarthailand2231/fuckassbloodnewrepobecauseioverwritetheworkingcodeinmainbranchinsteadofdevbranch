@@ -350,6 +350,58 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "play_music",
+            "description": "Play music in voice channel. Supports YouTube URLs, Spotify URLs, SoundCloud URLs, or search by song name/artist. YouTube is used by default for search. If already playing, adds to queue.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "URL or search query (e.g. 'Never Gonna Give You Up' or 'https://youtube.com/...')"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skip_music",
+            "description": "Skip the current song and play the next one in queue.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stop_music",
+            "description": "Stop music playback and clear the queue.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "music_queue",
+            "description": "Show the current music queue and what's playing.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "music_volume",
+            "description": "Set music volume (0-100).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "volume": {"type": "integer", "description": "Volume level 0-100."},
+                },
+                "required": ["volume"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "set_nickname",
             "description": "Change a user's nickname in the server.",
             "parameters": {
@@ -1482,6 +1534,48 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
                 return f"Failed to join VC: {e}"
         except Exception as e:
             return f"Failed to join VC: {e}"
+
+    # ── music tools ──────────────────────────────────────────────────────────
+    elif name == "play_music":
+        query = args.get("query", "").strip()
+        if not query:
+            return "No song specified."
+        try:
+            from voice import play_music as _play_music
+            return await _play_music(guild, query, invoker.display_name, channel)
+        except ImportError:
+            return "Voice/music module not available."
+        except Exception as e:
+            return f"Music playback failed: {e}"
+
+    elif name == "skip_music":
+        try:
+            from voice import skip_music as _skip
+            return await _skip(guild)
+        except ImportError:
+            return "Voice/music module not available."
+
+    elif name == "stop_music":
+        try:
+            from voice import stop_music as _stop
+            return await _stop(guild)
+        except ImportError:
+            return "Voice/music module not available."
+
+    elif name == "music_queue":
+        try:
+            from voice import get_queue_info
+            return get_queue_info(str(guild.id))
+        except ImportError:
+            return "Voice/music module not available."
+
+    elif name == "music_volume":
+        vol = int(args.get("volume", 50))
+        try:
+            from voice import set_music_volume
+            return set_music_volume(str(guild.id), vol / 100.0)
+        except ImportError:
+            return "Voice/music module not available."
 
     # ── set nickname ──────────────────────────────────────────────────────────
     elif name == "set_nickname":

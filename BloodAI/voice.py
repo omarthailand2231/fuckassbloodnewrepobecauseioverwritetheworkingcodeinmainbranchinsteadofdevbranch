@@ -41,6 +41,287 @@ SILENCE_THRESHOLD_SEC = 1.5  # Silence gap to consider speech ended
 MAX_SPEECH_SEC = 30  # Max single speech segment
 MIN_SPEECH_SEC = 0.3  # Ignore very short blips
 
+# ── Music Config ─────────────────────────────────────────────────────────────
+
+MUSIC_VOLUME = 0.5         # Default music volume (0.0-1.0)
+DUCK_VOLUME = 0.15         # Volume while Blood speaks
+DUCK_FADE_IN = 0.5         # Seconds before speech to duck
+DUCK_FADE_OUT = 0.3        # Seconds after speech to restore
+
+YTDL_OPTS = {
+    "format": "bestaudio/best",
+    "noplaylist": True,
+    "quiet": True,
+    "no_warnings": True,
+    "default_search": "ytsearch",
+    "source_address": "0.0.0.0",
+    "extract_flat": False,
+}
+
+FFMPEG_OPTS = {
+    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+    "options": "-vn -loglevel quiet",
+}
+
+
+# ── Music Queue ──────────────────────────────────────────────────────────────
+
+class MusicTrack:
+    __slots__ = ("title", "url", "stream_url", "duration", "requester", "source_type")
+
+    def __init__(self, title: str, url: str, stream_url: str,
+                 duration: int = 0, requester: str = "", source_type: str = "youtube"):
+        self.title = title
+        self.url = url
+        self.stream_url = stream_url
+        self.duration = duration
+        self.requester = requester
+        self.source_type = source_type
+
+    def __repr__(self):
+        return f"<Track: {self.title}>"
+
+
+class MusicQueue:
+    """Per-guild music queue with volume control."""
+
+    def __init__(self, guild_id: str):
+        self.guild_id = guild_id
+        self.queue: list[MusicTrack] = []
+        self.current: Optional[MusicTrack] = None
+        self.volume = MUSIC_VOLUME
+        self._volume_transformer: Optional[discord.PCMVolumeTransformer] = None
+        self.loop = False
+        self.paused = False
+
+    def add(self, track: MusicTrack):
+        self.queue.append(track)
+
+    def next(self) -> Optional[MusicTrack]:
+        if self.loop and self.current:
+            return self.current
+        if self.queue:
+            self.current = self.queue.pop(0)
+            return self.current
+        self.current = None
+        return None
+
+    def clear(self):
+        self.queue.clear()
+        self.current = None
+
+    def skip(self) -> Optional[MusicTrack]:
+        """Skip current, ignore loop."""
+        if self.queue:
+            self.current = self.queue.pop(0)
+            return self.current
+        self.current = None
+        return None
+
+    def duck(self):
+        """Lower volume for TTS."""
+        if self._volume_transformer:
+            self._volume_transformer.volume = DUCK_VOLUME
+
+    def unduck(self):
+        """Restore volume after TTS."""
+        if self._volume_transformer:
+            self._volume_transformer.volume = self.volume
+
+    @property
+    def is_empty(self):
+        return len(self.queue) == 0 and self.current is None
+
+
+# guild_id -> MusicQueue
+_music_queues: dict[str, MusicQueue] = {}
+
+
+def get_music_queue(guild_id: str) -> MusicQueue:
+    if guild_id not in _music_queues:
+        _music_queues[guild_id] = MusicQueue(guild_id)
+    return _music_queues[guild_id]
+
+
+# ── yt-dlp extraction ───────────────────────────────────────────────────────
+
+async def extract_track(query: str, requester: str = "") -> Optional[MusicTrack]:
+    """Extract audio info from URL or search query using yt-dlp."""
+    import re as _re
+
+    def _extract():
+        import yt_dlp
+        with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
+            # Detect if it's a URL
+            is_url = _re.match(r"https?://", query.strip())
+            if is_url:
+                info = ydl.extract_info(query.strip(), download=False)
+            else:
+                info = ydl.extract_info(f"ytsearch:{query}", download=False)
+                if "entries" in info:
+                    info = info["entries"][0]
+
+            if not info:
+                return None
+
+            # For Spotify URLs, yt-dlp may redirect to YouTube
+            stream_url = info.get("url") or info.get("webpage_url", "")
+            source = "youtube"
+            if "soundcloud" in info.get("extractor", "").lower():
+                source = "soundcloud"
+            elif "spotify" in query.lower():
+                source = "spotify"
+
+            return MusicTrack(
+                title=info.get("title", "Unknown"),
+                url=info.get("webpage_url", query),
+                stream_url=stream_url,
+                duration=info.get("duration", 0),
+                requester=requester,
+                source_type=source,
+            )
+
+    try:
+        return await asyncio.get_event_loop().run_in_executor(None, _extract)
+    except Exception as e:
+        log.warning("yt-dlp extraction failed for '%s': %s", query[:80], e)
+        return None
+
+
+# ── Playback ─────────────────────────────────────────────────────────────────
+
+async def play_track(guild: discord.Guild, track: MusicTrack,
+                     text_channel: Optional[discord.TextChannel] = None):
+    """Play a track in the guild's voice client."""
+    vc = guild.voice_client
+    if not vc or not vc.is_connected():
+        return
+
+    guild_id = str(guild.id)
+    mq = get_music_queue(guild_id)
+    mq.current = track
+
+    # Stop current playback
+    if vc.is_playing():
+        vc.stop()
+        await asyncio.sleep(0.2)
+
+    try:
+        source = discord.FFmpegPCMAudio(track.stream_url, **FFMPEG_OPTS)
+        volume_source = discord.PCMVolumeTransformer(source, volume=mq.volume)
+        mq._volume_transformer = volume_source
+
+        def after_play(error):
+            if error:
+                log.warning("Playback error: %s", error)
+            # Schedule next track
+            asyncio.run_coroutine_threadsafe(
+                _play_next(guild, text_channel), guild._state.loop
+            )
+
+        vc.play(volume_source, after=after_play)
+
+        # Announce in text channel
+        if text_channel:
+            dur = f" ({track.duration // 60}:{track.duration % 60:02d})" if track.duration else ""
+            icon = {"youtube": "🔴", "spotify": "🟢", "soundcloud": "🟠"}.get(track.source_type, "🎵")
+            try:
+                await text_channel.send(f"{icon} **Now playing:** {track.title}{dur} — requested by {track.requester}")
+            except Exception:
+                pass
+
+        log.info("Playing: %s (requested by %s)", track.title, track.requester)
+    except Exception as e:
+        log.warning("Failed to play track: %s", e)
+        # Try next
+        await _play_next(guild, text_channel)
+
+
+async def _play_next(guild: discord.Guild,
+                     text_channel: Optional[discord.TextChannel] = None):
+    """Play the next track in queue, or announce queue is empty."""
+    guild_id = str(guild.id)
+    mq = get_music_queue(guild_id)
+    nxt = mq.next()
+    if nxt:
+        await play_track(guild, nxt, text_channel)
+    else:
+        mq.current = None
+        # Don't announce — just stop silently
+
+
+async def play_music(guild: discord.Guild, query: str, requester: str = "",
+                     text_channel: Optional[discord.TextChannel] = None) -> str:
+    """High-level: extract track, add to queue, play if not playing."""
+    guild_id = str(guild.id)
+    vc = guild.voice_client
+    if not vc or not vc.is_connected():
+        return "❌ Not in a voice channel. Use /joinvc first."
+
+    track = await extract_track(query, requester)
+    if not track:
+        return f"❌ Could not find anything for: {query}"
+
+    mq = get_music_queue(guild_id)
+    if vc.is_playing() and mq.current:
+        mq.add(track)
+        pos = len(mq.queue)
+        return f"📋 **Queued #{pos}:** {track.title}"
+    else:
+        mq.current = track
+        await play_track(guild, track, text_channel)
+        return f"🎵 **Playing:** {track.title}"
+
+
+async def skip_music(guild: discord.Guild) -> str:
+    """Skip current track."""
+    vc = guild.voice_client
+    if not vc or not vc.is_playing():
+        return "Nothing is playing."
+    vc.stop()  # triggers after_play -> _play_next
+    return "⏭️ Skipped."
+
+
+async def stop_music(guild: discord.Guild) -> str:
+    """Stop playback and clear queue."""
+    guild_id = str(guild.id)
+    mq = get_music_queue(guild_id)
+    mq.clear()
+    vc = guild.voice_client
+    if vc and vc.is_playing():
+        vc.stop()
+    return "⏹️ Stopped and cleared queue."
+
+
+def get_queue_info(guild_id: str) -> str:
+    """Return formatted queue info."""
+    mq = get_music_queue(guild_id)
+    lines = []
+    if mq.current:
+        dur = f" ({mq.current.duration // 60}:{mq.current.duration % 60:02d})" if mq.current.duration else ""
+        lines.append(f"▶️ **Now:** {mq.current.title}{dur}")
+    if mq.queue:
+        for i, t in enumerate(mq.queue[:10], 1):
+            dur = f" ({t.duration // 60}:{t.duration % 60:02d})" if t.duration else ""
+            lines.append(f"`{i}.` {t.title}{dur}")
+        if len(mq.queue) > 10:
+            lines.append(f"... and {len(mq.queue) - 10} more")
+    if not lines:
+        return "Queue is empty."
+    lines.append(f"\n🔊 Volume: {int(mq.volume * 100)}%{' 🔁 Loop ON' if mq.loop else ''}")
+    return "\n".join(lines)
+
+
+def set_music_volume(guild_id: str, vol: float) -> str:
+    """Set volume (0.0-1.0)."""
+    vol = max(0.0, min(1.0, vol))
+    mq = get_music_queue(guild_id)
+    mq.volume = vol
+    if mq._volume_transformer:
+        mq._volume_transformer.volume = vol
+    return f"🔊 Volume set to {int(vol * 100)}%"
+
+
 # ── Transcript Storage ────────────────────────────────────────────────────────
 
 # guild_id -> list of transcript entries
@@ -511,16 +792,24 @@ class BloodAudioSink:
 
     async def _generate_response(self, user_id: int, user_name: str, text: str) -> Optional[str]:
         """Generate Blood's response using the AI provider."""
+        # Check if it's a music request first — handle directly
+        music_result = await self._check_music_request(text, user_name)
+        if music_result:
+            return music_result
+
         try:
             from provider import call_ai
             from config import CONFIG
 
-            # Build a compact voice-mode system prompt
+            # Compact voice-mode system prompt — NO YAPPING
             system = (
-                f"You are Blood, speaking in a voice channel. Keep responses SHORT (1-3 sentences max) "
-                f"since they will be spoken aloud via TTS. Be witty and natural. "
-                f"Don't use markdown, emojis, or formatting — just plain spoken text. "
-                f"The user '{user_name}' said: \"{text}\""
+                "You are Blood, in a voice channel. RULES:\n"
+                "- MAX 1-2 sentences. You're speaking aloud, not typing.\n"
+                "- No markdown, no emojis, no formatting. Plain speech only.\n"
+                "- Be witty but brief. Don't explain jokes. Don't ramble.\n"
+                "- If someone asks to play music, just say 'on it' or 'sure' — the music system handles the rest.\n"
+                "- You still have all your normal tools and can use them.\n"
+                f"Speaker: {user_name}"
             )
 
             # Include recent conversation context
@@ -533,15 +822,69 @@ class BloodAudioSink:
             if not context_msgs:
                 context_msgs = [{"role": "user", "content": f"[{user_name}] {text}"}]
 
-            result = await call_ai(system, context_msgs, max_tokens=200)
+            result = await call_ai(system, context_msgs, max_tokens=150)
             content = result.get("content", "").strip()
             return content if content else None
         except Exception as e:
             log.warning("Voice response generation failed: %s", e)
             return None
 
+    async def _check_music_request(self, text: str, requester: str) -> Optional[str]:
+        """Detect music requests in speech and handle them."""
+        lower = text.lower()
+
+        # Detect music-related keywords
+        play_keywords = ["play ", "put on ", "play me ", "เปิดเพลง", "เล่นเพลง", "เปิด"]
+        skip_keywords = ["skip", "next song", "next track", "ข้าม"]
+        stop_keywords = ["stop music", "stop the music", "หยุดเพลง"]
+        pause_keywords = ["pause", "หยุด"]
+        queue_keywords = ["what's playing", "queue", "now playing", "เพลงอะไร"]
+        volume_keywords = ["volume", "louder", "quieter", "เสียง"]
+
+        # URL paste detection
+        import re as _re
+        url_match = _re.search(r"(https?://\S+)", text)
+
+        guild = self.bot.get_guild(int(self.guild_id))
+        if not guild:
+            return None
+
+        # Skip
+        for kw in skip_keywords:
+            if kw in lower:
+                result = await skip_music(guild)
+                return result
+
+        # Stop
+        for kw in stop_keywords:
+            if kw in lower:
+                result = await stop_music(guild)
+                return result
+
+        # Queue info
+        for kw in queue_keywords:
+            if kw in lower:
+                return get_queue_info(self.guild_id)
+
+        # URL pasted
+        if url_match:
+            result = await play_music(guild, url_match.group(1), requester, self.text_channel)
+            return result
+
+        # Play request
+        for kw in play_keywords:
+            if kw in lower:
+                # Extract the song query after the keyword
+                idx = lower.index(kw) + len(kw)
+                query = text[idx:].strip()
+                if query:
+                    result = await play_music(guild, query, requester, self.text_channel)
+                    return result
+
+        return None
+
     async def _speak(self, text: str):
-        """Convert text to speech and play in voice channel."""
+        """Convert text to speech and play in voice channel. Ducks music if playing."""
         guild = self.bot.get_guild(int(self.guild_id))
         if not guild or not guild.voice_client:
             return
@@ -551,22 +894,47 @@ class BloodAudioSink:
             log.warning("TTS returned no audio")
             return
 
+        vc = guild.voice_client
+        mq = get_music_queue(self.guild_id)
+        music_was_playing = vc.is_playing() and mq.current is not None
+
         try:
+            # Duck music volume before speaking
+            if music_was_playing:
+                mq.duck()
+                await asyncio.sleep(DUCK_FADE_IN)
+                # Pause music, play TTS, then resume
+                vc.pause()
+                await asyncio.sleep(0.05)
+
             source = FFmpegPCMAudioPipe(mp3_data)
             source.prepare()
 
-            # Wait for any current audio to finish
-            vc = guild.voice_client
-            while vc.is_playing():
-                await asyncio.sleep(0.1)
+            # Play TTS
+            tts_done = asyncio.Event()
 
-            vc.play(source, after=lambda e: log.warning("TTS playback error: %s", e) if e else None)
+            def on_tts_done(error):
+                if error:
+                    log.warning("TTS playback error: %s", error)
+                tts_done.set()
 
-            # Wait for playback to finish
-            while vc.is_playing():
-                await asyncio.sleep(0.1)
+            vc.play(source, after=on_tts_done)
+            await tts_done.wait()
+
+            # Restore music after TTS
+            if music_was_playing:
+                await asyncio.sleep(DUCK_FADE_OUT)
+                mq.unduck()
+                vc.resume()
         except Exception as e:
             log.warning("Failed to play TTS: %s", e)
+            # Restore music on failure
+            if music_was_playing:
+                try:
+                    mq.unduck()
+                    vc.resume()
+                except Exception:
+                    pass
 
     async def _conversation_timeout(self):
         """Clear active conversation after timeout."""

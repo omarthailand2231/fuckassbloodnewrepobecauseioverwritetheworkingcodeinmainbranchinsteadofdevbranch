@@ -17,3 +17,4 @@ lxml>=5.0
 tiktoken>=0.7
 edge-tts>=7.0
 discord-ext-voice-recv>=0.5
+yt-dlp>=2024.0

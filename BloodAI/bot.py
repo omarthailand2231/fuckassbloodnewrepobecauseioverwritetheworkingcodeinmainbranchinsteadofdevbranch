@@ -1989,6 +1989,13 @@ if bot:
             "`/leavevc` — leave VC and save transcript\n"
             "`/transcript` — view recent VC transcripts"
         ), inline=False)
+        embed.add_field(name="Music", value=(
+            "`/play <song/url>` — play from YouTube/Spotify/SoundCloud\n"
+            "`/skip` — skip current song\n"
+            "`/stop` — stop & clear queue\n"
+            "`/queue` — show queue | `/np` — now playing\n"
+            "`/volume <0-100>` — set volume"
+        ), inline=False)
         embed.add_field(name="Remote Terminal (Admin+)", value=(
             "`/openterminal` — open remote session\n"
             "`/closeterminal` — close remote session"
@@ -2801,6 +2808,76 @@ if bot:
         embed.set_footer(text=f"Page {page}/{total_pages} | Use /transcript <page> for more")
 
         await ctx.reply(embed=embed, files=files_to_send[:5])  # Discord max 10 files
+
+    # ── Music Commands ─────────────────────────────────────────────────────
+
+    @bot.hybrid_command(name="play", aliases=["p"], description="Play music in VC (YouTube/Spotify/SoundCloud)")
+    async def play_cmd(ctx, *, query: str):
+        try:
+            from voice import play_music, join_and_listen
+        except ImportError:
+            await ctx.reply("Voice module not available.")
+            return
+        # Auto-join user's VC if not connected
+        if not ctx.guild.voice_client:
+            if ctx.author.voice and ctx.author.voice.channel:
+                await join_and_listen(ctx.guild, ctx.author.voice.channel, ctx.channel, bot)
+            else:
+                await ctx.reply("Join a voice channel first, or use /joinvc.")
+                return
+        await ctx.defer()
+        result = await play_music(ctx.guild, query, ctx.author.display_name, ctx.channel)
+        await ctx.reply(result)
+
+    @bot.hybrid_command(name="skip", description="Skip the current song")
+    async def skip_cmd(ctx):
+        try:
+            from voice import skip_music
+            result = await skip_music(ctx.guild)
+            await ctx.reply(result)
+        except ImportError:
+            await ctx.reply("Voice module not available.")
+
+    @bot.hybrid_command(name="stop", description="Stop music and clear queue")
+    async def stop_cmd(ctx):
+        try:
+            from voice import stop_music
+            result = await stop_music(ctx.guild)
+            await ctx.reply(result)
+        except ImportError:
+            await ctx.reply("Voice module not available.")
+
+    @bot.hybrid_command(name="queue", aliases=["q"], description="Show music queue")
+    async def queue_cmd(ctx):
+        try:
+            from voice import get_queue_info
+            info = get_queue_info(str(ctx.guild.id))
+            await ctx.reply(info)
+        except ImportError:
+            await ctx.reply("Voice module not available.")
+
+    @bot.hybrid_command(name="np", aliases=["nowplaying"], description="Show what's currently playing")
+    async def np_cmd(ctx):
+        try:
+            from voice import get_music_queue
+            mq = get_music_queue(str(ctx.guild.id))
+            if mq.current:
+                dur = f" ({mq.current.duration // 60}:{mq.current.duration % 60:02d})" if mq.current.duration else ""
+                icon = {"youtube": "🔴", "spotify": "🟢", "soundcloud": "🟠"}.get(mq.current.source_type, "🎵")
+                await ctx.reply(f"{icon} **Now playing:** {mq.current.title}{dur}")
+            else:
+                await ctx.reply("Nothing is playing.")
+        except ImportError:
+            await ctx.reply("Voice module not available.")
+
+    @bot.hybrid_command(name="volume", aliases=["vol"], description="Set music volume (0-100)")
+    async def volume_cmd(ctx, level: int = 50):
+        try:
+            from voice import set_music_volume
+            result = set_music_volume(str(ctx.guild.id), level / 100.0)
+            await ctx.reply(result)
+        except ImportError:
+            await ctx.reply("Voice module not available.")
 
     # ── Voice State Tracking ──────────────────────────────────────────────
 
