@@ -992,10 +992,13 @@ if bot:
     @bot.event
     async def on_ready():
         log.info("Blood is online as %s (%s)", bot.user, bot.user.id)
-        # Sync slash commands with Discord
+        # Sync slash commands with Discord (per-guild for instant, global for DMs)
         try:
+            for g in bot.guilds:
+                bot.tree.copy_global_to(guild=g)
+                await bot.tree.sync(guild=g)
             synced = await bot.tree.sync()
-            log.info("Synced %d slash commands", len(synced))
+            log.info("Synced %d slash commands (%d guilds)", len(synced), len(bot.guilds))
         except Exception as e:
             log.error("Failed to sync slash commands: %s", e)
         # Log available skills on startup
