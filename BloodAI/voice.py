@@ -322,6 +322,278 @@ def set_music_volume(guild_id: str, vol: float) -> str:
     return f"🔊 Volume set to {int(vol * 100)}%"
 
 
+# ── Music Taste / Recommendation System ──────────────────────────────────────
+
+TASTE_DIR = os.path.join(os.path.dirname(__file__), "data", "music_taste")
+os.makedirs(TASTE_DIR, exist_ok=True)
+
+# In-memory cache: user_id -> {"liked": [...], "disliked": [...]}
+_taste_cache: dict[str, dict] = {}
+
+
+def _load_taste(user_id: str) -> dict:
+    if user_id in _taste_cache:
+        return _taste_cache[user_id]
+    path = os.path.join(TASTE_DIR, f"{user_id}.json")
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {"liked": [], "disliked": []}
+    else:
+        data = {"liked": [], "disliked": []}
+    _taste_cache[user_id] = data
+    return data
+
+
+def _save_taste(user_id: str, data: dict):
+    _taste_cache[user_id] = data
+    path = os.path.join(TASTE_DIR, f"{user_id}.json")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def record_feedback(user_id: str, track_title: str, positive: bool):
+    """Record user's music taste feedback."""
+    data = _load_taste(user_id)
+    entry = track_title.strip()
+    if positive:
+        if entry not in data["liked"]:
+            data["liked"].append(entry)
+        # Remove from disliked if present
+        data["disliked"] = [d for d in data["disliked"] if d != entry]
+    else:
+        if entry not in data["disliked"]:
+            data["disliked"].append(entry)
+        data["liked"] = [l for l in data["liked"] if l != entry]
+    # Keep last 100 each
+    data["liked"] = data["liked"][-100:]
+    data["disliked"] = data["disliked"][-100:]
+    _save_taste(user_id, data)
+
+
+def get_taste_query(user_id: str) -> str:
+    """Build a YouTube search query based on user taste. Returns a random-ish search string."""
+    import random
+    data = _load_taste(user_id)
+    liked = data.get("liked", [])
+
+    if not liked:
+        # Default genres for cold start
+        genres = [
+            "popular music 2024", "top hits playlist", "chill vibes music",
+            "lofi hip hop", "pop hits", "rock classics", "edm mix",
+            "thai music hits", "kpop hits", "rap playlist", "indie music",
+            "jazz chill", "rnb soul", "anime openings", "gaming music"
+        ]
+        return random.choice(genres)
+
+    # Pick from liked tracks and build a related search
+    base = random.choice(liked)
+    modifiers = [
+        f"songs like {base}",
+        f"{base} similar music",
+        f"music similar to {base}",
+        base,  # Just play it again sometimes
+    ]
+    # Occasionally mix in genre exploration
+    if random.random() < 0.2:
+        genres = ["remix", "cover", "acoustic version", "live"]
+        return f"{base} {random.choice(genres)}"
+
+    return random.choice(modifiers)
+
+
+# ── Random Music DJ System ────────────────────────────────────────────────────
+
+class RandomDJ:
+    """Multi-user random music DJ with priority rotation.
+
+    Priority system:
+    - First user to /randommusic gets priority
+    - 1 user: play normally
+    - 2 users: priority user plays 2, then user2 plays 1, repeat
+    - 3 users: priority user plays 3, user2 plays 1, user3 plays 1, repeat
+    - N users: priority user plays N, others play 1 each, repeat
+    """
+
+    def __init__(self, guild_id: str):
+        self.guild_id = guild_id
+        self.participants: list[str] = []  # user_ids in join order
+        self.user_names: dict[str, str] = {}  # user_id -> display_name
+        self.active = False
+        self._rotation_idx = 0  # Tracks position in rotation cycle
+        self._priority_remaining = 0  # How many priority songs left before rotating
+
+    def add_user(self, user_id: str, display_name: str):
+        if user_id not in self.participants:
+            self.participants.append(user_id)
+            self.user_names[user_id] = display_name
+
+    def remove_user(self, user_id: str):
+        if user_id in self.participants:
+            self.participants.remove(user_id)
+            self.user_names.pop(user_id, None)
+            # Adjust rotation if needed
+            if not self.participants:
+                self.active = False
+                self._rotation_idx = 0
+                self._priority_remaining = 0
+
+    def get_next_user(self) -> Optional[str]:
+        """Get the next user whose music should play based on priority rotation."""
+        if not self.participants:
+            return None
+
+        n = len(self.participants)
+        if n == 1:
+            return self.participants[0]
+
+        # Priority user is always index 0 (first to join)
+        priority_user = self.participants[0]
+        priority_count = n  # priority user gets N songs per cycle
+
+        # Build rotation cycle: [priority x N, user2, user3, ..., userN]
+        if self._priority_remaining > 0:
+            self._priority_remaining -= 1
+            return priority_user
+        else:
+            # Rotate through non-priority users
+            non_priority = self.participants[1:]
+            if self._rotation_idx >= len(non_priority):
+                # Cycle complete, reset to priority
+                self._rotation_idx = 0
+                self._priority_remaining = priority_count - 1  # -1 because we return priority now
+                return priority_user
+            else:
+                user = non_priority[self._rotation_idx]
+                self._rotation_idx += 1
+                return user
+
+    @property
+    def is_active(self):
+        return self.active and len(self.participants) > 0
+
+
+# guild_id -> RandomDJ
+_random_djs: dict[str, RandomDJ] = {}
+
+
+def get_random_dj(guild_id: str) -> RandomDJ:
+    if guild_id not in _random_djs:
+        _random_djs[guild_id] = RandomDJ(guild_id)
+    return _random_djs[guild_id]
+
+
+async def start_random_music(guild: discord.Guild, user_id: str, display_name: str,
+                             text_channel: Optional[discord.TextChannel] = None) -> str:
+    """Add user to random DJ and start playing if not already."""
+    guild_id = str(guild.id)
+    dj = get_random_dj(guild_id)
+
+    already_in = user_id in dj.participants
+    dj.add_user(user_id, display_name)
+
+    if already_in:
+        return f"🎲 You're already in the DJ rotation! ({len(dj.participants)} participants)"
+
+    if not dj.active:
+        dj.active = True
+        # Start the DJ loop
+        asyncio.create_task(_dj_loop(guild, text_channel))
+        return f"🎲 **Random DJ started!** Playing music based on your taste. Say 'I like this' or 'skip' to teach me."
+    else:
+        pos = dj.participants.index(user_id) + 1
+        priority_name = dj.user_names.get(dj.participants[0], "???")
+        return (f"🎲 Joined DJ rotation! Position #{pos}/{len(dj.participants)}. "
+                f"Priority: {priority_name} (plays {len(dj.participants)} songs per cycle)")
+
+
+async def stop_random_music(guild_id: str, user_id: str) -> str:
+    """Remove user from random DJ."""
+    dj = get_random_dj(guild_id)
+    if user_id not in dj.participants:
+        return "You're not in the DJ rotation."
+    dj.remove_user(user_id)
+    if not dj.participants:
+        dj.active = False
+        return "🎲 DJ stopped — no participants left."
+    return f"🎲 Left DJ rotation. {len(dj.participants)} still going."
+
+
+async def _dj_loop(guild: discord.Guild, text_channel: Optional[discord.TextChannel]):
+    """Background loop that auto-queues random music based on rotation."""
+    guild_id = str(guild.id)
+    dj = get_random_dj(guild_id)
+    mq = get_music_queue(guild_id)
+
+    while dj.is_active:
+        vc = guild.voice_client
+        if not vc or not vc.is_connected():
+            dj.active = False
+            break
+
+        # Only queue next when nothing is playing or queue is empty
+        if not vc.is_playing() and not mq.current:
+            next_user = dj.get_next_user()
+            if not next_user:
+                await asyncio.sleep(2)
+                continue
+
+            # Build search query based on user's taste
+            query = get_taste_query(next_user)
+            user_name = dj.user_names.get(next_user, "Someone")
+
+            track = await extract_track(query, f"{user_name} (DJ)")
+            if track:
+                await play_track(guild, track, text_channel)
+                if text_channel:
+                    try:
+                        await text_channel.send(
+                            f"🎲 **DJ pick for {user_name}:** {track.title}\n"
+                            f"*React with 👍/👎 or say 'like'/'dislike' to shape your recommendations*"
+                        )
+                    except Exception:
+                        pass
+
+        # Wait before checking again
+        await asyncio.sleep(3)
+
+
+def cleanup_user_from_dj(guild_id: str, user_id: str):
+    """Remove user from DJ when they leave VC."""
+    dj = get_random_dj(guild_id)
+    dj.remove_user(user_id)
+    if not dj.participants:
+        dj.active = False
+
+
+# ── Text+VC Dual Reply Support ────────────────────────────────────────────────
+
+async def speak_in_vc(guild: discord.Guild, text: str, bot_instance):
+    """Speak text in VC via TTS (used when user chats in text while in VC with Blood)."""
+    if not guild.voice_client or not guild.voice_client.is_connected():
+        return
+
+    guild_id = str(guild.id)
+    sink = _active_sinks.get(guild_id)
+    if not sink:
+        return
+
+    await sink._speak(text)
+
+
+def is_user_in_blood_vc(guild: discord.Guild, user) -> bool:
+    """Check if a user is in the same VC as Blood."""
+    if not guild.voice_client or not guild.voice_client.channel:
+        return False
+    return user in guild.voice_client.channel.members
+
+
 # ── Transcript Storage ────────────────────────────────────────────────────────
 
 # guild_id -> list of transcript entries
@@ -837,9 +1109,10 @@ class BloodAudioSink:
         play_keywords = ["play ", "put on ", "play me ", "เปิดเพลง", "เล่นเพลง", "เปิด"]
         skip_keywords = ["skip", "next song", "next track", "ข้าม"]
         stop_keywords = ["stop music", "stop the music", "หยุดเพลง"]
-        pause_keywords = ["pause", "หยุด"]
+        like_keywords = ["i like this", "this is good", "love this", "great song", "ชอบ", "เพราะ", "ดี"]
+        dislike_keywords = ["i don't like this", "this sucks", "hate this", "bad song", "ไม่ชอบ", "ห่วย", "เปลี่ยน"]
         queue_keywords = ["what's playing", "queue", "now playing", "เพลงอะไร"]
-        volume_keywords = ["volume", "louder", "quieter", "เสียง"]
+        random_keywords = ["random music", "play something random", "surprise me", "เปิดอะไรก็ได้"]
 
         # URL paste detection
         import re as _re
@@ -848,6 +1121,35 @@ class BloodAudioSink:
         guild = self.bot.get_guild(int(self.guild_id))
         if not guild:
             return None
+
+        # Like/dislike feedback (per user via VC)
+        mq = get_music_queue(self.guild_id)
+        # Get user_id from requester name -> look up in sink user_buffers
+        requester_id = None
+        for uid, buf in self.user_buffers.items():
+            if buf.user_name == requester:
+                requester_id = str(uid)
+                break
+
+        if mq.current and requester_id:
+            for kw in like_keywords:
+                if kw in lower:
+                    record_feedback(requester_id, mq.current.title, positive=True)
+                    return f"Noted, you like {mq.current.title}. I'll remember that."
+            for kw in dislike_keywords:
+                if kw in lower:
+                    record_feedback(requester_id, mq.current.title, positive=False)
+                    # Also skip
+                    if guild.voice_client and guild.voice_client.is_playing():
+                        guild.voice_client.stop()
+                    return "Got it, skipping. I'll play less of that for you."
+
+        # Random music request via voice
+        for kw in random_keywords:
+            if kw in lower:
+                if requester_id:
+                    result = await start_random_music(guild, requester_id, requester, self.text_channel)
+                    return result
 
         # Skip
         for kw in skip_keywords:

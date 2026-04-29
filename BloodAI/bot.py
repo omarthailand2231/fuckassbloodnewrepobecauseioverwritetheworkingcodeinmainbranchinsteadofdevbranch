@@ -1911,6 +1911,23 @@ if bot:
 
             await send_trace_log(guild, f"[DONE] {len(final_text)} chars | {prompt_t}+{completion_t}={total_t} | {model_used}")
 
+            # ── Text+VC dual reply: speak in VC if user is there ──────────
+            if guild and final_text:
+                try:
+                    from voice import is_user_in_blood_vc, speak_in_vc
+                    if is_user_in_blood_vc(guild, message.author):
+                        # Truncate for TTS — don't yap, keep it short
+                        tts_text = final_text[:300].split("\n")[0] if len(final_text) > 300 else final_text
+                        # Strip markdown for spoken text
+                        import re as _tts_re
+                        tts_text = _tts_re.sub(r"[*_~`#>\[\]()]", "", tts_text).strip()
+                        if tts_text and len(tts_text) > 5:
+                            asyncio.create_task(speak_in_vc(guild, tts_text, bot))
+                except ImportError:
+                    pass
+                except Exception:
+                    pass
+
             # ── Flush terminal if dirty ────────────────────────────────────
             if _terminal_dirty:
                 _t_ch_id = CONFIG.get("terminal_channel_id")
@@ -1991,10 +2008,12 @@ if bot:
         ), inline=False)
         embed.add_field(name="Music", value=(
             "`/play <song/url>` — play from YouTube/Spotify/SoundCloud\n"
-            "`/skip` — skip current song\n"
-            "`/stop` — stop & clear queue\n"
-            "`/queue` — show queue | `/np` — now playing\n"
-            "`/volume <0-100>` — set volume"
+            "`/skip` — skip | `/stop` — stop & clear\n"
+            "`/queue` — queue | `/np` — now playing\n"
+            "`/volume <0-100>` — set volume\n"
+            "`/randommusic` — DJ mode (learns your taste!)\n"
+            "`/like` / `/dislike` — teach Blood your taste\n"
+            "`/stopdj` — leave DJ rotation"
         ), inline=False)
         embed.add_field(name="Remote Terminal (Admin+)", value=(
             "`/openterminal` — open remote session\n"
@@ -2879,6 +2898,81 @@ if bot:
         except ImportError:
             await ctx.reply("Voice module not available.")
 
+    @bot.hybrid_command(name="randommusic", aliases=["rdj", "djme"], description="Start random music DJ based on your taste")
+    async def randommusic_cmd(ctx):
+        try:
+            from voice import start_random_music, join_and_listen
+        except ImportError:
+            await ctx.reply("Voice module not available.")
+            return
+        # Auto-join user's VC if not connected
+        if not ctx.guild.voice_client:
+            if ctx.author.voice and ctx.author.voice.channel:
+                await join_and_listen(ctx.guild, ctx.author.voice.channel, ctx.channel, bot)
+            else:
+                await ctx.reply("Join a voice channel first.")
+                return
+        result = await start_random_music(
+            ctx.guild, str(ctx.author.id), ctx.author.display_name, ctx.channel
+        )
+        await ctx.reply(result)
+
+    @bot.hybrid_command(name="stopdj", description="Leave the random music DJ rotation")
+    async def stopdj_cmd(ctx):
+        try:
+            from voice import stop_random_music
+            result = await stop_random_music(str(ctx.guild.id), str(ctx.author.id))
+            await ctx.reply(result)
+        except ImportError:
+            await ctx.reply("Voice module not available.")
+
+    @bot.hybrid_command(name="like", description="Like the current song (improves recommendations)")
+    async def like_cmd(ctx):
+        try:
+            from voice import record_feedback, get_music_queue
+            mq = get_music_queue(str(ctx.guild.id))
+            if not mq.current:
+                await ctx.reply("Nothing is playing.")
+                return
+            record_feedback(str(ctx.author.id), mq.current.title, positive=True)
+            await ctx.reply(f"👍 Liked **{mq.current.title}** — I'll play more like this for you!")
+        except ImportError:
+            await ctx.reply("Voice module not available.")
+
+    @bot.hybrid_command(name="dislike", description="Dislike the current song (improves recommendations)")
+    async def dislike_cmd(ctx):
+        try:
+            from voice import record_feedback, get_music_queue
+            mq = get_music_queue(str(ctx.guild.id))
+            if not mq.current:
+                await ctx.reply("Nothing is playing.")
+                return
+            record_feedback(str(ctx.author.id), mq.current.title, positive=False)
+            await ctx.reply(f"👎 Noted — less of **{mq.current.title}** style for you.")
+        except ImportError:
+            await ctx.reply("Voice module not available.")
+
+    # ── Reaction feedback for music ──────────────────────────────────────
+
+    @bot.event
+    async def on_raw_reaction_add(payload):
+        """Handle 👍/👎 reactions on DJ messages for music taste feedback."""
+        if payload.user_id == bot.user.id:
+            return
+        emoji = str(payload.emoji)
+        if emoji not in ("👍", "👎"):
+            return
+        try:
+            from voice import record_feedback, get_music_queue
+            guild = bot.get_guild(payload.guild_id)
+            if not guild:
+                return
+            mq = get_music_queue(str(guild.id))
+            if mq.current:
+                record_feedback(str(payload.user_id), mq.current.title, positive=(emoji == "👍"))
+        except Exception:
+            pass
+
     # ── Voice State Tracking ──────────────────────────────────────────────
 
     @bot.event
@@ -2910,6 +3004,13 @@ if bot:
                 f"[left voice channel]", before.channel.name
             )
             await terminal_push(guild, f"[VC] {member.display_name} left #{before.channel.name}")
+
+            # Cleanup: remove from random DJ rotation
+            try:
+                from voice import cleanup_user_from_dj
+                cleanup_user_from_dj(guild_id, str(member.id))
+            except Exception:
+                pass
 
             # If Blood is alone in VC, auto-leave
             if guild.voice_client and guild.voice_client.channel == before.channel:
