@@ -110,13 +110,13 @@ app.router.add_get("/ws",handle_ws)
 
 _server=None
 
-def start_web_mixer(port=7777):
+async def start_web_mixer(port=7777):
     global _server
     if _server:
         return
     runner=web.AppRunner(app)
-    asyncio.get_event_loop().run_until_complete(runner.setup())
+    await runner.setup()
     site=web.TCPSite(runner,"0.0.0.0",port)
-    asyncio.get_event_loop().run_until_complete(site.start())
+    await site.start()
     _server=runner
     log.info("Mixer web UI running at http://localhost:%d",port)

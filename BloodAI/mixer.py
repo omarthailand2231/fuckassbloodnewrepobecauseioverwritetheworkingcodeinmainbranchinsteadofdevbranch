@@ -14,6 +14,8 @@ import struct
 from collections import deque
 from typing import Optional
 
+import discord
+
 log = logging.getLogger("blood.mixer")
 
 # Audio config — must match Discord's expectations
@@ -208,7 +210,11 @@ class MixedAudioSource(discord.AudioSource):
         return False
 
     def cleanup(self):
-        pass
+        """Stop mixer when Discord stops playing."""
+        try:
+            self.mixer.stop()
+        except Exception:
+            pass
 
 
 # ── Integration helpers ───────────────────────────────────────────────────────

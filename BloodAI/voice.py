@@ -21,9 +21,10 @@ import discord
 
 log = logging.getLogger("blood.voice")
 
-# Silence noisy voice_recv spam (WS payload, corrupted stream errors)
+# Silence noisy voice_recv spam (WS payload, corrupted stream errors, RTCP packets)
 logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.ERROR)
 logging.getLogger("discord.ext.voice_recv.router").setLevel(logging.CRITICAL)
+logging.getLogger("discord.ext.voice_recv.reader").setLevel(logging.WARNING)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -97,6 +98,11 @@ class MusicQueue:
         self._volume_transformer: Optional[discord.PCMVolumeTransformer] = None
         self.loop = False
         self.paused = False
+        # Mixer / process tracking for clean shutdown
+        self._mixer = None
+        self._music_proc = None
+        self._music_feed_task = None
+        self._music_watch_task = None
 
     def add(self, track: MusicTrack):
         self.queue.append(track)
@@ -135,6 +141,33 @@ class MusicQueue:
     @property
     def is_empty(self):
         return len(self.queue) == 0 and self.current is None
+
+    def cleanup(self):
+        """Kill FFmpeg, cancel feed task, stop mixer."""
+        if self._music_feed_task:
+            try:
+                self._music_feed_task.cancel()
+            except Exception:
+                pass
+            self._music_feed_task = None
+        if self._music_watch_task:
+            try:
+                self._music_watch_task.cancel()
+            except Exception:
+                pass
+            self._music_watch_task = None
+        if self._music_proc:
+            try:
+                self._music_proc.kill()
+            except Exception:
+                pass
+            self._music_proc = None
+        if self._mixer:
+            try:
+                self._mixer.stop()
+            except Exception:
+                pass
+            self._mixer = None
 
 
 # guild_id -> MusicQueue
@@ -205,7 +238,8 @@ async def play_track(guild: discord.Guild, track: MusicTrack,
     mq = get_music_queue(guild_id)
     mq.current = track
 
-    # Stop current playback
+    # Clean up any existing playback
+    mq.cleanup()
     if vc.is_playing():
         vc.stop()
         await asyncio.sleep(0.2)
@@ -219,9 +253,9 @@ async def play_track(guild: discord.Guild, track: MusicTrack,
         mixer.add_source("tts", volume=1.0)
         mixer.start()
 
-        # Start FFmpeg for music, feeding into mixer
+        # Start FFmpeg for music — no -re for network streams
         proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-re", "-i", track.stream_url,
+            "ffmpeg", "-i", track.stream_url,
             "-f", "s16le", "-ar", "48000", "-ac", "2",
             "-loglevel", "quiet", "pipe:1",
             stdout=asyncio.subprocess.PIPE,
@@ -235,20 +269,25 @@ async def play_track(guild: discord.Guild, track: MusicTrack,
                     if not chunk:
                         break
                     mixer.feed("music", chunk)
+            except asyncio.CancelledError:
+                pass
             except Exception:
                 pass
-            finally:
-                try:
-                    proc.kill()
-                    await proc.wait()
-                except Exception:
-                    pass
-                # Track ended — advance queue
-                asyncio.run_coroutine_threadsafe(
-                    _play_next(guild, text_channel), guild._state.loop
-                )
 
-        asyncio.create_task(feed_music())
+        async def watch_proc():
+            """Wait for FFmpeg to finish, then advance queue if this track is still current."""
+            try:
+                await proc.wait()
+                # Only advance if this track is still current (not skipped)
+                if mq.current is track and not mq.loop:
+                    asyncio.create_task(_play_next(guild, text_channel))
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+        mq._music_feed_task = asyncio.create_task(feed_music())
+        mq._music_watch_task = asyncio.create_task(watch_proc())
 
         # Connect mixer output to Discord
         mixed_source = MixedAudioSource(mixer)
@@ -326,7 +365,14 @@ async def skip_music(guild: discord.Guild) -> str:
     vc = guild.voice_client
     if not vc or not vc.is_playing():
         return "Nothing is playing."
-    vc.stop()  # triggers after_play -> _play_next
+    guild_id = str(guild.id)
+    mq = get_music_queue(guild_id)
+    mq.cleanup()  # kill FFmpeg, cancel tasks, stop mixer
+    vc.stop()
+    # Manually advance queue since watch_proc was cancelled
+    nxt = mq.skip()
+    if nxt:
+        await play_track(guild, nxt)
     return "⏭️ Skipped."
 
 
@@ -334,6 +380,7 @@ async def stop_music(guild: discord.Guild) -> str:
     """Stop playback and clear queue."""
     guild_id = str(guild.id)
     mq = get_music_queue(guild_id)
+    mq.cleanup()  # kill FFmpeg, cancel tasks, stop mixer
     mq.clear()
     vc = guild.voice_client
     if vc and vc.is_playing():
@@ -1474,7 +1521,7 @@ async def join_and_listen(guild: discord.Guild, vc_channel: discord.VoiceChannel
     # Start web mixer dashboard
     try:
         import web_mixer as wm
-        wm.start_web_mixer()
+        await wm.start_web_mixer()
         wm.update_state(music_active=False, tts_active=False, ducked=False)
     except Exception as e:
         log.warning("Web mixer not started: %s", e)
