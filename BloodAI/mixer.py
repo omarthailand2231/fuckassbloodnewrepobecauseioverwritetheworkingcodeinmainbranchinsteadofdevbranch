@@ -165,7 +165,14 @@ class BloodMixerSource(discord.AudioSource):
         """Stop current music stream and clear buffer."""
         self._music_stopping = True
         self._has_music = False
+        # Clear buffer first so read() returns silence immediately
+        self._music_buf.clear()
         if self._music_proc:
+            try:
+                # Close stdout first to unblock the reader thread's .read()
+                self._music_proc.stdout.close()
+            except Exception:
+                pass
             try:
                 self._music_proc.kill()
             except Exception:
@@ -174,6 +181,7 @@ class BloodMixerSource(discord.AudioSource):
         if self._music_thread and self._music_thread.is_alive():
             self._music_thread.join(timeout=2)
         self._music_thread = None
+        # Clear again in case reader thread wrote frames between kill and join
         self._music_buf.clear()
         self._music_stopping = False
 

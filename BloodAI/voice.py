@@ -364,9 +364,17 @@ async def skip_music(guild: discord.Guild) -> str:
     """Skip current track."""
     guild_id = str(guild.id)
     mq = get_music_queue(guild_id)
-    if not mq._mixer or not mq._mixer.has_music:
+
+    # Nothing playing — check if there's at least a current track set
+    if not mq.current and (not mq._mixer or not mq._mixer.has_music):
         return "Nothing is playing."
-    mq._mixer.stop_music()  # kills FFmpeg thread, clears buffer
+
+    old_title = mq.current.title if mq.current else "track"
+
+    # Stop the music feed (kills FFmpeg, clears buffer)
+    if mq._mixer:
+        mq._mixer.stop_music()
+
     nxt = mq.skip()
     if nxt:
         await play_track(guild, nxt)
@@ -375,12 +383,14 @@ async def skip_music(guild: discord.Guild) -> str:
         # If DJ is active, don't kill mixer/player — let DJ loop queue next
         dj = get_random_dj(guild_id)
         if dj.is_active:
-            log.info("Skip with active DJ — waiting for DJ loop to queue next")
+            log.info("Skip '%s' with active DJ — DJ loop will queue next", old_title)
         else:
             vc = guild.voice_client
             if vc and vc.is_playing():
                 vc.stop()
             mq._mixer = None
+
+    log.info("Skipped '%s'", old_title)
     return "⏭️ Skipped."
 
 
