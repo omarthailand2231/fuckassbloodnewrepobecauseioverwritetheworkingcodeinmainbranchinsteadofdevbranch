@@ -324,10 +324,15 @@ async def skip_music(guild: discord.Guild) -> str:
         await play_track(guild, nxt)
     else:
         mq.current = None
-        vc = guild.voice_client
-        if vc and vc.is_playing():
-            vc.stop()
-        mq._mixer = None
+        # If DJ is active, don't kill mixer/player — let DJ loop queue next
+        dj = get_random_dj(guild_id)
+        if dj.is_active:
+            log.info("Skip with active DJ — waiting for DJ loop to queue next")
+        else:
+            vc = guild.voice_client
+            if vc and vc.is_playing():
+                vc.stop()
+            mq._mixer = None
     return "⏭️ Skipped."
 
 
