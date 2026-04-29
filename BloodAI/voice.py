@@ -1055,10 +1055,44 @@ class BloodAudioSink:
         async with self._stt_lock:
             await self._handle_speech(user_id, user_name, pcm_data)
 
+    @staticmethod
+    def _is_junk(text: str) -> bool:
+        """Return True if STT output is junk we should ignore."""
+        import re as _re
+        t = text.strip()
+        # Too short
+        if len(t) < 2:
+            return True
+        # URL / link
+        if _re.search(r"https?://\S+", t):
+            return True
+        # Emoji-only (unicode emoji or Discord custom :emoji:)
+        cleaned = _re.sub(r"[\U0001F000-\U0001FFFF\u2600-\u27BF\u2700-\u27BF\uFE00-\uFE0F\u200D]", "", t)
+        cleaned = _re.sub(r"<a?:\w+:\d+>", "", cleaned)  # Discord custom emoji
+        if not cleaned.strip():
+            return True
+        # Command triggers (slash commands, prefix commands)
+        if t.startswith(("/", "!", ".", "?", "$")):
+            return True
+        # Whisper hallucinations — common junk outputs
+        hallucinations = [
+            "thank you", "thanks for watching", "subscribe", "like and subscribe",
+            "you", "bye", ".", "...", "ขอบคุณ", "สวัสดีครับ", "สวัสดีค่ะ",
+            "ฝากกดไลค์", "ฝากกดติดตาม", "♪", "🎵",
+        ]
+        if t.lower().strip(".!? ") in hallucinations:
+            return True
+        return False
+
     async def _handle_speech(self, user_id: int, user_name: str, pcm_data: bytes):
         """Transcribe speech and decide whether to respond."""
         text = await transcribe_audio(pcm_data)
         if not text:
+            return
+
+        # Filter junk STT output
+        if self._is_junk(text):
+            log.debug("[VC STT] Ignored junk: %s", text[:50])
             return
 
         log.info("[VC STT] %s: %s", user_name, text)
