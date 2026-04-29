@@ -2845,7 +2845,8 @@ if bot:
                 await ctx.reply("Join a voice channel first, or use /joinvc.")
                 return
         await ctx.defer()
-        result = await play_music(ctx.guild, query, ctx.author.display_name, ctx.channel)
+        result = await play_music(ctx.guild, query, ctx.author.display_name, ctx.channel,
+                                  requester_id=str(ctx.author.id))
         await ctx.reply(result)
 
     @bot.hybrid_command(name="skip", description="Skip the current song")

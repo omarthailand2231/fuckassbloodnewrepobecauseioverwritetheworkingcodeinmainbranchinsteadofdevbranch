@@ -251,7 +251,8 @@ async def _play_next(guild: discord.Guild,
 
 
 async def play_music(guild: discord.Guild, query: str, requester: str = "",
-                     text_channel: Optional[discord.TextChannel] = None) -> str:
+                     text_channel: Optional[discord.TextChannel] = None,
+                     requester_id: Optional[str] = None) -> str:
     """High-level: extract track, add to queue, play if not playing."""
     guild_id = str(guild.id)
     vc = guild.voice_client
@@ -261,6 +262,10 @@ async def play_music(guild: discord.Guild, query: str, requester: str = "",
     track = await extract_track(query, requester)
     if not track:
         return f"❌ Could not find anything for: {query}"
+
+    # Auto-record positive taste — if user asked for it, they probably like it
+    if requester_id and track.title:
+        record_feedback(requester_id, track.title, positive=True)
 
     mq = get_music_queue(guild_id)
     if vc.is_playing() and mq.current:
@@ -1170,7 +1175,8 @@ class BloodAudioSink:
 
         # URL pasted
         if url_match:
-            result = await play_music(guild, url_match.group(1), requester, self.text_channel)
+            result = await play_music(guild, url_match.group(1), requester, self.text_channel,
+                                      requester_id=requester_id)
             return result
 
         # Play request
@@ -1180,7 +1186,8 @@ class BloodAudioSink:
                 idx = lower.index(kw) + len(kw)
                 query = text[idx:].strip()
                 if query:
-                    result = await play_music(guild, query, requester, self.text_channel)
+                    result = await play_music(guild, query, requester, self.text_channel,
+                                              requester_id=requester_id)
                     return result
 
         return None

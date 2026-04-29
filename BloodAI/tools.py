@@ -1542,7 +1542,8 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
             return "No song specified."
         try:
             from voice import play_music as _play_music
-            return await _play_music(guild, query, invoker.display_name, channel)
+            return await _play_music(guild, query, invoker.display_name, channel,
+                                     requester_id=str(invoker.id))
         except ImportError:
             return "Voice/music module not available."
         except Exception as e:
