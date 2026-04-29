@@ -153,13 +153,18 @@ async def extract_track(query: str, requester: str = "") -> Optional[MusicTrack]
     """Extract audio info from URL or search query using yt-dlp."""
     import re as _re
 
-    # Words in title that indicate a cover/remix (skip these in search)
-    _cover_words = {"cover", "covers", "covered", "karaoke", "instrumental",
-                    "reaction", "react", "tutorial", "lesson", "how to play"}
+    # Words in title that indicate non-music content (skip these)
+    _skip_words = {"cover", "covers", "covered", "karaoke", "instrumental",
+                   "reaction", "react", "tutorial", "lesson", "how to play",
+                   "audiobook", "podcast", "lecture", "asmr", "meditation",
+                   "full movie", "documentary", "10 hours"}
+    MAX_DURATION = 900  # 15 minutes — skip anything longer
 
-    def _is_cover(title: str) -> bool:
+    def _is_bad(title: str, duration: int) -> bool:
+        if duration and duration > MAX_DURATION:
+            return True
         t = title.lower()
-        return any(w in t for w in _cover_words)
+        return any(w in t for w in _skip_words)
 
     def _extract():
         import yt_dlp
@@ -175,10 +180,10 @@ async def extract_track(query: str, requester: str = "") -> Optional[MusicTrack]
                     search_q += " audio"
                 info = ydl.extract_info(f"ytsearch5:{search_q}", download=False)
                 if "entries" in info and info["entries"]:
-                    # Pick first non-cover result
+                    # Pick first good result (no covers, audiobooks, or >15min)
                     chosen = None
                     for entry in info["entries"]:
-                        if entry and not _is_cover(entry.get("title", "")):
+                        if entry and not _is_bad(entry.get("title", ""), entry.get("duration", 0)):
                             chosen = entry
                             break
                     info = chosen or info["entries"][0]
@@ -472,7 +477,10 @@ async def _generate_recommendations(user_id: str, count: int = 15) -> list[str]:
         for line in text.strip().split("\n"):
             line = line.strip().lstrip("0123456789.-) •●")
             line = line.strip()
-            if line and len(line) > 5 and " - " in line:
+            # Must be "Artist - Title" format, reasonable length, no AI reasoning
+            if (line and 5 < len(line) < 100
+                    and " - " in line
+                    and not any(w in line.lower() for w in ("actually", "maybe", "could be", "let me", "i think", "note:", "here"))):
                 songs.append(line)
         if songs:
             random.shuffle(songs)
