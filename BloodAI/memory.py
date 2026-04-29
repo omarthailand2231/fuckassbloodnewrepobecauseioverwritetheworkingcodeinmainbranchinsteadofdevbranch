@@ -765,6 +765,8 @@ class MemoryManager:
     _vector_ready = False
     _chroma_client = None
     _embed_model = None
+    _vector_queue: list[tuple] = []  # [(guild_id, text, metadata), ...]
+    _VECTOR_QUEUE_MAX = 500
 
     def _init_vector(self):
         """Lazy-init: load the embedding model + ChromaDB on first use."""
@@ -802,35 +804,48 @@ class MemoryManager:
         )
 
     def vector_add(self, guild_id: str, text: str, metadata: dict | None = None):
-        """Embed and store a single text chunk."""
-        if not self._init_vector():
-            return
+        """Queue text for vector indexing. Only flushed when vector_search is called."""
         text = text.strip()
         if not text or len(text) < 10:
             return
-        col = self._get_collection(guild_id)
-        if col is None:
-            return
-        # Deterministic ID to avoid duplicates
-        import hashlib
-        doc_id = hashlib.sha256(text.encode()).hexdigest()[:24]
         meta = metadata or {}
         meta["timestamp"] = _now_iso()
-        # Truncate text for embedding (model max ~256 tokens ≈ 1000 chars)
-        embed_text = text[:1000]
-        try:
-            embedding = self._embed_model.encode(embed_text).tolist()
-            col.upsert(
-                ids=[doc_id],
-                embeddings=[embedding],
-                documents=[text[:2000]],
-                metadatas=[meta],
-            )
-        except Exception as e:
-            log.warning("Vector add failed: %s", e)
+        self._vector_queue.append((guild_id, text, meta))
+        # Cap queue size to prevent memory bloat
+        if len(self._vector_queue) > self._VECTOR_QUEUE_MAX:
+            self._vector_queue = self._vector_queue[-self._VECTOR_QUEUE_MAX:]
+
+    def _flush_vector_queue(self):
+        """Flush queued entries to ChromaDB. Called before search."""
+        if not self._vector_queue:
+            return
+        if not self._init_vector():
+            self._vector_queue.clear()
+            return
+        import hashlib
+        queued = self._vector_queue[:]
+        self._vector_queue.clear()
+        for guild_id, text, meta in queued:
+            col = self._get_collection(guild_id)
+            if col is None:
+                continue
+            doc_id = hashlib.sha256(text.encode()).hexdigest()[:24]
+            embed_text = text[:1000]
+            try:
+                embedding = self._embed_model.encode(embed_text).tolist()
+                col.upsert(
+                    ids=[doc_id],
+                    embeddings=[embedding],
+                    documents=[text[:2000]],
+                    metadatas=[meta],
+                )
+            except Exception as e:
+                log.warning("Vector flush failed: %s", e)
 
     def vector_search(self, guild_id: str, query: str, n_results: int = 15) -> list[dict]:
         """Semantic search. Returns [{text, score, metadata}, ...]."""
+        # Flush pending entries before searching
+        self._flush_vector_queue()
         if not self._init_vector():
             return []
         col = self._get_collection(guild_id)

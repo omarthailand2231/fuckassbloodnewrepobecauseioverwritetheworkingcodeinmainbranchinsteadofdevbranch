@@ -1018,16 +1018,9 @@ if bot:
                 if skill_files:
                     await terminal_push(g, f"[BOOT] Skills: {', '.join(skill_files)}")
         memory.cleanup_old_entries()
-        # Background vector index for existing memory files (threaded to avoid blocking)
-        async def _bg_vector_index():
-            for g in bot.guilds:
-                try:
-                    count = await asyncio.to_thread(memory.vector_index_existing, str(g.id))
-                    if count > 0:
-                        log.info("Vector indexed %d entries for %s", count, g.name)
-                except Exception as e:
-                    log.warning("Vector indexing failed for %s: %s", g.name, e)
-        asyncio.create_task(_bg_vector_index())
+        # NOTE: vector_index_existing disabled — too heavy on startup
+        # ChromaDB + sentence-transformers loads ~2GB+ and melts CPU
+        # Vector memory is populated lazily via vector_add on each message instead
         dashboard_loop.start()
         if CONFIG.get("scheduled_tasks_enabled"):
             scheduled_tasks_loop.start()
