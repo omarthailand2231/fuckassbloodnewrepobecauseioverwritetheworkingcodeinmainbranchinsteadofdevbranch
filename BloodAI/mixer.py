@@ -143,6 +143,11 @@ class BloodMixerSource(discord.AudioSource):
                 if not self._music_stopping:
                     log.warning("Music feed error: %s", e)
             finally:
+                # Wait for remaining buffer to drain before signaling end
+                # (prevents cutting off the last few seconds of the song)
+                if not self._music_stopping:
+                    while self._music_buf and not self._music_stopping:
+                        time.sleep(0.05)
                 self._has_music = False
                 if proc:
                     try:

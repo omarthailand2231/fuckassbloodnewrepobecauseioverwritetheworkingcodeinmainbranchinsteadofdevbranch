@@ -1541,7 +1541,14 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
         if not query:
             return "No song specified."
         try:
-            from voice import play_music as _play_music
+            from voice import play_music as _play_music, join_and_listen as _join
+            # Auto-join invoker's VC if Blood isn't connected
+            if not guild.voice_client:
+                if invoker.voice and invoker.voice.channel:
+                    bot_instance = channel._state._get_client() if hasattr(channel, '_state') else None
+                    await _join(guild, invoker.voice.channel, channel, bot_instance)
+                else:
+                    return "I'm not in a voice channel. Join one and try again, or use /joinvc."
             return await _play_music(guild, query, invoker.display_name, channel,
                                      requester_id=str(invoker.id))
         except ImportError:
