@@ -1317,9 +1317,8 @@ class BloodAudioSink:
             for kw in dislike_keywords:
                 if kw in lower:
                     record_feedback(requester_id, mq.current.title, positive=False)
-                    # Also skip
-                    if guild.voice_client and guild.voice_client.is_playing():
-                        guild.voice_client.stop()
+                    # Auto-skip on dislike
+                    await skip_music(guild)
                     return "Got it, skipping. I'll play less of that for you."
 
         # Random music request via voice
