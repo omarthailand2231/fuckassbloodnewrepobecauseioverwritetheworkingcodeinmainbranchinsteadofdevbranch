@@ -337,7 +337,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "join_voice",
-            "description": "Join or leave a voice channel.",
+            "description": "Join or leave a voice channel. When joining, Blood listens via STT (Groq Whisper), responds via TTS, and records transcripts. Say 'leave' to disconnect and save transcript.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1452,21 +1452,34 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
     elif name == "join_voice":
         ch_name = args.get("channel_name", "").strip()
         if ch_name.lower() == "leave":
-            if guild.voice_client:
-                await guild.voice_client.disconnect(force=True)
-                return "✅ Left voice channel."
-            return "Not in a voice channel."
+            try:
+                from voice import leave_voice
+                return await leave_voice(guild)
+            except ImportError:
+                if guild.voice_client:
+                    await guild.voice_client.disconnect(force=True)
+                    return "✅ Left voice channel."
+                return "Not in a voice channel."
         vc = _find_voice_channel(ch_name)
         if not vc:
             return f"Voice channel '{ch_name}' not found. Check SERVER CHANNELS in your prompt."
         try:
-            if guild.voice_client:
-                await guild.voice_client.move_to(vc)
-            else:
-                await vc.connect()
-            return f"✅ Joined voice channel '{vc.name}'."
-        except discord.Forbidden:
-            return "No permission to join that voice channel."
+            from voice import join_and_listen
+            # Pass the bot instance from the channel's guild
+            bot_instance = channel._state._get_client() if hasattr(channel, '_state') else None
+            return await join_and_listen(guild, vc, channel, bot_instance)
+        except ImportError:
+            # Fallback: basic join without listening
+            try:
+                if guild.voice_client:
+                    await guild.voice_client.move_to(vc)
+                else:
+                    await vc.connect()
+                return f"✅ Joined voice channel '{vc.name}' (no listening — voice module unavailable)."
+            except discord.Forbidden:
+                return "No permission to join that voice channel."
+            except Exception as e:
+                return f"Failed to join VC: {e}"
         except Exception as e:
             return f"Failed to join VC: {e}"
 

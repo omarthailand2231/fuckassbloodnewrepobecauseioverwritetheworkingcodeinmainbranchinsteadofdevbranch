@@ -21,6 +21,7 @@ from memory import MemoryManager
 from tools import TOOL_DEFINITIONS, AUTONOMOUS_TOOLS, TERMINAL_TOOLS, active_terminal_channels, fastimg_channels, execute_tool, get_meme_url, get_meme_data, _close_browser_session
 from config import CONFIG
 import os
+import io
 import asyncio
 from datetime import datetime, timezone
 
@@ -1983,6 +1984,11 @@ if bot:
             "`/sell <ticker>` — sell position\n"
             "`/portfolio` — view holdings + P&L"
         ), inline=False)
+        embed.add_field(name="Voice Channel", value=(
+            "`/joinvc <channel>` — join VC with listening + TTS\n"
+            "`/leavevc` — leave VC and save transcript\n"
+            "`/transcript` — view recent VC transcripts"
+        ), inline=False)
         embed.add_field(name="Remote Terminal (Admin+)", value=(
             "`/openterminal` — open remote session\n"
             "`/closeterminal` — close remote session"
@@ -2685,6 +2691,163 @@ if bot:
 
         embed.set_footer(text=f"Query: {query[:100]} | Model: all-MiniLM-L6-v2")
         await ctx.reply(embed=embed)
+
+    # ── Voice Channel Commands ─────────────────────────────────────────────
+
+    @bot.hybrid_command(name="joinvc", description="Join a voice channel with listening + TTS")
+    async def joinvc_cmd(ctx, *, channel_name: str = ""):
+        if not channel_name:
+            # Auto-join the user's current VC
+            if ctx.author.voice and ctx.author.voice.channel:
+                channel_name = ctx.author.voice.channel.name
+            else:
+                await ctx.reply("Tell me which VC to join, or join one first.")
+                return
+        try:
+            from voice import join_and_listen
+            # Find the voice channel (fuzzy)
+            vc = discord.utils.get(ctx.guild.voice_channels, name=channel_name)
+            if not vc:
+                # Fuzzy search
+                import unicodedata, difflib
+                def _norm(s):
+                    s = unicodedata.normalize("NFKD", s)
+                    import re
+                    s = re.sub(r"[^\w\s\-]", "", s)
+                    return s.strip().lower().replace(" ", "-")
+                norm_q = _norm(channel_name)
+                for c in ctx.guild.voice_channels:
+                    if _norm(c.name) == norm_q or norm_q in _norm(c.name):
+                        vc = c
+                        break
+                if not vc:
+                    names = {_norm(c.name): c for c in ctx.guild.voice_channels}
+                    close = difflib.get_close_matches(norm_q, names.keys(), n=1, cutoff=0.5)
+                    if close:
+                        vc = names[close[0]]
+            if not vc:
+                await ctx.reply(f"Voice channel '{channel_name}' not found.")
+                return
+            result = await join_and_listen(ctx.guild, vc, ctx.channel, bot)
+            await ctx.reply(result)
+        except ImportError:
+            await ctx.reply("Voice module not available.")
+        except Exception as e:
+            log.error("joinvc error: %s", e, exc_info=True)
+            await ctx.reply(f"Failed: {e}")
+
+    @bot.hybrid_command(name="leavevc", description="Leave voice channel and save transcript")
+    async def leavevc_cmd(ctx):
+        try:
+            from voice import leave_voice
+            result = await leave_voice(ctx.guild)
+            await ctx.reply(result)
+        except ImportError:
+            if ctx.guild.voice_client:
+                await ctx.guild.voice_client.disconnect(force=True)
+                await ctx.reply("Left voice channel.")
+            else:
+                await ctx.reply("Not in a voice channel.")
+        except Exception as e:
+            await ctx.reply(f"Failed: {e}")
+
+    @bot.hybrid_command(name="transcript", description="View recent VC transcripts")
+    async def transcript_cmd(ctx, page: int = 1):
+        try:
+            from voice import get_recent_sessions, format_transcript_txt, summarize_transcript
+        except ImportError:
+            await ctx.reply("Voice module not available.")
+            return
+
+        guild_id = str(ctx.guild.id)
+        per_page = 5
+        sessions = get_recent_sessions(guild_id, limit=per_page * page)
+
+        if not sessions:
+            await ctx.reply("No VC transcripts found.")
+            return
+
+        # Paginate
+        start = (page - 1) * per_page
+        page_sessions = sessions[start:start + per_page]
+
+        if not page_sessions:
+            await ctx.reply(f"No transcripts on page {page}.")
+            return
+
+        embed = discord.Embed(
+            title=f"🎙️ VC Transcripts — Page {page}",
+            color=discord.Color.blurple(),
+        )
+
+        files_to_send = []
+
+        for i, session in enumerate(page_sessions, start=start + 1):
+            # Summary in embed
+            summary = summarize_transcript(session)
+            embed.add_field(name=f"#{i}", value=summary, inline=False)
+
+            # Generate txt file
+            txt_content = format_transcript_txt(session)
+            joined = session.get("joined_at", "unknown").replace(":", "-")[:19]
+            ch = session.get("channel_name", "vc")
+            filename = f"transcript_{ch}_{joined}.txt"
+            files_to_send.append(discord.File(
+                io.BytesIO(txt_content.encode("utf-8")),
+                filename=filename,
+            ))
+
+        total_pages = (len(sessions) + per_page - 1) // per_page
+        embed.set_footer(text=f"Page {page}/{total_pages} | Use /transcript <page> for more")
+
+        await ctx.reply(embed=embed, files=files_to_send[:5])  # Discord max 10 files
+
+    # ── Voice State Tracking ──────────────────────────────────────────────
+
+    @bot.event
+    async def on_voice_state_update(member, before, after):
+        """Track VC joins/leaves for transcript and activity monitoring."""
+        if member.bot:
+            return
+        guild = member.guild
+        guild_id = str(guild.id)
+
+        try:
+            from voice import add_transcript_entry, get_active_sink
+        except ImportError:
+            return
+
+        # User joined a VC
+        if before.channel is None and after.channel is not None:
+            add_transcript_entry(
+                guild_id, member.id, member.display_name,
+                f"[joined voice channel]", after.channel.name
+            )
+            # Log to terminal
+            await terminal_push(guild, f"[VC] {member.display_name} joined #{after.channel.name}")
+
+        # User left a VC
+        elif before.channel is not None and after.channel is None:
+            add_transcript_entry(
+                guild_id, member.id, member.display_name,
+                f"[left voice channel]", before.channel.name
+            )
+            await terminal_push(guild, f"[VC] {member.display_name} left #{before.channel.name}")
+
+            # If Blood is alone in VC, auto-leave
+            if guild.voice_client and guild.voice_client.channel == before.channel:
+                real_members = [m for m in before.channel.members if not m.bot]
+                if not real_members:
+                    from voice import leave_voice
+                    await leave_voice(guild)
+                    await terminal_push(guild, "[VC] Auto-left — everyone left the channel")
+
+        # User moved between VCs
+        elif before.channel != after.channel:
+            add_transcript_entry(
+                guild_id, member.id, member.display_name,
+                f"[moved to #{after.channel.name}]", before.channel.name
+            )
 
     @bot.event
     async def on_command_error(ctx, error):
