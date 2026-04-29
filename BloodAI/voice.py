@@ -70,7 +70,7 @@ YTDL_OPTS = {
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
-    "default_search": "https://music.youtube.com/search?q=",
+    "default_search": "ytsearch",
     "source_address": "0.0.0.0",
     "extract_flat": False,
 }
@@ -169,14 +169,21 @@ async def extract_track(query: str, requester: str = "") -> Optional[MusicTrack]
     _skip_words = {"cover", "covers", "covered", "karaoke", "instrumental",
                    "reaction", "react", "tutorial", "lesson", "how to play",
                    "audiobook", "podcast", "lecture", "asmr", "meditation",
-                   "full movie", "documentary", "10 hours"}
+                   "full movie", "documentary", "10 hours", "how to",
+                   "correcting", "fix ", "app tutorial"}
     MAX_DURATION = 900  # 15 minutes — skip anything longer
+    q_lower = query.lower()
 
     def _is_bad(title: str, duration: int) -> bool:
         if duration and duration > MAX_DURATION:
             return True
         t = title.lower()
-        return any(w in t for w in _skip_words)
+        if any(w in t for w in _skip_words):
+            return True
+        # Skip remixes unless the query specifically asked for one
+        if "remix" not in q_lower and "remix" in t:
+            return True
+        return False
 
     def _make_track(info, src="youtube"):
         stream_url = info.get("url") or info.get("webpage_url", "")
@@ -188,7 +195,7 @@ async def extract_track(query: str, requester: str = "") -> Optional[MusicTrack]
             title=info.get("title", "Unknown"),
             url=info.get("webpage_url", query),
             stream_url=stream_url,
-            duration=info.get("duration", 0),
+            duration=int(info.get("duration", 0) or 0),
             requester=requester,
             source_type=src,
         )
@@ -204,19 +211,14 @@ async def extract_track(query: str, requester: str = "") -> Optional[MusicTrack]
                 info = ydl.extract_info(query.strip(), download=False)
                 return _make_track(info) if info else None
 
-            # ── YouTube Music search (5 results) ──
+            # ── YouTube search (5 results) ──
             search_q = query.strip()
+            if "audio" not in search_q.lower() and "mv" not in search_q.lower():
+                search_q += " audio"
 
             try:
-                # Use ytmusic: prefix to search music.youtube.com (only real songs)
-                yt_results = ydl.extract_info(f"https://music.youtube.com/search?q={search_q}", download=False)
+                yt_results = ydl.extract_info(f"ytsearch5:{search_q}", download=False)
                 entries = (yt_results or {}).get("entries") or []
-                if not entries:
-                    # Fallback to regular YouTube search if ytmusic returns nothing
-                    if "audio" not in search_q.lower():
-                        search_q += " audio"
-                    yt_results = ydl.extract_info(f"ytsearch5:{search_q}", download=False)
-                    entries = (yt_results or {}).get("entries") or []
             except Exception as e:
                 log.warning("YouTube search failed for '%s': %s", search_q[:60], e)
                 entries = []
