@@ -403,36 +403,90 @@ def record_feedback(user_id: str, track_title: str, positive: bool):
     _save_taste(user_id, data)
 
 
+# Track recently played per user to avoid repeats
+_recent_plays: dict[str, list[str]] = {}  # user_id -> last N queries
+RECENT_PLAYS_MAX = 20
+
+
 def get_taste_query(user_id: str) -> str:
-    """Build a YouTube search query based on user taste. Returns a random-ish search string."""
+    """Build a YouTube search query based on user taste. Avoids recent repeats."""
     import random
     data = _load_taste(user_id)
     liked = data.get("liked", [])
+    recent = _recent_plays.get(user_id, [])
+
+    # Cold start — wide genre variety
+    cold_genres = [
+        "popular music 2025", "top hits 2025", "trending songs today",
+        "new music this week", "hot 100 songs", "viral tiktok songs 2025",
+        "chill vibes playlist", "lofi hip hop mix", "pop hits playlist",
+        "rock classics mix", "edm festival mix", "best of 2024 music",
+        "thai music 2025", "kpop new releases", "rap hits 2025",
+        "indie discoveries", "jazz lounge", "rnb soul mix",
+        "anime openings mix", "gaming soundtrack mix",
+        "90s hits playlist", "2000s throwback mix", "workout music mix",
+        "late night drive music", "sad songs playlist", "happy upbeat songs",
+        "acoustic covers playlist", "lo-fi chill beats", "synthwave mix",
+        "bedroom pop", "hyperpop mix", "classical music for studying",
+    ]
 
     if not liked:
-        # Default genres for cold start
-        genres = [
-            "popular music 2024", "top hits playlist", "chill vibes music",
-            "lofi hip hop", "pop hits", "rock classics", "edm mix",
-            "thai music hits", "kpop hits", "rap playlist", "indie music",
-            "jazz chill", "rnb soul", "anime openings", "gaming music"
-        ]
-        return random.choice(genres)
+        # Pick from cold genres, avoid recent
+        available = [g for g in cold_genres if g not in recent]
+        if not available:
+            available = cold_genres
+        query = random.choice(available)
+        _track_recent(user_id, query)
+        return query
 
-    # Pick from liked tracks and build a related search
-    base = random.choice(liked)
-    modifiers = [
-        f"songs like {base}",
-        f"{base} similar music",
-        f"music similar to {base}",
-        base,  # Just play it again sometimes
+    # Build diverse queries from liked tracks
+    # Shuffle liked so we don't always pick the same base
+    pool = liked.copy()
+    random.shuffle(pool)
+
+    # Try to find a base that wasn't recently used
+    base = None
+    for candidate in pool:
+        if candidate not in recent:
+            base = candidate
+            break
+    if not base:
+        base = random.choice(pool)
+
+    # Diverse query templates — never just replay the same song
+    templates = [
+        f"{base} radio mix",
+        f"songs similar to {base}",
+        f"if you like {base}",
+        f"{base} genre playlist",
+        f"artists like {base}",
+        f"more songs by the artist of {base}",
+        f"{base} type beat music",
     ]
-    # Occasionally mix in genre exploration
-    if random.random() < 0.2:
-        genres = ["remix", "cover", "acoustic version", "live"]
-        return f"{base} {random.choice(genres)}"
 
-    return random.choice(modifiers)
+    # 30% chance: explore something new entirely
+    if random.random() < 0.3:
+        explore = [
+            f"{base} remix",
+            f"{base} acoustic version",
+            f"{base} live performance",
+            f"{base} cover",
+        ] + cold_genres[:10]  # mix in some genre exploration
+        query = random.choice(explore)
+    else:
+        query = random.choice(templates)
+
+    _track_recent(user_id, query)
+    return query
+
+
+def _track_recent(user_id: str, query: str):
+    """Record a query as recently used."""
+    if user_id not in _recent_plays:
+        _recent_plays[user_id] = []
+    _recent_plays[user_id].append(query)
+    if len(_recent_plays[user_id]) > RECENT_PLAYS_MAX:
+        _recent_plays[user_id] = _recent_plays[user_id][-RECENT_PLAYS_MAX:]
 
 
 # ── Random Music DJ System ────────────────────────────────────────────────────
@@ -564,8 +618,9 @@ async def _dj_loop(guild: discord.Guild, text_channel: Optional[discord.TextChan
             dj.active = False
             break
 
-        # Only queue next when nothing is playing or queue is empty
-        if not vc.is_playing() and not mq.current:
+        # Only queue next when mixer has no music or no current track
+        mixer_busy = mq._mixer and mq._mixer.has_music
+        if not mixer_busy and not mq.current:
             next_user = dj.get_next_user()
             if not next_user:
                 await asyncio.sleep(2)
