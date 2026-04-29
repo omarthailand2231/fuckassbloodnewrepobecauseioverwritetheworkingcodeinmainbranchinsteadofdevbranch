@@ -1279,88 +1279,91 @@ class BloodAudioSink:
             log.warning("Voice response generation failed: %s", e)
             return None
 
+    async def _classify_music_intent(self, text: str) -> dict:
+        """Use AI to classify music intent from natural speech.
+        Returns: {"intent": "like"|"dislike"|"skip"|"stop"|"play"|"random"|"queue"|"none", "query": "..."}"""
+        from provider import call_ai
+        try:
+            result = await call_ai(
+                system=(
+                    "You classify user speech into music intents. Reply with ONLY one word from this list:\n"
+                    "like - user enjoys the current song (e.g. 'this slaps', 'banger', 'ดี', 'เพราะ')\n"
+                    "dislike - user dislikes current song (e.g. 'this is mid', 'nah', 'ไม่ชอบ', 'ห่วย', 'change it')\n"
+                    "skip - user wants next song (e.g. 'next', 'skip this', 'ข้าม')\n"
+                    "stop - user wants music to stop (e.g. 'turn it off', 'stop', 'หยุดเพลง')\n"
+                    "random - user wants random/surprise music (e.g. 'play something', 'surprise me', 'เปิดอะไรก็ได้')\n"
+                    "queue - user asks what's playing (e.g. 'what song is this', 'เพลงอะไร')\n"
+                    "play:QUERY - user wants a specific song (e.g. 'play Blinding Lights' → 'play:Blinding Lights')\n"
+                    "none - not music related at all\n\n"
+                    "Reply with ONLY the intent. For play, include the query after colon."
+                ),
+                messages=[{"role": "user", "content": text}],
+                max_tokens=30,
+            )
+            reply = result.get("message", {}).get("content", "none").strip().lower()
+            if reply.startswith("play:"):
+                return {"intent": "play", "query": reply[5:].strip()}
+            return {"intent": reply if reply in ("like", "dislike", "skip", "stop", "random", "queue", "none") else "none"}
+        except Exception as e:
+            log.warning("Music intent classification failed: %s", e)
+            return {"intent": "none"}
+
     async def _check_music_request(self, text: str, requester: str) -> Optional[str]:
-        """Detect music requests in speech and handle them."""
-        lower = text.lower()
-
-        # Detect music-related keywords
-        play_keywords = ["play ", "put on ", "play me ", "เปิดเพลง", "เล่นเพลง", "เปิด"]
-        skip_keywords = ["skip", "next song", "next track", "ข้าม"]
-        stop_keywords = ["stop music", "stop the music", "หยุดเพลง"]
-        like_keywords = ["i like this", "this is good", "love this", "great song", "ชอบ", "เพราะ", "ดี"]
-        dislike_keywords = ["i don't like this", "this sucks", "hate this", "bad song", "ไม่ชอบ", "ห่วย", "เปลี่ยน"]
-        queue_keywords = ["what's playing", "queue", "now playing", "เพลงอะไร"]
-        random_keywords = ["random music", "play something random", "surprise me", "เปิดอะไรก็ได้"]
-
-        # URL paste detection
+        """Detect music requests in speech using AI intent classification."""
         import re as _re
+
+        # URL paste detection (no AI needed)
         url_match = _re.search(r"(https?://\S+)", text)
 
         guild = self.bot.get_guild(int(self.guild_id))
         if not guild:
             return None
 
-        # Like/dislike feedback (per user via VC)
         mq = get_music_queue(self.guild_id)
-        # Get user_id from requester name -> look up in sink user_buffers
+
+        # Get user_id from requester name
         requester_id = None
         for uid, buf in self.user_buffers.items():
             if buf.user_name == requester:
                 requester_id = str(uid)
                 break
 
-        if mq.current and requester_id:
-            for kw in like_keywords:
-                if kw in lower:
-                    record_feedback(requester_id, mq.current.title, positive=True)
-                    return f"Noted, you like {mq.current.title}. I'll remember that."
-            for kw in dislike_keywords:
-                if kw in lower:
-                    record_feedback(requester_id, mq.current.title, positive=False)
-                    # Auto-skip on dislike
-                    await skip_music(guild)
-                    return "Got it, skipping. I'll play less of that for you."
-
-        # Random music request via voice
-        for kw in random_keywords:
-            if kw in lower:
-                if requester_id:
-                    result = await start_random_music(guild, requester_id, requester, self.text_channel)
-                    return result
-
-        # Skip
-        for kw in skip_keywords:
-            if kw in lower:
-                result = await skip_music(guild)
-                return result
-
-        # Stop
-        for kw in stop_keywords:
-            if kw in lower:
-                result = await stop_music(guild)
-                return result
-
-        # Queue info
-        for kw in queue_keywords:
-            if kw in lower:
-                return get_queue_info(self.guild_id)
-
-        # URL pasted
+        # URL pasted — handle directly, no AI needed
         if url_match:
             result = await play_music(guild, url_match.group(1), requester, self.text_channel,
                                       requester_id=requester_id)
             return result
 
-        # Play request
-        for kw in play_keywords:
-            if kw in lower:
-                # Extract the song query after the keyword
-                idx = lower.index(kw) + len(kw)
-                query = text[idx:].strip()
-                if query:
-                    result = await play_music(guild, query, requester, self.text_channel,
-                                              requester_id=requester_id)
-                    return result
+        # AI intent classification
+        intent_data = await self._classify_music_intent(text)
+        intent = intent_data.get("intent", "none")
+
+        if intent == "like" and mq.current and requester_id:
+            record_feedback(requester_id, mq.current.title, positive=True)
+            return f"Noted, you like {mq.current.title}. I'll remember that."
+
+        if intent == "dislike" and mq.current and requester_id:
+            record_feedback(requester_id, mq.current.title, positive=False)
+            await skip_music(guild)
+            return "Got it, skipping. I'll play less of that for you."
+
+        if intent == "skip":
+            return await skip_music(guild)
+
+        if intent == "stop":
+            return await stop_music(guild)
+
+        if intent == "queue":
+            return get_queue_info(self.guild_id)
+
+        if intent == "random" and requester_id:
+            return await start_random_music(guild, requester_id, requester, self.text_channel)
+
+        if intent == "play":
+            query = intent_data.get("query", "")
+            if query:
+                return await play_music(guild, query, requester, self.text_channel,
+                                        requester_id=requester_id)
 
         return None
 
