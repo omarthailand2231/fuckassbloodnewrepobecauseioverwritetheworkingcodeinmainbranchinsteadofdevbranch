@@ -453,6 +453,15 @@ def build_system_prompt(invoker, guild, channel, permission: str = "user", menti
 
     channel_ctx = f"Channel: DM with {invoker.display_name}" if is_dm else f"Channel: #{channel.name} (ID:{channel.id})"
 
+    # Build channel directory so Blood can see all channels
+    channels_block = ""
+    if guild:
+        text_chs = [f"#{c.name} (ID:{c.id})" for c in sorted(guild.text_channels, key=lambda c: c.position)]
+        voice_chs = [f"🔊{c.name} (ID:{c.id})" for c in sorted(guild.voice_channels, key=lambda c: c.position)]
+        all_chs = text_chs + voice_chs
+        if all_chs:
+            channels_block = "\nSERVER CHANNELS:\n" + ", ".join(all_chs)
+
     # AGI scaffold injections
     goals_block = ""
     if guild and CONFIG.get("goals_enabled"):
@@ -500,6 +509,7 @@ LENGTH: Match the energy. Simple greetings or one-liners? 2-3 sentences. Actual 
 {invoker.display_name} (ID:{invoker.id}) | Perm: {permission} | Tools: {', '.join(allowed_tool_names)}
 
 MEMORY: "what happened?" = read_channel_history. Specific facts = recall_memory.
+{channels_block}
 PINNED: {summary}
 {_server_custom_block(guild) if guild else ''}{_terminal_mode_block(channel) if not is_dm else ''}"""
 
@@ -564,6 +574,7 @@ LENGTH: Match the energy. Casual chat = 1-3 sentences. Actual questions or tasks
 {invoker.display_name} (ID:{invoker.id}) | Perm: {permission} | Tools: {', '.join(allowed_tool_names)}
 
 MEMORY: "what happened?" = read_channel_history. Specific facts = recall_memory.
+{channels_block}
 PINNED: {summary}
 {_server_custom_block(guild) if guild else ''}{_terminal_mode_block(channel) if not is_dm else ''}"""
 

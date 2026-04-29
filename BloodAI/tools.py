@@ -974,6 +974,57 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
             if lc:
                 await lc.send(f"**[BOT ACTION]** {text}")
 
+    def _normalize(s: str) -> str:
+        """Normalize channel name: strip special chars, unicode fonts, bold, etc."""
+        import unicodedata, re as _re_n
+        # NFKD decomposes fancy unicode (bold/italic/fullwidth) to ASCII equivalents
+        s = unicodedata.normalize("NFKD", s)
+        # Strip non-ASCII, non-alphanumeric except hyphens/underscores/spaces
+        s = _re_n.sub(r"[^\w\s\-]", "", s)
+        return s.strip().lower().replace(" ", "-")
+
+    def _fuzzy_find_channel(query: str, channel_list):
+        """Find a channel by name, ID, or fuzzy match. Handles special chars & unicode fonts."""
+        query = query.strip()
+        if not query:
+            return None
+        # 1) Try by ID first
+        import re as _re_ch
+        id_match = _re_ch.search(r"(\d{17,20})", query)
+        if id_match:
+            ch_id = int(id_match.group(1))
+            ch = guild.get_channel(ch_id)
+            if ch and ch in channel_list:
+                return ch
+        # 2) Exact name match
+        exact = discord.utils.get(channel_list, name=query)
+        if exact:
+            return exact
+        # 3) Normalized match (strips unicode fonts, special chars)
+        norm_q = _normalize(query)
+        for ch in channel_list:
+            if _normalize(ch.name) == norm_q:
+                return ch
+        # 4) Fuzzy substring match
+        for ch in channel_list:
+            if norm_q in _normalize(ch.name) or _normalize(ch.name) in norm_q:
+                return ch
+        # 5) difflib closest match
+        names = {_normalize(ch.name): ch for ch in channel_list}
+        close = difflib.get_close_matches(norm_q, names.keys(), n=1, cutoff=0.5)
+        if close:
+            return names[close[0]]
+        return None
+
+    def _find_text_channel(query: str):
+        return _fuzzy_find_channel(query, guild.text_channels)
+
+    def _find_voice_channel(query: str):
+        return _fuzzy_find_channel(query, guild.voice_channels)
+
+    def _find_any_channel(query: str):
+        return _fuzzy_find_channel(query, list(guild.text_channels) + list(guild.voice_channels))
+
     # ── ban ───────────────────────────────────────────────────────────────────
     if name == "ban_user":
         m = await resolve(args["user_id"])
@@ -1168,9 +1219,9 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
         if not m.voice or not m.voice.channel:
             return f"{m.display_name} is not in a voice channel."
         ch_name = args.get("channel_name", "").strip()
-        target_vc = discord.utils.get(guild.voice_channels, name=ch_name)
+        target_vc = _find_voice_channel(ch_name)
         if not target_vc:
-            return f"Voice channel '{ch_name}' not found."
+            return f"Voice channel '{ch_name}' not found. Check SERVER CHANNELS in your prompt."
         try:
             await m.move_to(target_vc, reason=f"[Blood] Moved by {invoker}")
             memory.append_action_log(str(guild.id), f"I moved '{m.display_name}' to #{target_vc.name}. Triggered by {invoker.display_name}.")
@@ -1288,8 +1339,8 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
 
     # ── announcement ──────────────────────────────────────────────────────────
     elif name == "send_announcement":
-        target = discord.utils.get(guild.text_channels, name=args["channel_name"])
-        if not target: return f"Channel #{args['channel_name']} not found."
+        target = _find_text_channel(args["channel_name"])
+        if not target: return f"Channel #{args['channel_name']} not found. Check SERVER CHANNELS in your prompt."
         try:
             await target.send(args["message"])
             memory.append_action_log(str(guild.id), f"I announced '{args['message'][:50]}...' in #{args['channel_name']}.")
@@ -1366,9 +1417,9 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
                 return f"Failed: {e}"
 
         elif action == "delete":
-            target = discord.utils.get(guild.channels, name=ch_name)
+            target = _find_any_channel(ch_name)
             if not target:
-                return f"Channel '{ch_name}' not found."
+                return f"Channel '{ch_name}' not found. Check SERVER CHANNELS in your prompt."
             try:
                 await target.delete(reason=f"[Blood] Deleted by {invoker}")
                 memory.append_action_log(str(guild.id), f"I deleted channel '#{ch_name}'.")
@@ -1382,9 +1433,9 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
             new_name = args.get("new_name", "").strip()
             if not new_name:
                 return "Error: new_name required for rename."
-            target = discord.utils.get(guild.channels, name=ch_name)
+            target = _find_any_channel(ch_name)
             if not target:
-                return f"Channel '{ch_name}' not found."
+                return f"Channel '{ch_name}' not found. Check SERVER CHANNELS in your prompt."
             try:
                 old_name = target.name
                 await target.edit(name=new_name, reason=f"[Blood] Renamed by {invoker}")
@@ -1405,9 +1456,9 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
                 await guild.voice_client.disconnect(force=True)
                 return "✅ Left voice channel."
             return "Not in a voice channel."
-        vc = discord.utils.get(guild.voice_channels, name=ch_name)
+        vc = _find_voice_channel(ch_name)
         if not vc:
-            return f"Voice channel '{ch_name}' not found."
+            return f"Voice channel '{ch_name}' not found. Check SERVER CHANNELS in your prompt."
         try:
             if guild.voice_client:
                 await guild.voice_client.move_to(vc)

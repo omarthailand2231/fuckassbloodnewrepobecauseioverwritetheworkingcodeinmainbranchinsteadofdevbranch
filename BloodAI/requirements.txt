@@ -10,3 +10,4 @@ pyautogui>=0.9
 playwright>=1.40
 chromadb>=1.0
 sentence-transformers>=3.0
+PyNaCl>=1.5
