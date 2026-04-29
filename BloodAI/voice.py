@@ -21,8 +21,9 @@ import discord
 
 log = logging.getLogger("blood.voice")
 
-# Silence noisy voice_recv gateway spam ("WS payload has extra keys")
+# Silence noisy voice_recv spam (WS payload, corrupted stream errors)
 logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.ERROR)
+logging.getLogger("discord.ext.voice_recv.router").setLevel(logging.CRITICAL)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
