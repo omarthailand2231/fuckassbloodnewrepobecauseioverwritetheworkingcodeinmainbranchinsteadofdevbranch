@@ -1653,6 +1653,14 @@ async def join_and_listen(guild: discord.Guild, vc_channel: discord.VoiceChannel
     except Exception as e:
         return f"❌ Failed to connect: {e}"
 
+    # Wait for voice connection to be fully ready
+    for _ in range(20):  # up to 4 seconds
+        if voice_client.is_connected():
+            break
+        await asyncio.sleep(0.2)
+    else:
+        return "❌ Voice connection timed out"
+
     # Create sink
     sink = BloodAudioSink(guild_id, vc_channel.name, bot_instance, text_channel)
     _active_sinks[guild_id] = sink

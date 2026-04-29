@@ -2755,6 +2755,7 @@ if bot:
             else:
                 await ctx.reply("Tell me which VC to join, or join one first.")
                 return
+        await ctx.defer()  # Voice connect takes a few seconds
         try:
             from voice import join_and_listen
             # Find the voice channel (fuzzy)
