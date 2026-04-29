@@ -42,7 +42,7 @@ memory = MemoryManager()
 if discord and commands:
     from discord.ext import tasks
     intents = discord.Intents.all()
-    bot = commands.Bot(command_prefix="!", intents=intents)
+    bot = commands.Bot(command_prefix="!", intents=intents, heartbeat_timeout=120.0)
 else:
     intents = None
     bot = None

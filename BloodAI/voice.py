@@ -21,6 +21,18 @@ import discord
 
 log = logging.getLogger("blood.voice")
 
+# Persistent aiohttp session for STT (avoids creating new TCP pool per call)
+_stt_session: Optional[aiohttp.ClientSession] = None
+
+def _get_stt_session() -> aiohttp.ClientSession:
+    global _stt_session
+    if _stt_session is None or _stt_session.closed:
+        _stt_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=15),
+            connector=aiohttp.TCPConnector(limit=2, ttl_dns_cache=300)
+        )
+    return _stt_session
+
 # Silence noisy voice_recv spam (WS payload, corrupted stream, CryptoError, RTCP)
 logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.CRITICAL)
 logging.getLogger("discord.ext.voice_recv.router").setLevel(logging.CRITICAL)
@@ -819,7 +831,9 @@ async def transcribe_audio(pcm_data: bytes) -> Optional[str]:
         log.warning("No GROQ_API_KEY — cannot transcribe")
         return None
 
-    wav_data = pcm_to_wav(pcm_data)
+    # Run WAV conversion in executor to avoid blocking event loop
+    loop = asyncio.get_event_loop()
+    wav_data = await loop.run_in_executor(None, pcm_to_wav, pcm_data)
 
     # Skip very small files (< 1KB of actual audio)
     if len(wav_data) < 1024:
@@ -834,16 +848,15 @@ async def transcribe_audio(pcm_data: bytes) -> Optional[str]:
     form.add_field("language", "th")  # Thai primary, Whisper auto-detects mixed
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(GROQ_STT_URL, headers=headers, data=form,
-                                    timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    err = await resp.text()
-                    log.warning("Whisper STT error %d: %s", resp.status, err[:200])
-                    return None
-                data = await resp.json()
-                text = data.get("text", "").strip()
-                return text if text else None
+        session = _get_stt_session()
+        async with session.post(GROQ_STT_URL, headers=headers, data=form) as resp:
+            if resp.status != 200:
+                err = await resp.text()
+                log.warning("Whisper STT error %d: %s", resp.status, err[:200])
+                return None
+            data = await resp.json()
+            text = data.get("text", "").strip()
+            return text if text else None
     except Exception as e:
         log.warning("STT failed: %s", e)
         return None
@@ -1141,7 +1154,7 @@ class BloodAudioSink:
         """Periodically check user buffers for completed speech."""
         while self._running:
             try:
-                await asyncio.sleep(0.5)  # Check every 500ms (was 300ms)
+                await asyncio.sleep(1.0)  # Check every 1s — gentler on event loop
                 now = time.monotonic()
                 for uid, buf in list(self.user_buffers.items()):
                     # Check if user stopped speaking (silence gap)
