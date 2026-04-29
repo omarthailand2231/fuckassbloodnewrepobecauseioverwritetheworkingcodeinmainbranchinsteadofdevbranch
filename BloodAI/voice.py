@@ -1333,9 +1333,7 @@ class BloodAudioSink:
         uid = user.id
         if uid not in self.user_buffers:
             self.user_buffers[uid] = UserAudioBuffer(uid, user.display_name)
-        # Only buffer if we're not already processing STT (back-pressure)
-        if not self._stt_lock.locked():
-            self.user_buffers[uid].add_pcm(pcm_data)
+        self.user_buffers[uid].add_pcm(pcm_data)
 
     def stop(self):
         """Stop the processing loop."""
