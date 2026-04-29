@@ -153,6 +153,14 @@ async def extract_track(query: str, requester: str = "") -> Optional[MusicTrack]
     """Extract audio info from URL or search query using yt-dlp."""
     import re as _re
 
+    # Words in title that indicate a cover/remix (skip these in search)
+    _cover_words = {"cover", "covers", "covered", "karaoke", "instrumental",
+                    "reaction", "react", "tutorial", "lesson", "how to play"}
+
+    def _is_cover(title: str) -> bool:
+        t = title.lower()
+        return any(w in t for w in _cover_words)
+
     def _extract():
         import yt_dlp
         with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
@@ -161,9 +169,19 @@ async def extract_track(query: str, requester: str = "") -> Optional[MusicTrack]
             if is_url:
                 info = ydl.extract_info(query.strip(), download=False)
             else:
-                info = ydl.extract_info(f"ytsearch:{query}", download=False)
-                if "entries" in info:
-                    info = info["entries"][0]
+                # Search with 'audio' to prefer audio uploads over music videos
+                search_q = query.strip()
+                if "audio" not in search_q.lower() and "mv" not in search_q.lower():
+                    search_q += " audio"
+                info = ydl.extract_info(f"ytsearch5:{search_q}", download=False)
+                if "entries" in info and info["entries"]:
+                    # Pick first non-cover result
+                    chosen = None
+                    for entry in info["entries"]:
+                        if entry and not _is_cover(entry.get("title", "")):
+                            chosen = entry
+                            break
+                    info = chosen or info["entries"][0]
 
             if not info:
                 return None
@@ -467,10 +485,10 @@ def get_taste_query(user_id: str) -> str:
     # 30% chance: explore something new entirely
     if random.random() < 0.3:
         explore = [
-            f"{base} remix",
-            f"{base} acoustic version",
-            f"{base} live performance",
-            f"{base} cover",
+            f"songs by the same artist as {base}",
+            f"{base} album full",
+            f"more from {base} artist",
+            f"best of {base} genre",
         ] + cold_genres[:10]  # mix in some genre exploration
         query = random.choice(explore)
     else:
