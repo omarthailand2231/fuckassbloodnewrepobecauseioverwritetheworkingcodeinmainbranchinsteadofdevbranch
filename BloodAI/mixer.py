@@ -76,9 +76,9 @@ class BloodMixerSource(discord.AudioSource):
     def __init__(self, loop: asyncio.AbstractEventLoop):
         self._loop = loop
 
-        # Audio buffers (thread-safe deques)
-        self._music_buf: deque = deque(maxlen=500)  # ~10s
-        self._tts_buf: deque = deque(maxlen=500)    # ~10s
+        # Audio buffers (thread-safe deques, no maxlen = no frame drops)
+        self._music_buf: deque = deque()
+        self._tts_buf: deque = deque()
 
         # Volume
         self._music_vol = 0.8
@@ -126,6 +126,11 @@ class BloodMixerSource(discord.AudioSource):
                 )
                 self._music_proc = proc
                 while not self._music_stopping:
+                    # Back-pressure: don't read too far ahead (~5s buffer)
+                    while len(self._music_buf) > 250 and not self._music_stopping:
+                        time.sleep(0.05)
+                    if self._music_stopping:
+                        break
                     chunk = proc.stdout.read(FRAME_SIZE)
                     if not chunk:
                         break
