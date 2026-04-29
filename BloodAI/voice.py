@@ -470,13 +470,80 @@ def _save_taste(user_id: str, data: dict):
         pass
 
 
+_taste_embed_model = None
+
+def _get_taste_model():
+    """Get or lazily load the SentenceTransformer model (shared with memory.py if possible)."""
+    global _taste_embed_model
+    if _taste_embed_model is not None:
+        return _taste_embed_model
+    try:
+        # Try reusing memory.py's already-loaded model
+        import memory
+        mem = memory.Memory
+        if hasattr(mem, '_embed_model') and mem._embed_model is not None:
+            _taste_embed_model = mem._embed_model
+            return _taste_embed_model
+    except Exception:
+        pass
+    from sentence_transformers import SentenceTransformer
+    _taste_embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+    return _taste_embed_model
+
+
+def _is_taste_relevant(entry: str, existing_liked: list[str], threshold: float = 0.35) -> bool:
+    """Check if a song title is semantically related to existing taste using embeddings.
+    Returns True if the song is similar enough to at least one liked song,
+    or if there are fewer than 5 liked songs (cold start — accept everything)."""
+    if len(existing_liked) < 5:
+        return True  # Cold start: accept everything to build initial profile
+    try:
+        model = _get_taste_model()
+        entry_emb = model.encode(entry)
+        # Compare against last 20 liked songs
+        recent_liked = existing_liked[-20:]
+        liked_embs = model.encode(recent_liked)
+        # Cosine similarity
+        import numpy as np
+        sims = np.dot(liked_embs, entry_emb) / (
+            np.linalg.norm(liked_embs, axis=1) * np.linalg.norm(entry_emb) + 1e-8
+        )
+        best = float(np.max(sims))
+        log.debug("[TASTE] '%s' best similarity: %.3f (threshold: %.2f)", entry[:40], best, threshold)
+        return best >= threshold
+    except Exception as e:
+        log.debug("[TASTE] Embedding check failed, accepting: %s", e)
+        return True  # Fail open — don't block taste recording
+
+
+def _has_repeated_pattern(entry: str, existing_liked: list[str], min_matches: int = 2) -> bool:
+    """Check if the entry matches a repeated artist/genre pattern in liked songs."""
+    entry_lower = entry.lower()
+    # Extract artist if format is 'Artist - Song'
+    artist = entry_lower.split(" - ")[0].strip() if " - " in entry_lower else ""
+    if not artist or len(artist) < 2:
+        return False
+    # Count how many liked songs share this artist
+    count = sum(1 for s in existing_liked if artist in s.lower())
+    return count >= min_matches
+
+
 def record_feedback(user_id: str, track_title: str, positive: bool):
-    """Record user's music taste feedback."""
+    """Record user's music taste feedback with smart validation.
+    For likes: only adds if the song is related to existing taste (embedding similarity)
+    or matches a repeated pattern (same artist). Prevents junk entries."""
     data = _load_taste(user_id)
     entry = track_title.strip()
     if positive:
         if entry not in data["liked"]:
-            data["liked"].append(entry)
+            # Smart filter: check if this song belongs in the taste profile
+            if (_is_taste_relevant(entry, data["liked"])
+                    or _has_repeated_pattern(entry, data["liked"])):
+                data["liked"].append(entry)
+                log.debug("[TASTE] Added to liked: %s", entry[:50])
+            else:
+                log.debug("[TASTE] Rejected from liked (not relevant): %s", entry[:50])
+                return  # Don't save — not relevant enough
         # Remove from disliked if present
         data["disliked"] = [d for d in data["disliked"] if d != entry]
     else:
@@ -682,9 +749,30 @@ async def _generate_recommendations(user_id: str, count: int = 15, guild_id: str
     return await _ai_recommendations(user_id, count)
 
 
+# How often to play a liked song vs new recommendation (0.0 - 1.0)
+LIKED_SONG_CHANCE = 0.30  # 30% chance to play from liked, 70% new discovery
+
 async def get_next_song(user_id: str, guild_id: str = "") -> str:
-    """Get next song recommendation. Pulls from cache, refills when empty."""
-    # Check cache
+    """Get next song recommendation. Mixes liked songs with new discoveries.
+    ~30% chance to replay a liked song, ~70% new recommendation."""
+    import random as _rng
+
+    data = _load_taste(user_id)
+    liked = data.get("liked", [])
+    recent = _recent_played.get(user_id, [])
+
+    # Roll: play a liked song or a new recommendation?
+    if liked and _rng.random() < LIKED_SONG_CHANCE:
+        # Pick a random liked song that wasn't recently played
+        available = [s for s in liked if s not in recent]
+        if not available:
+            available = liked  # All played recently — allow repeats
+        song = _rng.choice(available)
+        _track_played(user_id, song)
+        log.debug("[DJ] Playing liked song: %s", song[:50])
+        return song
+
+    # New recommendation from cache or fresh batch
     if user_id in _rec_cache and _rec_cache[user_id]:
         song = _rec_cache[user_id].pop(0)
         _track_played(user_id, song)
@@ -1621,6 +1709,8 @@ class BloodAudioSink:
         if self.guild_id in _active_conversation:
             _active_conversation.pop(self.guild_id, None)
 
+    _voice_data_count = 0
+
     def on_voice_data(self, user, pcm_data: bytes):
         """Called when voice data is received from a user."""
         if user.bot:
@@ -1628,7 +1718,13 @@ class BloodAudioSink:
         uid = user.id
         if uid not in self.user_buffers:
             self.user_buffers[uid] = UserAudioBuffer(uid, user.display_name)
+            log.info("[VC] New speaker detected: %s (ID:%s)", user.display_name, uid)
         self.user_buffers[uid].add_pcm(pcm_data)
+        # Log first few packets to confirm voice data is flowing
+        self._voice_data_count += 1
+        if self._voice_data_count in (1, 50, 500):
+            log.info("[VC] Voice packets received: %d (from %s, %d bytes)",
+                     self._voice_data_count, user.display_name, len(pcm_data))
 
     def stop(self):
         """Stop the processing loop."""
@@ -1691,7 +1787,9 @@ async def join_and_listen(guild: discord.Guild, vc_channel: discord.VoiceChannel
 
     try:
         voice_client.listen(voice_recv.BasicSink(callback))
+        log.info("[VC] Listener started on '%s' (voice_recv.BasicSink)", vc_channel.name)
     except Exception as e:
+        log.error("[VC] Failed to start listener: %s", e)
         return f"❌ Failed to start listening: {e}"
 
     # Start processing loop
