@@ -70,7 +70,7 @@ YTDL_OPTS = {
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
-    "default_search": "ytsearch",
+    "default_search": "https://music.youtube.com/search?q=",
     "source_address": "0.0.0.0",
     "extract_flat": False,
 }
@@ -204,14 +204,19 @@ async def extract_track(query: str, requester: str = "") -> Optional[MusicTrack]
                 info = ydl.extract_info(query.strip(), download=False)
                 return _make_track(info) if info else None
 
-            # ── YouTube search (5 results) ──
+            # ── YouTube Music search (5 results) ──
             search_q = query.strip()
-            if "audio" not in search_q.lower() and "mv" not in search_q.lower():
-                search_q += " audio"
 
             try:
-                yt_results = ydl.extract_info(f"ytsearch5:{search_q}", download=False)
+                # Use ytmusic: prefix to search music.youtube.com (only real songs)
+                yt_results = ydl.extract_info(f"https://music.youtube.com/search?q={search_q}", download=False)
                 entries = (yt_results or {}).get("entries") or []
+                if not entries:
+                    # Fallback to regular YouTube search if ytmusic returns nothing
+                    if "audio" not in search_q.lower():
+                        search_q += " audio"
+                    yt_results = ydl.extract_info(f"ytsearch5:{search_q}", download=False)
+                    entries = (yt_results or {}).get("entries") or []
             except Exception as e:
                 log.warning("YouTube search failed for '%s': %s", search_q[:60], e)
                 entries = []
