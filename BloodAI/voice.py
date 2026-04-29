@@ -1281,7 +1281,7 @@ class BloodAudioSink:
                 context_msgs = [{"role": "user", "content": f"[{user_name}] {text}"}]
 
             result = await call_ai(system, context_msgs, max_tokens=150)
-            content = result.get("content", "").strip()
+            content = result.get("message", {}).get("content", "").strip()
             return content if content else None
         except Exception as e:
             log.warning("Voice response generation failed: %s", e)

@@ -1029,6 +1029,36 @@ if bot:
         if CONFIG.get("background_agent_enabled"):
             background_agent_loop.start()
 
+    @bot.event
+    async def on_resumed():
+        """Gateway resumed after a disconnect — restart music playback if needed."""
+        log.info("Gateway resumed — checking voice playback state")
+        await asyncio.sleep(3)  # Give voice connection time to stabilize
+        try:
+            from voice import get_music_queue, get_active_sink
+            from mixer import BloodMixerSource
+            for guild in bot.guilds:
+                vc = guild.voice_client
+                if not vc or not vc.is_connected():
+                    continue
+                guild_id = str(guild.id)
+                mq = get_music_queue(guild_id)
+                # If there's a current track but nothing is playing, restart
+                if mq.current and not vc.is_playing():
+                    mixer = mq._mixer
+                    if mixer:
+                        log.info("Resuming playback after gateway reconnect: %s", mq.current.title)
+                        vc.play(mixer)
+                    else:
+                        # Mixer was lost — recreate and replay current track
+                        log.info("Recreating mixer after gateway reconnect: %s", mq.current.title)
+                        from voice import play_track
+                        sink = get_active_sink(guild_id)
+                        tc = sink.text_channel if sink else None
+                        await play_track(guild, mq.current, tc)
+        except Exception as e:
+            log.warning("Voice recovery after resume failed: %s", e)
+
     @tasks.loop(minutes=CONFIG["dashboard_refresh_minutes"])
     async def dashboard_loop():
         try:
