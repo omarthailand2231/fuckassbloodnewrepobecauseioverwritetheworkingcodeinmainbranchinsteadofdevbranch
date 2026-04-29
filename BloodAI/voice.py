@@ -178,47 +178,76 @@ async def extract_track(query: str, requester: str = "") -> Optional[MusicTrack]
         t = title.lower()
         return any(w in t for w in _skip_words)
 
+    def _make_track(info, src="youtube"):
+        stream_url = info.get("url") or info.get("webpage_url", "")
+        if "soundcloud" in info.get("extractor", "").lower():
+            src = "soundcloud"
+        elif "spotify" in query.lower():
+            src = "spotify"
+        return MusicTrack(
+            title=info.get("title", "Unknown"),
+            url=info.get("webpage_url", query),
+            stream_url=stream_url,
+            duration=info.get("duration", 0),
+            requester=requester,
+            source_type=src,
+        )
+
     def _extract():
         import yt_dlp
+
+        is_url = _re.match(r"https?://", query.strip())
+
         with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
-            # Detect if it's a URL
-            is_url = _re.match(r"https?://", query.strip())
+            # Direct URL — just try it
             if is_url:
                 info = ydl.extract_info(query.strip(), download=False)
-            else:
-                # Search with 'audio' to prefer audio uploads over music videos
-                search_q = query.strip()
-                if "audio" not in search_q.lower() and "mv" not in search_q.lower():
-                    search_q += " audio"
-                info = ydl.extract_info(f"ytsearch5:{search_q}", download=False)
-                if "entries" in info and info["entries"]:
-                    # Pick first good result (no covers, audiobooks, or >15min)
-                    chosen = None
-                    for entry in info["entries"]:
-                        if entry and not _is_bad(entry.get("title", ""), entry.get("duration", 0)):
-                            chosen = entry
-                            break
-                    info = chosen or info["entries"][0]
+                return _make_track(info) if info else None
 
-            if not info:
-                return None
+            # ── YouTube search (5 results) ──
+            search_q = query.strip()
+            if "audio" not in search_q.lower() and "mv" not in search_q.lower():
+                search_q += " audio"
 
-            # For Spotify URLs, yt-dlp may redirect to YouTube
-            stream_url = info.get("url") or info.get("webpage_url", "")
-            source = "youtube"
-            if "soundcloud" in info.get("extractor", "").lower():
-                source = "soundcloud"
-            elif "spotify" in query.lower():
-                source = "spotify"
+            try:
+                yt_results = ydl.extract_info(f"ytsearch5:{search_q}", download=False)
+                entries = (yt_results or {}).get("entries") or []
+            except Exception as e:
+                log.warning("YouTube search failed for '%s': %s", search_q[:60], e)
+                entries = []
 
-            return MusicTrack(
-                title=info.get("title", "Unknown"),
-                url=info.get("webpage_url", query),
-                stream_url=stream_url,
-                duration=info.get("duration", 0),
-                requester=requester,
-                source_type=source,
-            )
+            # Try each YouTube result (skip age-restricted, bad titles, etc.)
+            for entry in entries:
+                if not entry:
+                    continue
+                if _is_bad(entry.get("title", ""), entry.get("duration", 0)):
+                    continue
+                try:
+                    # Re-extract to get stream URL (flat search may not have it)
+                    vid_url = entry.get("url") or entry.get("webpage_url")
+                    if vid_url and not entry.get("url"):
+                        entry = ydl.extract_info(vid_url, download=False)
+                    if entry and entry.get("url"):
+                        return _make_track(entry, "youtube")
+                except Exception as e:
+                    log.debug("YouTube entry failed (age-gate?): %s", str(e)[:100])
+                    continue
+
+            # ── SoundCloud fallback (3 results) ──
+            log.info("YouTube failed for '%s' — trying SoundCloud", query[:60])
+            try:
+                sc_results = ydl.extract_info(f"scsearch3:{query.strip()}", download=False)
+                sc_entries = (sc_results or {}).get("entries") or []
+                for entry in sc_entries:
+                    if not entry:
+                        continue
+                    if _is_bad(entry.get("title", ""), entry.get("duration", 0)):
+                        continue
+                    return _make_track(entry, "soundcloud")
+            except Exception as e:
+                log.warning("SoundCloud fallback also failed: %s", str(e)[:100])
+
+            return None
 
     try:
         return await asyncio.get_event_loop().run_in_executor(None, _extract)
@@ -449,9 +478,113 @@ _rec_cache: dict[str, list[str]] = {}
 _recent_played: dict[str, list[str]] = {}
 RECENT_MAX = 30
 
+# Mood cache: user_id -> {"mood": str, "timestamp": float}
+_mood_cache: dict[str, dict] = {}
+MOOD_CACHE_TTL = 600  # Re-detect mood every 10 minutes
 
-async def _generate_recommendations(user_id: str, count: int = 15) -> list[str]:
-    """Use AI to generate diverse song recommendations like Spotify/YouTube Music."""
+
+async def _detect_mood(user_id: str, guild_id: str) -> str:
+    """Use AI to infer user's current mood from chat context + music behavior.
+    Returns one of: chill, hype, sad, focus, angry, neutral."""
+    from provider import call_ai
+
+    # Check cache
+    cached = _mood_cache.get(user_id)
+    if cached and time.time() - cached.get("timestamp", 0) < MOOD_CACHE_TTL:
+        return cached["mood"]
+
+    # Gather context signals
+    recent_chat = []
+    for entry in _convo_buffer.get(guild_id, [])[-10:]:
+        if entry.get("user_name") != "Blood":
+            recent_chat.append(entry.get("text", ""))
+
+    recent = _recent_played.get(user_id, [])[-5:]
+    data = _load_taste(user_id)
+    # Count recent skips (disliked songs that were recently played indicate wrong mood)
+    recent_skips = [d for d in data.get("disliked", [])[-5:] if d in recent]
+
+    # Time of day hint
+    from datetime import datetime, timezone, timedelta
+    local_hour = (datetime.now(timezone.utc) + timedelta(hours=7)).hour  # UTC+7 for Thailand
+    if 0 <= local_hour < 6:
+        time_hint = "very late night / early morning"
+    elif 6 <= local_hour < 12:
+        time_hint = "morning"
+    elif 12 <= local_hour < 17:
+        time_hint = "afternoon"
+    elif 17 <= local_hour < 21:
+        time_hint = "evening"
+    else:
+        time_hint = "night"
+
+    chat_text = "; ".join(recent_chat[-5:]) if recent_chat else "no recent chat"
+    recent_text = ", ".join(recent) if recent else "none"
+    skip_text = f"Recently skipped: {', '.join(recent_skips)}" if recent_skips else ""
+
+    prompt = (
+        f"Given this context, classify the user's current mood for music.\n"
+        f"- Recent chat: {chat_text}\n"
+        f"- Recently played songs: {recent_text}\n"
+        f"- {skip_text}\n"
+        f"- Time: {time_hint}\n\n"
+        f"Reply with ONLY one word: chill, hype, sad, focus, angry, or neutral"
+    )
+
+    try:
+        result = await call_ai(
+            system="You classify a user's mood for music. Reply with ONLY one word.",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=10,
+        )
+        mood = result.get("message", {}).get("content", "neutral").strip().lower()
+        if mood not in ("chill", "hype", "sad", "focus", "angry", "neutral"):
+            mood = "neutral"
+        log.info("Detected mood for user %s: %s", user_id, mood)
+    except Exception as e:
+        log.warning("Mood detection failed: %s", e)
+        mood = "neutral"
+
+    _mood_cache[user_id] = {"mood": mood, "timestamp": time.time()}
+    return mood
+
+
+async def _spotify_recommendations(user_id: str, guild_id: str, count: int = 15) -> list[str]:
+    """Get Spotify mood-based recommendations. Returns list of 'Artist - Title' or empty list."""
+    try:
+        from spotify import resolve_spotify_ids, get_mood_recommendations
+    except ImportError:
+        return []
+
+    data = _load_taste(user_id)
+    liked = data.get("liked", [])[-10:]
+    recent = _recent_played.get(user_id, [])[-15:]
+
+    if not liked:
+        return []
+
+    # Detect mood
+    mood = await _detect_mood(user_id, guild_id)
+
+    # Resolve Spotify IDs for liked songs (cached in spotify.py)
+    seed_ids = await resolve_spotify_ids(liked[-5:])
+    if not seed_ids:
+        log.debug("No Spotify IDs found for seed tracks")
+        return []
+
+    # Get mood-based recommendations
+    songs = await get_mood_recommendations(mood, seed_ids, count + 5)
+    if not songs:
+        return []
+
+    # Filter out recently played
+    filtered = [s for s in songs if s not in recent]
+    log.info("Spotify mood=%s → %d recommendations (from %d)", mood, len(filtered), len(songs))
+    return filtered[:count]
+
+
+async def _ai_recommendations(user_id: str, count: int = 15) -> list[str]:
+    """AI-only fallback recommendations (no Spotify needed)."""
     import random
     from provider import call_ai
 
@@ -494,7 +627,6 @@ async def _generate_recommendations(user_id: str, count: int = 15) -> list[str]:
         for line in text.strip().split("\n"):
             line = line.strip().lstrip("0123456789.-) •●")
             line = line.strip()
-            # Must be "Artist - Title" format, reasonable length, no AI reasoning
             if (line and 5 < len(line) < 100
                     and " - " in line
                     and not any(w in line.lower() for w in ("actually", "maybe", "could be", "let me", "i think", "note:", "here"))):
@@ -505,7 +637,7 @@ async def _generate_recommendations(user_id: str, count: int = 15) -> list[str]:
     except Exception as e:
         log.warning("AI recommendation failed: %s", e)
 
-    # Fallback: diverse cold-start genres
+    # Fallback: diverse cold-start
     fallback = [
         "Dua Lipa - Levitating", "The Weeknd - Blinding Lights",
         "Tame Impala - The Less I Know The Better", "Arctic Monkeys - Do I Wanna Know",
@@ -520,8 +652,21 @@ async def _generate_recommendations(user_id: str, count: int = 15) -> list[str]:
     return [s for s in fallback if s not in recent][:count]
 
 
-async def get_next_song(user_id: str) -> str:
-    """Get next song recommendation. Pulls from cache, refills via AI when empty."""
+async def _generate_recommendations(user_id: str, count: int = 15, guild_id: str = "") -> list[str]:
+    """Generate song recommendations. Tries Spotify mood-based first, falls back to AI."""
+    # Try Spotify mood-based recommendations first
+    if guild_id:
+        songs = await _spotify_recommendations(user_id, guild_id, count)
+        if songs:
+            return songs
+        log.debug("Spotify recs unavailable — falling back to AI")
+
+    # Fallback: AI-only recommendations
+    return await _ai_recommendations(user_id, count)
+
+
+async def get_next_song(user_id: str, guild_id: str = "") -> str:
+    """Get next song recommendation. Pulls from cache, refills when empty."""
     # Check cache
     if user_id in _rec_cache and _rec_cache[user_id]:
         song = _rec_cache[user_id].pop(0)
@@ -529,7 +674,7 @@ async def get_next_song(user_id: str) -> str:
         return song
 
     # Cache empty — generate new batch
-    songs = await _generate_recommendations(user_id)
+    songs = await _generate_recommendations(user_id, guild_id=guild_id)
     if not songs:
         return "popular music mix 2025"
 
@@ -685,8 +830,8 @@ async def _dj_loop(guild: discord.Guild, text_channel: Optional[discord.TextChan
                 await asyncio.sleep(2)
                 continue
 
-            # Get AI-powered song recommendation
-            query = await get_next_song(next_user)
+            # Get mood-aware song recommendation (Spotify + AI)
+            query = await get_next_song(next_user, guild_id=guild_id)
             user_name = dj.user_names.get(next_user, "Someone")
 
             track = await extract_track(query, f"{user_name} (DJ)")
