@@ -1328,6 +1328,7 @@ class BloodAudioSink:
             return None
 
         mq = get_music_queue(self.guild_id)
+        has_music = mq._mixer and mq._mixer.has_music
 
         # Get user_id from requester name
         requester_id = None
@@ -1341,6 +1342,16 @@ class BloodAudioSink:
             result = await play_music(guild, url_match.group(1), requester, self.text_channel,
                                       requester_id=requester_id)
             return result
+
+        # Quick keyword pre-check: only call AI classifier if music is playing
+        # OR text contains music-ish words (saves API calls when just chatting)
+        _music_hints = {"play", "song", "music", "skip", "stop", "next", "like", "dislike",
+                        "hate", "love", "sucks", "banger", "random", "queue", "playing",
+                        "เพลง", "เปิด", "ข้าม", "หยุด", "ชอบ", "ไม่ชอบ", "ห่วย", "เปลี่ยน", "เพราะ", "ดี"}
+        lower = text.lower()
+        might_be_music = has_music or any(w in lower for w in _music_hints)
+        if not might_be_music:
+            return None
 
         # AI intent classification
         intent_data = await self._classify_music_intent(text)
