@@ -211,19 +211,51 @@ async def play_track(guild: discord.Guild, track: MusicTrack,
         await asyncio.sleep(0.2)
 
     try:
-        source = discord.FFmpegPCMAudio(track.stream_url, **FFMPEG_OPTS)
-        volume_source = discord.PCMVolumeTransformer(source, volume=mq.volume)
-        mq._volume_transformer = volume_source
+        from mixer import get_mixer, MixedAudioSource, FRAME_SIZE
 
-        def after_play(error):
-            if error:
-                log.warning("Playback error: %s", error)
-            # Schedule next track
-            asyncio.run_coroutine_threadsafe(
-                _play_next(guild, text_channel), guild._state.loop
-            )
+        mixer = get_mixer()
+        mixer.reset()
+        mixer.add_source("music", volume=mq.volume)
+        mixer.add_source("tts", volume=1.0)
+        mixer.start()
 
-        vc.play(volume_source, after=after_play)
+        # Start FFmpeg for music, feeding into mixer
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-re", "-i", track.stream_url,
+            "-f", "s16le", "-ar", "48000", "-ac", "2",
+            "-loglevel", "quiet", "pipe:1",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+
+        async def feed_music():
+            try:
+                while True:
+                    chunk = await proc.stdout.read(FRAME_SIZE)
+                    if not chunk:
+                        break
+                    mixer.feed("music", chunk)
+            except Exception:
+                pass
+            finally:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
+                # Track ended — advance queue
+                asyncio.run_coroutine_threadsafe(
+                    _play_next(guild, text_channel), guild._state.loop
+                )
+
+        asyncio.create_task(feed_music())
+
+        # Connect mixer output to Discord
+        mixed_source = MixedAudioSource(mixer)
+        vc.play(mixed_source)
+
+        mq._mixer = mixer
+        mq._music_proc = proc
 
         # Announce in text channel
         if text_channel:
@@ -235,6 +267,13 @@ async def play_track(guild: discord.Guild, track: MusicTrack,
                 pass
 
         log.info("Playing: %s (requested by %s)", track.title, track.requester)
+
+        # Update web mixer state
+        try:
+            import web_mixer as wm
+            wm.update_state(music_active=True, music_title=track.title, music_level=0.0)
+        except Exception:
+            pass
     except Exception as e:
         log.warning("Failed to play track: %s", e)
         # Try next
@@ -1259,73 +1298,102 @@ class BloodAudioSink:
         return None
 
     async def _speak(self, text: str):
-        """Convert text to speech and play in voice channel.
-        Discord.py only supports 1 audio source, so we stop music,
-        play TTS, then restart the music track."""
+        """Convert text to speech and feed into mixer with ducking."""
         guild = self.bot.get_guild(int(self.guild_id))
         if not guild or not guild.voice_client:
             return
 
+        # Update web mixer
+        try:
+            import web_mixer as wm
+            wm.update_state(tts_active=True, tts_text=text, ducked=True)
+        except Exception:
+            pass
+
         mp3_data = await text_to_speech(text)
         if not mp3_data:
             log.warning("TTS returned no audio")
+            try:
+                import web_mixer as wm
+                wm.update_state(tts_active=False, ducked=False)
+            except Exception:
+                pass
             return
 
-        vc = guild.voice_client
         mq = get_music_queue(self.guild_id)
-        saved_track = mq.current if (vc.is_playing() or vc.is_paused()) and mq.current else None
-
-        try:
-            # Stop music if playing (saves track reference above)
-            if vc.is_playing() or vc.is_paused():
-                vc.stop()
-                await asyncio.sleep(0.1)
-
+        mixer = getattr(mq, '_mixer', None)
+        if not mixer:
+            # Fallback: no mixer active, just play TTS raw
+            vc = guild.voice_client
             source = FFmpegPCMAudioPipe(mp3_data)
             source.prepare()
+            vc.play(source)
+            await asyncio.sleep(1.0)  # rough estimate
+            try:
+                import web_mixer as wm
+                wm.update_state(tts_active=False, ducked=False)
+            except Exception:
+                pass
+            return
 
-            # Play TTS
-            tts_done = asyncio.Event()
+        try:
+            # Convert MP3 → PCM using FFmpeg
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-i", "pipe:0",
+                "-f", "s16le", "-ar", "48000", "-ac", "2",
+                "-loglevel", "quiet", "pipe:1",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            proc.stdin.write(mp3_data)
+            await proc.stdin.drain()
+            proc.stdin.close()
 
-            def on_tts_done(error):
-                if error:
-                    log.warning("TTS playback error: %s", error)
-                tts_done.set()
+            # Duck music
+            mixer.start_duck("music")
+            await asyncio.sleep(0.1)
 
-            vc.play(source, after=on_tts_done)
-            await tts_done.wait()
-            await asyncio.sleep(DUCK_FADE_OUT)
+            # Feed TTS into mixer
+            while True:
+                chunk = await proc.stdout.read(3840)  # 20ms
+                if not chunk:
+                    break
+                mixer.feed("tts", chunk)
+                await asyncio.sleep(0.015)  # slightly faster than real-time to fill buffer
 
-            # Restart music after TTS
-            if saved_track and saved_track.stream_url:
-                mq.current = saved_track
-                try:
-                    new_source = discord.FFmpegPCMAudio(saved_track.stream_url, **FFMPEG_OPTS)
-                    vol_source = discord.PCMVolumeTransformer(new_source, volume=mq.volume)
-                    mq._volume_transformer = vol_source
+            # Wait for TTS to finish playing through mixer
+            await asyncio.sleep(0.2)
 
-                    def after_music(error):
-                        if error:
-                            log.warning("Music resume error: %s", error)
-                        asyncio.run_coroutine_threadsafe(
-                            _play_next(guild, self.text_channel), guild._state.loop
-                        )
+            # Clear TTS channel
+            if "tts" in mixer._sources:
+                mixer._sources["tts"].clear()
 
-                    vc.play(vol_source, after=after_music)
-                    log.info("Resumed music: %s", saved_track.title)
-                except Exception as e:
-                    log.warning("Failed to restart music after TTS: %s", e)
+            # Restore music
+            mixer.stop_duck("music")
+
+            # Clean up FFmpeg
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+
+            log.info("Spoke in VC: %s", text[:60])
         except Exception as e:
-            log.warning("Failed to play TTS: %s", e)
-            # Try to restart music on failure too
-            if saved_track and saved_track.stream_url:
-                try:
-                    new_source = discord.FFmpegPCMAudio(saved_track.stream_url, **FFMPEG_OPTS)
-                    vol_source = discord.PCMVolumeTransformer(new_source, volume=mq.volume)
-                    mq._volume_transformer = vol_source
-                    vc.play(vol_source)
-                except Exception:
-                    pass
+            log.warning("TTS via mixer failed: %s", e)
+            # Restore music duck on failure
+            try:
+                mixer.stop_duck("music")
+            except Exception:
+                pass
+        finally:
+            # Reset web mixer state
+            try:
+                import web_mixer as wm
+                wm.update_state(tts_active=False, ducked=False)
+            except Exception:
+                pass
 
     async def _conversation_timeout(self):
         """Clear active conversation after timeout."""
@@ -1403,6 +1471,14 @@ async def join_and_listen(guild: discord.Guild, vc_channel: discord.VoiceChannel
     # Start processing loop
     sink.start_processing()
 
+    # Start web mixer dashboard
+    try:
+        import web_mixer as wm
+        wm.start_web_mixer()
+        wm.update_state(music_active=False, tts_active=False, ducked=False)
+    except Exception as e:
+        log.warning("Web mixer not started: %s", e)
+
     log.info("Joined VC '%s' in %s — listening", vc_channel.name, guild.name)
     return f"✅ Joined **{vc_channel.name}** — listening & recording. Say 'Blood' or 'hey Blood' to talk to me!"
 
@@ -1425,5 +1501,12 @@ async def leave_voice(guild: discord.Guild) -> str:
 
     # Clear conversation state
     _active_conversation.pop(guild_id, None)
+
+    # Reset web mixer
+    try:
+        import web_mixer as wm
+        wm.update_state(music_active=False, tts_active=False, ducked=False)
+    except Exception:
+        pass
 
     return "✅ Left voice channel. Transcript saved."
