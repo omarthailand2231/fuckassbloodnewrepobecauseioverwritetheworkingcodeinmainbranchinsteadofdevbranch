@@ -65,6 +65,13 @@ CONFIG = {
         "image_search":      ["user", "mod", "admin", "owner"],
         "give_coins":        ["user", "mod", "admin", "owner"],
 
+        # ── Music (anyone can use) ──
+        "play_music":        ["user", "mod", "admin", "owner"],
+        "skip_music":        ["user", "mod", "admin", "owner"],
+        "stop_music":        ["user", "mod", "admin", "owner"],
+        "music_queue":       ["user", "mod", "admin", "owner"],
+        "music_volume":      ["user", "mod", "admin", "owner"],
+
         # ── Admin-only ──
         "send_announcement": ["admin", "owner"],
         "manage_role":       ["admin", "owner"],
