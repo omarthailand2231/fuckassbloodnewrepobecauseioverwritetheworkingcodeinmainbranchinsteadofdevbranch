@@ -421,90 +421,106 @@ def record_feedback(user_id: str, track_title: str, positive: bool):
     _save_taste(user_id, data)
 
 
-# Track recently played per user to avoid repeats
-_recent_plays: dict[str, list[str]] = {}  # user_id -> last N queries
-RECENT_PLAYS_MAX = 20
+# AI-powered recommendation cache: user_id -> list of "Artist - Song" strings
+_rec_cache: dict[str, list[str]] = {}
+# Track recently played to avoid repeats across batches
+_recent_played: dict[str, list[str]] = {}
+RECENT_MAX = 30
 
 
-def get_taste_query(user_id: str) -> str:
-    """Build a YouTube search query based on user taste. Avoids recent repeats."""
+async def _generate_recommendations(user_id: str, count: int = 15) -> list[str]:
+    """Use AI to generate diverse song recommendations like Spotify/YouTube Music."""
     import random
+    from provider import call_ai
+
     data = _load_taste(user_id)
-    liked = data.get("liked", [])
-    recent = _recent_plays.get(user_id, [])
+    liked = data.get("liked", [])[-20:]
+    disliked = data.get("disliked", [])[-10:]
+    recent = _recent_played.get(user_id, [])[-15:]
 
-    # Cold start — wide genre variety
-    cold_genres = [
-        "popular music 2025", "top hits 2025", "trending songs today",
-        "new music this week", "hot 100 songs", "viral tiktok songs 2025",
-        "chill vibes playlist", "lofi hip hop mix", "pop hits playlist",
-        "rock classics mix", "edm festival mix", "best of 2024 music",
-        "thai music 2025", "kpop new releases", "rap hits 2025",
-        "indie discoveries", "jazz lounge", "rnb soul mix",
-        "anime openings mix", "gaming soundtrack mix",
-        "90s hits playlist", "2000s throwback mix", "workout music mix",
-        "late night drive music", "sad songs playlist", "happy upbeat songs",
-        "acoustic covers playlist", "lo-fi chill beats", "synthwave mix",
-        "bedroom pop", "hyperpop mix", "classical music for studying",
-    ]
-
-    if not liked:
-        # Pick from cold genres, avoid recent
-        available = [g for g in cold_genres if g not in recent]
-        if not available:
-            available = cold_genres
-        query = random.choice(available)
-        _track_recent(user_id, query)
-        return query
-
-    # Build diverse queries from liked tracks
-    # Shuffle liked so we don't always pick the same base
-    pool = liked.copy()
-    random.shuffle(pool)
-
-    # Try to find a base that wasn't recently used
-    base = None
-    for candidate in pool:
-        if candidate not in recent:
-            base = candidate
-            break
-    if not base:
-        base = random.choice(pool)
-
-    # Diverse query templates — never just replay the same song
-    templates = [
-        f"{base} radio mix",
-        f"songs similar to {base}",
-        f"if you like {base}",
-        f"{base} genre playlist",
-        f"artists like {base}",
-        f"more songs by the artist of {base}",
-        f"{base} type beat music",
-    ]
-
-    # 30% chance: explore something new entirely
-    if random.random() < 0.3:
-        explore = [
-            f"songs by the same artist as {base}",
-            f"{base} album full",
-            f"more from {base} artist",
-            f"best of {base} genre",
-        ] + cold_genres[:10]  # mix in some genre exploration
-        query = random.choice(explore)
+    if liked:
+        taste_info = f"Songs they liked: {', '.join(liked)}"
     else:
-        query = random.choice(templates)
+        taste_info = "No listening history yet — suggest a diverse mix of popular and interesting songs across genres."
 
-    _track_recent(user_id, query)
-    return query
+    dislike_info = f"\nSongs they DISLIKED (avoid similar): {', '.join(disliked)}" if disliked else ""
+    recent_info = f"\nRecently played (DO NOT repeat these): {', '.join(recent)}" if recent else ""
+
+    prompt = (
+        f"You are a music recommendation engine like Spotify or YouTube Music.\n"
+        f"Generate {count} song recommendations for this listener.\n\n"
+        f"{taste_info}{dislike_info}{recent_info}\n\n"
+        f"Rules:\n"
+        f"- Output ONLY a list, one song per line, format: Artist - Song Title\n"
+        f"- NO numbering, NO bullets, NO extra text\n"
+        f"- Every song must be a REAL, existing song\n"
+        f"- Mix: 60% similar to their taste, 30% discovery (new genres/artists), 10% wildcard\n"
+        f"- NEVER repeat an artist more than twice\n"
+        f"- NEVER include songs from the recently played list\n"
+        f"- Prefer original recordings, not covers or live versions\n"
+        f"- Include a good variety of energy levels (chill, upbeat, hype)\n"
+    )
+
+    try:
+        result = await call_ai(
+            system="You are a music recommendation engine. Output ONLY song names, one per line.",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=600,
+        )
+        text = result.get("message", {}).get("content", "")
+        songs = []
+        for line in text.strip().split("\n"):
+            line = line.strip().lstrip("0123456789.-) •●")
+            line = line.strip()
+            if line and len(line) > 5 and " - " in line:
+                songs.append(line)
+        if songs:
+            random.shuffle(songs)
+            return songs
+    except Exception as e:
+        log.warning("AI recommendation failed: %s", e)
+
+    # Fallback: diverse cold-start genres
+    fallback = [
+        "Dua Lipa - Levitating", "The Weeknd - Blinding Lights",
+        "Tame Impala - The Less I Know The Better", "Arctic Monkeys - Do I Wanna Know",
+        "Billie Eilish - bad guy", "Harry Styles - As It Was",
+        "Tyler The Creator - See You Again", "SZA - Kill Bill",
+        "Olivia Rodrigo - good 4 u", "Post Malone - Circles",
+        "Mac DeMarco - Chamber of Reflection", "Glass Animals - Heat Waves",
+        "Doja Cat - Say So", "BTS - Dynamite", "BLACKPINK - How You Like That",
+    ]
+    import random
+    random.shuffle(fallback)
+    return [s for s in fallback if s not in recent][:count]
 
 
-def _track_recent(user_id: str, query: str):
-    """Record a query as recently used."""
-    if user_id not in _recent_plays:
-        _recent_plays[user_id] = []
-    _recent_plays[user_id].append(query)
-    if len(_recent_plays[user_id]) > RECENT_PLAYS_MAX:
-        _recent_plays[user_id] = _recent_plays[user_id][-RECENT_PLAYS_MAX:]
+async def get_next_song(user_id: str) -> str:
+    """Get next song recommendation. Pulls from cache, refills via AI when empty."""
+    # Check cache
+    if user_id in _rec_cache and _rec_cache[user_id]:
+        song = _rec_cache[user_id].pop(0)
+        _track_played(user_id, song)
+        return song
+
+    # Cache empty — generate new batch
+    songs = await _generate_recommendations(user_id)
+    if not songs:
+        return "popular music mix 2025"
+
+    song = songs.pop(0)
+    _rec_cache[user_id] = songs  # Cache the rest
+    _track_played(user_id, song)
+    return song
+
+
+def _track_played(user_id: str, song: str):
+    """Record a song as recently played."""
+    if user_id not in _recent_played:
+        _recent_played[user_id] = []
+    _recent_played[user_id].append(song)
+    if len(_recent_played[user_id]) > RECENT_MAX:
+        _recent_played[user_id] = _recent_played[user_id][-RECENT_MAX:]
 
 
 # ── Random Music DJ System ────────────────────────────────────────────────────
@@ -644,8 +660,8 @@ async def _dj_loop(guild: discord.Guild, text_channel: Optional[discord.TextChan
                 await asyncio.sleep(2)
                 continue
 
-            # Build search query based on user's taste
-            query = get_taste_query(next_user)
+            # Get AI-powered song recommendation
+            query = await get_next_song(next_user)
             user_name = dj.user_names.get(next_user, "Someone")
 
             track = await extract_track(query, f"{user_name} (DJ)")
