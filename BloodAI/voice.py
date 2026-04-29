@@ -21,6 +21,9 @@ import discord
 
 log = logging.getLogger("blood.voice")
 
+# Silence noisy voice_recv gateway spam ("WS payload has extra keys")
+logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.ERROR)
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -1221,7 +1224,9 @@ class BloodAudioSink:
         return None
 
     async def _speak(self, text: str):
-        """Convert text to speech and play in voice channel. Ducks music if playing."""
+        """Convert text to speech and play in voice channel.
+        Discord.py only supports 1 audio source, so we stop music,
+        play TTS, then restart the music track."""
         guild = self.bot.get_guild(int(self.guild_id))
         if not guild or not guild.voice_client:
             return
@@ -1233,16 +1238,13 @@ class BloodAudioSink:
 
         vc = guild.voice_client
         mq = get_music_queue(self.guild_id)
-        music_was_playing = vc.is_playing() and mq.current is not None
+        saved_track = mq.current if (vc.is_playing() or vc.is_paused()) and mq.current else None
 
         try:
-            # Duck music volume before speaking
-            if music_was_playing:
-                mq.duck()
-                await asyncio.sleep(DUCK_FADE_IN)
-                # Pause music, play TTS, then resume
-                vc.pause()
-                await asyncio.sleep(0.05)
+            # Stop music if playing (saves track reference above)
+            if vc.is_playing() or vc.is_paused():
+                vc.stop()
+                await asyncio.sleep(0.1)
 
             source = FFmpegPCMAudioPipe(mp3_data)
             source.prepare()
@@ -1257,19 +1259,36 @@ class BloodAudioSink:
 
             vc.play(source, after=on_tts_done)
             await tts_done.wait()
+            await asyncio.sleep(DUCK_FADE_OUT)
 
-            # Restore music after TTS
-            if music_was_playing:
-                await asyncio.sleep(DUCK_FADE_OUT)
-                mq.unduck()
-                vc.resume()
+            # Restart music after TTS
+            if saved_track and saved_track.stream_url:
+                mq.current = saved_track
+                try:
+                    new_source = discord.FFmpegPCMAudio(saved_track.stream_url, **FFMPEG_OPTS)
+                    vol_source = discord.PCMVolumeTransformer(new_source, volume=mq.volume)
+                    mq._volume_transformer = vol_source
+
+                    def after_music(error):
+                        if error:
+                            log.warning("Music resume error: %s", error)
+                        asyncio.run_coroutine_threadsafe(
+                            _play_next(guild, self.text_channel), guild._state.loop
+                        )
+
+                    vc.play(vol_source, after=after_music)
+                    log.info("Resumed music: %s", saved_track.title)
+                except Exception as e:
+                    log.warning("Failed to restart music after TTS: %s", e)
         except Exception as e:
             log.warning("Failed to play TTS: %s", e)
-            # Restore music on failure
-            if music_was_playing:
+            # Try to restart music on failure too
+            if saved_track and saved_track.stream_url:
                 try:
-                    mq.unduck()
-                    vc.resume()
+                    new_source = discord.FFmpegPCMAudio(saved_track.stream_url, **FFMPEG_OPTS)
+                    vol_source = discord.PCMVolumeTransformer(new_source, volume=mq.volume)
+                    mq._volume_transformer = vol_source
+                    vc.play(vol_source)
                 except Exception:
                     pass
 
