@@ -252,3 +252,110 @@ If music playing:
 If no music:
     └── vc.play(FFmpegSource) → plays directly
 ```
+
+---
+
+## 11. Spotify Mood-Based DJ System
+
+**Problem**: AI-only recommendations plateau fast — the LLM suggests the same artists repeatedly and has no understanding of audio characteristics.
+
+**Solution**: Hybrid system — AI detects mood from chat context, Spotify API provides musically-accurate recommendations.
+
+**Flow per DJ pick**:
+```
+1. AI mood detection (cached 10 min):
+   - Input: last 10 chat messages + last 3 skipped + last 3 liked + time of day
+   - Output: one word — chill, hype, sad, focus, angry, neutral
+   
+2. Map mood → Spotify audio feature targets:
+   - chill  → valence 0.3-0.6, energy 0.2-0.5, tempo 70-110
+   - hype   → valence 0.6-1.0, energy 0.7-1.0, tempo 120-160
+   - sad    → valence 0.0-0.3, energy 0.1-0.4, tempo 60-100
+   - etc.
+
+3. Resolve Spotify IDs for user's top 5 liked songs (cached)
+
+4. Call Spotify /recommendations with seed tracks + mood targets → 15 tracks
+
+5. Cache batch, serve one at a time
+
+6. Search each track on YouTube/SoundCloud via extract_track
+```
+
+**Fallback**: If Spotify API fails (no keys, rate limit, no liked songs), falls back to pure AI recommendations. The user never notices — same interface.
+
+**Auth**: Client Credentials flow (no user login needed). Token cached until expiry.
+
+---
+
+## 12. yt-dlp Age-Restricted Fallback
+
+**Problem**: YouTube age-restricts random music videos. `yt-dlp` fails with "Sign in to confirm your age" — kills the entire search.
+
+**Solution**: Multi-result search with per-entry error handling + platform fallback.
+
+```
+ytsearch5:"Artist - Song audio"
+    ├── entry 1: age-restricted → skip
+    ├── entry 2: too long (>15min) → skip
+    ├── entry 3: "cover" in title → skip
+    ├── entry 4: ✓ good → use this
+    └── entry 5: (never reached)
+
+If ALL 5 YouTube entries fail:
+    └── scsearch3:"Artist - Song"  (SoundCloud fallback)
+         ├── Same _is_bad() filter applies
+         └── First good result → use it
+```
+
+**Key**: Wrap each `ydl.extract_info()` in its own try/catch. The age-restricted error happens per-entry, not per-search. Don't let one bad entry kill the whole batch.
+
+---
+
+## 13. Reliable Music Skip (stop_music)
+
+**Problem**: `skip_music` said "Skipped" but the old song kept playing. The FFmpeg process was killed but audio frames were still in the buffer.
+
+**Root cause**: `proc.stdout.read(FRAME_SIZE)` is a blocking call. Even after `proc.kill()`, the reader thread could be mid-read, and frames written between `kill()` and `thread.join()` would linger in the deque.
+
+**Fix** (order matters):
+```python
+def stop_music(self):
+    self._music_stopping = True      # 1. Signal reader thread to stop
+    self._has_music = False
+    self._music_buf.clear()           # 2. Clear buffer FIRST (read() returns silence immediately)
+    proc.stdout.close()               # 3. Close stdout (unblocks reader's .read())
+    proc.kill()                       # 4. Kill FFmpeg
+    thread.join(timeout=2)            # 5. Wait for reader thread
+    self._music_buf.clear()           # 6. Clear AGAIN (catch frames written between 2-5)
+```
+
+**Also**: When a track ends naturally, the reader thread must wait for the buffer to drain before firing `on_music_end`. Otherwise the last ~5 seconds of every song gets cut off:
+```python
+# In reader thread finally block:
+while self._music_buf and not self._music_stopping:
+    time.sleep(0.05)  # wait for Discord's read() to consume remaining frames
+```
+
+---
+
+## 14. Tool Permission Architecture
+
+**Problem**: Regular users couldn't use music via `@blood play X` even though slash commands worked. Blood would say "I can't do that" and tell them to use `/play`.
+
+**Root cause**: `tool_permissions` config defaults unlisted tools to `["owner"]`:
+```python
+allowed = CONFIG["tool_permissions"].get(tool_name, ["owner"])
+```
+
+Music tools weren't listed → only owner got them → AI literally couldn't see `play_music` for regular users.
+
+**Fix**: Explicitly list every tool that should be available to users:
+```python
+"play_music":   ["user", "mod", "admin", "owner"],
+"skip_music":   ["user", "mod", "admin", "owner"],
+```
+
+**Lesson**: The default-to-owner pattern is safe (least privilege) but means new tools are invisible until explicitly granted. Always add new tools to `tool_permissions` when creating them.
+
+**Prompt reinforcement**: Even with tools available, the AI may still choose not to use them. Adding a `MUSIC:` section to the system prompt ("ALWAYS use the tool, never say do it yourself") was necessary to get reliable tool usage.

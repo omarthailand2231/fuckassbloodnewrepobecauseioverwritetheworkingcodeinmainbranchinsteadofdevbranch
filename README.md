@@ -12,16 +12,20 @@ A ruthless, autonomous Discord bot with a god complex. Powered by Kimi K2 (Firew
 
 ```
 bot.py        — core Discord bot, event loop, system prompt, commands, AGI loops
-tools.py      — 35+ tool definitions + execution handlers
+tools.py      — 40+ tool definitions + execution handlers
 provider.py   — LLM provider (Fireworks/Moonshot Kimi K2, Groq fallback, vision models)
 memory.py     — persistent memory: chat logs, vector search, goals, reflections, coins
 market.py     — real-time stock/crypto/commodity trading engine
+voice.py      — voice receive, STT, TTS, music playback, DJ system, mood detection
+mixer.py      — thread-based audio mixer (music + TTS overlay, ducking)
+spotify.py    — Spotify API client (audio features, recommendations, mood mapping)
 config.py     — single source of truth for every tunable value
 ```
 
 **Model:** `kimi-k2p6` via Fireworks API (streaming for >4096 tokens)
 **Vision:** `qwen3-vl-30b` (fast/gaming) + Kimi K2 native vision
 **Vector Memory:** ChromaDB + SentenceTransformer (`all-MiniLM-L6-v2`)
+**Music:** yt-dlp (YouTube/SoundCloud) + Spotify API (mood recommendations)
 
 ---
 
@@ -97,6 +101,21 @@ Blood also gives/takes coins autonomously via `give_coins` — reward for smart 
 
 BHC coins convert to fractional shares at real prices. Real market movements = real gains/losses.
 
+### Voice & Music
+| Command | Aliases | Description |
+|---|---|---|
+| `/joinvc [channel]` | | Join a voice channel with listening + TTS |
+| `/leavevc` | | Leave voice channel and save transcript |
+| `/play <query>` | `!p` | Play music (YouTube/Spotify/SoundCloud URL or search) |
+| `/skip` | | Skip the current song |
+| `/stop` | | Stop music and clear queue |
+| `/queue` | `!q` | Show music queue |
+| `/np` | `!nowplaying` | Show what's currently playing |
+| `/volume <0-100>` | `!vol` | Set music volume |
+| `/randommusic` | `!rdj`, `!djme` | Start mood-aware random DJ based on your taste |
+
+Music also works via `@blood` text commands (e.g. `@blood play Sugar by Maroon 5`) — Blood auto-joins your VC if needed. All users can use music tools.
+
 ### Remote Terminal (Admin+)
 | Command | Aliases | Description |
 |---|---|---|
@@ -105,7 +124,7 @@ BHC coins convert to fractional shares at real prices. Real market movements = r
 
 ---
 
-## AI Tools (35+)
+## AI Tools (40+)
 
 Blood has real tool-calling capabilities — he makes actual function calls, never roleplays tool usage.
 
@@ -151,6 +170,15 @@ Blood has real tool-calling capabilities — he makes actual function calls, nev
 | Tool | Description |
 |---|---|
 | `give_coins` | Give or take BHC coins (no limits — reward or punish at will) |
+
+### Music (Everyone)
+| Tool | Description |
+|---|---|
+| `play_music` | Play/queue a song by name or URL (auto-joins VC if needed) |
+| `skip_music` | Skip the current song |
+| `stop_music` | Stop music and clear the queue |
+| `music_queue` | Show what's playing and what's queued |
+| `music_volume` | Set music volume (0-100) |
 
 ### Communication
 | Tool | Description |
@@ -303,7 +331,7 @@ blacklisted < user < mod < admin < owner
 
 | Tier | Access |
 |---|---|
-| **Everyone** | Coins, gambling, market, leaderboard, goals, skills (read) |
+| **Everyone** | Coins, gambling, market, leaderboard, goals, skills (read), music (play/skip/queue/volume) |
 | **Mod+** | Compact, kick, timeout, mute/unmute, set nickname |
 | **Admin+** | Ban, addcoins, terminal, announcements, roles, channels, reflect, config, skills (write) |
 | **Owner** | Everything + debug + reset |
@@ -378,6 +406,10 @@ bash run.sh
 - **TAVILY_API_KEY** — Tavily web search/extraction
 - **OWNER_ID** — Your Discord user ID
 
+### Optional API Keys
+- **SPOTIFY_CLIENT_ID** + **SPOTIFY_CLIENT_SECRET** — Spotify API (mood-based DJ recommendations)
+- **GROQ_API_KEY** — Groq Whisper (voice STT)
+
 ---
 
 ## Tech Stack
@@ -390,5 +422,8 @@ bash run.sh
 - **Web Search:** DuckDuckGo Search
 - **Web Extract:** Tavily API + fallback scraping
 - **Market Data:** yfinance + matplotlib charts
+- **Voice:** discord-ext-voice-recv + Edge-TTS + Groq Whisper
+- **Music:** yt-dlp + FFmpeg (YouTube/SoundCloud playback)
+- **Mood DJ:** Spotify Web API (audio features + recommendations)
 - **Desktop Control:** pyautogui + Pillow (grid overlay)
 - **Browser:** Playwright (disabled, re-enable later)
