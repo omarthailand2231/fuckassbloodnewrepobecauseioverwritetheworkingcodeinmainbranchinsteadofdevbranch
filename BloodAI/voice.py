@@ -622,6 +622,12 @@ _conversation_timeout = 30  # seconds before conversation goes cold
 
 # ── Audio Buffer per User ─────────────────────────────────────────────────────
 
+# Max buffer size: ~10s of audio at 48kHz stereo 16-bit = ~1.9MB
+MAX_BUFFER_BYTES = SAMPLE_RATE * CHANNELS * 2 * 10
+# Minimum audio bytes to bother sending to STT (~0.5s)
+MIN_STT_BYTES = SAMPLE_RATE * CHANNELS * 2 * 0.5
+
+
 class UserAudioBuffer:
     """Accumulate PCM audio per user, detect silence, trigger STT."""
 
@@ -638,7 +644,9 @@ class UserAudioBuffer:
         if not self.is_speaking:
             self.is_speaking = True
             self.speech_start = now
-        self.buffer.extend(pcm_data)
+        # Cap buffer to prevent memory blowup
+        if len(self.buffer) < MAX_BUFFER_BYTES:
+            self.buffer.extend(pcm_data)
         self.last_packet_time = now
 
     def silence_duration(self) -> float:
@@ -998,6 +1006,8 @@ class BloodAudioSink:
         self.user_buffers: dict[int, UserAudioBuffer] = {}
         self._running = True
         self._process_task = None
+        self._stt_lock = asyncio.Lock()
+        self._last_stt_time = 0.0
 
     def start_processing(self):
         """Start the background task that checks for silence and transcribes."""
@@ -1007,22 +1017,40 @@ class BloodAudioSink:
         """Periodically check user buffers for completed speech."""
         while self._running:
             try:
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.5)  # Check every 500ms (was 300ms)
+                now = time.monotonic()
                 for uid, buf in list(self.user_buffers.items()):
                     # Check if user stopped speaking (silence gap)
                     if buf.is_speaking and buf.silence_duration() > SILENCE_THRESHOLD_SEC:
                         pcm = buf.harvest()
-                        if pcm:
-                            asyncio.create_task(self._handle_speech(uid, buf.user_name, pcm))
+                        if pcm and len(pcm) >= int(MIN_STT_BYTES):
+                            # Throttle: skip if last STT was < 2s ago
+                            if now - self._last_stt_time < 2.0:
+                                continue
+                            if not self._stt_lock.locked():
+                                self._last_stt_time = now
+                                asyncio.create_task(self._guarded_handle(uid, buf.user_name, pcm))
+                        elif pcm:
+                            pass  # Too short, discard
                     # Force harvest if speaking too long
                     elif buf.is_speaking and buf.speech_duration() > MAX_SPEECH_SEC:
                         pcm = buf.harvest()
-                        if pcm:
-                            asyncio.create_task(self._handle_speech(uid, buf.user_name, pcm))
+                        if pcm and len(pcm) >= int(MIN_STT_BYTES):
+                            if not self._stt_lock.locked():
+                                self._last_stt_time = now
+                                asyncio.create_task(self._guarded_handle(uid, buf.user_name, pcm))
+                    # Clear stale buffers (no packets for 10s)
+                    elif not buf.is_speaking and buf.silence_duration() > 10:
+                        buf.clear()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 log.warning("Voice process loop error: %s", e)
+
+    async def _guarded_handle(self, user_id: int, user_name: str, pcm_data: bytes):
+        """Run STT+response with concurrency guard."""
+        async with self._stt_lock:
+            await self._handle_speech(user_id, user_name, pcm_data)
 
     async def _handle_speech(self, user_id: int, user_name: str, pcm_data: bytes):
         """Transcribe speech and decide whether to respond."""
@@ -1258,7 +1286,9 @@ class BloodAudioSink:
         uid = user.id
         if uid not in self.user_buffers:
             self.user_buffers[uid] = UserAudioBuffer(uid, user.display_name)
-        self.user_buffers[uid].add_pcm(pcm_data)
+        # Only buffer if we're not already processing STT (back-pressure)
+        if not self._stt_lock.locked():
+            self.user_buffers[uid].add_pcm(pcm_data)
 
     def stop(self):
         """Stop the processing loop."""
