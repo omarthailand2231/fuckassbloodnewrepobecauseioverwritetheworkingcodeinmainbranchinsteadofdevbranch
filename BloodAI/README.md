@@ -1,25 +1,26 @@
 # Blood — Discord AI Agent Bot
 
 ## What this is
-Blood is a full-featured Discord AI agent with voice presence, music DJ, moderation, coin economy, stock market trading, web browsing, and persistent memory. Supports STT/TTS for live voice conversations.
+Blood is a full-featured Discord AI agent with voice presence, real-time audio mixing, AI-powered music DJ, moderation, coin economy, stock market trading, web browsing, and persistent memory. Supports STT/TTS for live voice conversations with simultaneous music playback.
 
 ## Tech stack
-- Python 3.14 + discord.py 2.7 (with DAVE encryption)
-- Fireworks AI (Kimi K2.5) primary / Groq fallback chain
-- Groq Whisper (STT) + Edge-TTS (speech)
-- yt-dlp (YouTube/Spotify/SoundCloud music)
-- discord-ext-voice-recv (voice listening)
-- Yahoo Finance (`yfinance`) — real-time prices
-- Tavily — web search/scraping
-- ChromaDB + sentence-transformers — vector memory
-- Local file-based memory (no external DB)
+- **Runtime**: Python 3.14 + discord.py 2.7 (with DAVE encryption)
+- **AI**: Fireworks AI (Kimi K2.5) primary / Groq fallback chain
+- **Voice**: Groq Whisper (STT) + Edge-TTS (speech) + discord-ext-voice-recv
+- **Audio Mixer**: Thread-based PCM mixer with live ducking (`mixer.py`)
+- **Music**: yt-dlp (YouTube/Spotify/SoundCloud) + AI-powered recommendations
+- **Finance**: Yahoo Finance (`yfinance`) — real-time prices
+- **Search**: Tavily — web search/scraping
+- **Memory**: ChromaDB + sentence-transformers (vector) + local file-based (no external DB)
 
 ## File structure
 ```
 bot.py          — Main bot, event loop, commands, agentic tool-call loop
-voice.py        — Voice system: STT, TTS, music, DJ, transcripts, taste learning
+voice.py        — Voice: STT, TTS, music, DJ, AI intent, transcripts, taste learning
+mixer.py        — Thread-based real-time audio mixer (music + TTS ducking)
+web_mixer.py    — Mixer web UI dashboard (localhost:7777)
 tools.py        — Tool definitions + executors (30+ tools)
-provider.py     — Fireworks/Groq API client with smart fallback + vision
+provider.py     — Fireworks/Groq/DeepSeek API client with smart fallback + vision
 config.py       — Permission tiers, role IDs, tool gates, model chain
 memory.py       — Memory manager (RAM + channels + summaries + coins + market)
 market.py       — Real-time stock/crypto/commodity prices + charts
@@ -45,12 +46,12 @@ data/
 - NOT injected into every prompt — Blood uses `recall_memory` tool to search on demand
 
 ### Actions Ledger (`actions.md`)
-- Permanent timestamped log of every successful `timeout`, `ban`, `kick`, `unmute`, and `delete_messages`.
+- Permanent timestamped log of every successful `timeout`, `ban`, `kick`, `unmute`, and `delete_messages`
 - Automatically searched by `recall_memory` so Blood can definitively answer "Why did you ban X?"
 
 ### memory_2.md (summaries)
-- AI writes here via `save_summary` tool.
-- This IS injected into every system prompt (capped at 400 chars).
+- AI writes here via `save_summary` tool
+- This IS injected into every system prompt (capped at 400 chars)
 
 ### users.xml (relationships)
 - Tracks interaction graph: who interacted with whom and how many times. Updated on every message.
@@ -128,24 +129,44 @@ Blood can use these on its own judgment:
 3. Buffers per-user PCM audio, detects silence gaps (1.5s)
 4. Sends audio to **Groq Whisper** for transcription
 5. Checks for wake words (`"blood"`, `"hey blood"`, `"เลือด"`, `"บลัด"`)
-6. Generates short response (1-2 sentences max — no yapping)
-7. Converts to speech via **Edge-TTS** and plays in VC
+6. AI classifies intent (music command? general chat?)
+7. Generates short response (1-2 sentences max — no yapping)
+8. Converts to speech via **Edge-TTS** and plays in VC
 
 ### Text+VC Dual Reply
 If a user is in VC with Blood but chats in text, Blood replies in text **and** speaks via TTS simultaneously.
 
-### Music Playback
-- **yt-dlp** extracts audio from YouTube (priority), Spotify, SoundCloud
-- Queue system with auto-advance
-- Volume ducking: music lowers to 15% when Blood speaks, restores after
+### Thread-Based Audio Mixer (`mixer.py`)
+- **Music feed**: FFmpeg subprocess → reader thread → deque buffer
+- **TTS feed**: FFmpeg subprocess → reader thread → deque buffer
+- **Mixing**: Discord's AudioPlayer calls `read()` every 20ms, mixes both PCM streams
+- **Auto-ducking**: Music volume drops to 15% when Blood speaks, smoothly restores after
+- **Back-pressure**: Reader thread pauses when buffer exceeds 50 frames to prevent memory bloat
+- **Web UI**: Real-time mixer dashboard at `localhost:7777` with live VU meters
+
+### AI Music Intent Classification
+Instead of rigid keyword matching, Blood uses AI to understand natural language music commands:
+- `"this slaps"` / `"banger"` → **like** (records positive feedback)
+- `"nah this ain't it"` / `"mid"` → **dislike** (records negative + auto-skips)
+- `"next"` / `"play something else"` → **skip**
+- `"play Blinding Lights"` → **play:Blinding Lights**
+- Only runs when music is playing or text contains music-related words (saves API calls)
+
+### AI-Powered Music Recommendations
+Like Spotify/YouTube Music — uses AI to generate batches of 15 songs:
+- Sends user's liked/disliked/recently played history to LLM
+- AI generates diverse recommendations: 60% similar, 30% discovery, 10% wildcard
+- Batched: generates 15 songs at once, caches them, only calls AI every ~15 tracks
+- Recently played list (last 30) prevents repeats across batches
+- Filters: max 15min duration, skips covers/karaoke/audiobooks/podcasts
+- Search appends `"audio"` keyword to prefer audio uploads over music videos
 
 ### Random DJ System (`/randommusic`)
 - Per-user taste profiles stored in `data/music_taste/`
 - Songs you request are auto-liked
-- `/like` and `/dislike` (or voice: "I like this", "this sucks") shape recommendations
-- **Multi-user priority rotation**: first user gets N songs (N = total users), others get 1 each, then loop
+- Like/dislike via voice, slash commands, or 👍/👎 reactions
+- **Multi-user priority rotation**: first user gets N songs (N = total users), others get 1 each
 - Users auto-removed from DJ when they leave VC
-- 👍/👎 reactions on DJ messages also count as feedback
 
 ## Key behaviors
 - **Temporal Awareness**: Real-time UTC clock injected into every prompt
@@ -154,10 +175,12 @@ If a user is in VC with Blood but chats in text, Blood replies in text **and** s
 - **Thought leak prevention**: Discards leaked reasoning steps
 - **Mod action verification**: Retries up to 4 times
 - **Fuzzy channel matching**: Handles Unicode fonts, special chars, partial names
+- **Always-on voice buffering**: Audio is never dropped even while STT is processing
 
 ## Environment variables
 ```
 DISCORD_TOKEN=...
 GROQ_API_KEY=...
 FIREWORKS_API_KEY=...
+TAVILY_API_KEY=...    # optional, for web search
 ```
