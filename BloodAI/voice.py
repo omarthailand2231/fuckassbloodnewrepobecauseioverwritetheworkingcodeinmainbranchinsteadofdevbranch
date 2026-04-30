@@ -1095,20 +1095,24 @@ async def transcribe_audio(pcm_data: bytes) -> Optional[str]:
     form.add_field("file", wav_data, filename="audio.wav", content_type="audio/wav")
     form.add_field("model", GROQ_STT_MODEL)
     form.add_field("response_format", "json")
-    form.add_field("language", "th")  # Thai primary, Whisper auto-detects mixed
+    # No language param = Whisper auto-detects (handles English/Thai/mixed)
 
     try:
         session = _get_stt_session()
         async with session.post(GROQ_STT_URL, headers=headers, data=form) as resp:
             if resp.status != 200:
                 err = await resp.text()
-                log.warning("Whisper STT error %d: %s", resp.status, err[:200])
+                log.warning("[STT] Whisper API error %d: %s", resp.status, err[:200])
                 return None
             data = await resp.json()
             text = data.get("text", "").strip()
+            if text:
+                log.info("[STT] Transcribed: '%s'", text[:60])
+            else:
+                log.debug("[STT] Whisper returned empty text")
             return text if text else None
     except Exception as e:
-        log.warning("STT failed: %s", e)
+        log.warning("[STT] API call failed: %s", e)
         return None
 
 
@@ -1409,18 +1413,25 @@ class BloodAudioSink:
                 for uid, buf in list(self.user_buffers.items()):
                     # Check if user stopped speaking (silence gap)
                     if buf.is_speaking and buf.silence_duration() > SILENCE_THRESHOLD_SEC:
+                        log.debug("[STT] Silence detected for %s (%.1fs), harvesting...", buf.user_name, buf.silence_duration())
                         pcm = buf.harvest()
                         if pcm and len(pcm) >= int(MIN_STT_BYTES):
+                            log.debug("[STT] Harvested %d bytes from %s", len(pcm), buf.user_name)
                             # Throttle: skip if last STT was < 2s ago
                             if now - self._last_stt_time < 2.0:
+                                log.debug("[STT] Throttled — last STT was %.1fs ago", now - self._last_stt_time)
                                 continue
                             if not self._stt_lock.locked():
                                 self._last_stt_time = now
+                                log.info("[STT] Sending %d bytes to Whisper for %s", len(pcm), buf.user_name)
                                 asyncio.create_task(self._guarded_handle(uid, buf.user_name, pcm))
+                            else:
+                                log.debug("[STT] Lock held — skipping")
                         elif pcm:
-                            pass  # Too short, discard
+                            log.debug("[STT] Audio too short (%d bytes < %d), discarding", len(pcm), int(MIN_STT_BYTES))
                     # Force harvest if speaking too long
                     elif buf.is_speaking and buf.speech_duration() > MAX_SPEECH_SEC:
+                        log.debug("[STT] Max speech duration reached for %s", buf.user_name)
                         pcm = buf.harvest()
                         if pcm and len(pcm) >= int(MIN_STT_BYTES):
                             if not self._stt_lock.locked():
@@ -1487,6 +1498,7 @@ class BloodAudioSink:
         # Check if Blood should respond
         has_wake = contains_wake_word(text)
         is_relevant = is_relevant_to_conversation(text, self.guild_id)
+        log.debug("[STT] Wake word: %s, Relevant: %s for '%s'", has_wake, is_relevant, text[:40])
 
         if has_wake or is_relevant:
             # Mark conversation as active
