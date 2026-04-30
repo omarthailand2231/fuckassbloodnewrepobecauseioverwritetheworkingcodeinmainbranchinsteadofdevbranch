@@ -1737,6 +1737,9 @@ class BloodAudioSink:
 
 _active_sinks: dict[str, BloodAudioSink] = {}
 
+# Track intentional disconnects so auto-rejoin doesn't fight /leavevc
+_intentional_leave: set[str] = set()  # guild_ids currently doing intentional leave
+
 
 def get_active_sink(guild_id: str) -> Optional[BloodAudioSink]:
     return _active_sinks.get(guild_id)
@@ -1811,10 +1814,19 @@ async def leave_voice(guild: discord.Guild) -> str:
     """Leave voice channel and save transcript."""
     guild_id = str(guild.id)
 
+    # Mark as intentional so auto-rejoin doesn't fire
+    _intentional_leave.add(guild_id)
+
     # Stop sink
     sink = _active_sinks.pop(guild_id, None)
     if sink:
         sink.stop()
+
+    # Stop DJ
+    dj = get_random_dj(guild_id)
+    if dj.is_active:
+        dj.active = False
+        dj.participants.clear()
 
     # Stop mixer
     mq = get_music_queue(guild_id)
@@ -1830,5 +1842,11 @@ async def leave_voice(guild: discord.Guild) -> str:
 
     # Clear conversation state
     _active_conversation.pop(guild_id, None)
+
+    # Clear intentional flag after a delay (give on_voice_state_update time to see it)
+    async def _clear_flag():
+        await asyncio.sleep(5)
+        _intentional_leave.discard(guild_id)
+    asyncio.create_task(_clear_flag())
 
     return "✅ Left voice channel. Transcript saved."

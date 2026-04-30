@@ -133,12 +133,17 @@ class BloodMixerSource(discord.AudioSource):
                         break
                     chunk = proc.stdout.read(FRAME_SIZE)
                     if not chunk:
+                        if not self._music_stopping:
+                            log.info("Music stream ended (FFmpeg returned empty)")
                         break
                     if len(chunk) < FRAME_SIZE:
                         chunk += b'\x00' * (FRAME_SIZE - len(chunk))
                     self._music_buf.append(chunk)
                 proc.stdout.close()
                 proc.wait()
+                exit_code = proc.returncode
+                if exit_code and exit_code != 0 and not self._music_stopping:
+                    log.warning("FFmpeg exited with code %d (stream may have died)", exit_code)
             except Exception as e:
                 if not self._music_stopping:
                     log.warning("Music feed error: %s", e)
@@ -146,8 +151,12 @@ class BloodMixerSource(discord.AudioSource):
                 # Wait for remaining buffer to drain before signaling end
                 # (prevents cutting off the last few seconds of the song)
                 if not self._music_stopping:
+                    drain_start = time.monotonic()
                     while self._music_buf and not self._music_stopping:
                         time.sleep(0.05)
+                        if time.monotonic() - drain_start > 30:
+                            log.warning("Buffer drain timeout (30s) — forcing end")
+                            break
                 self._has_music = False
                 if proc:
                     try:
@@ -156,10 +165,11 @@ class BloodMixerSource(discord.AudioSource):
                         pass
                 cb = self._on_music_end
                 if cb and not self._music_stopping:
+                    log.info("Track ended naturally — firing on_track_end callback")
                     try:
                         asyncio.run_coroutine_threadsafe(cb(), self._loop)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.warning("on_track_end callback failed: %s", e)
 
         self._music_thread = threading.Thread(
             target=_reader, daemon=True, name="blood-music-feed"

@@ -3014,8 +3014,17 @@ if bot:
         # ── Bot itself got disconnected from voice — auto-rejoin ──
         if member.id == bot.user.id:
             if before.channel is not None and after.channel is None:
+                # Check if this was an intentional disconnect (/leavevc)
+                from voice import _intentional_leave
+                if guild_id in _intentional_leave:
+                    log.info("Intentional leave from VC '%s' — skipping auto-rejoin", before.channel.name)
+                    return
                 log.warning("Blood was disconnected from VC '%s' — attempting auto-rejoin", before.channel.name)
                 await asyncio.sleep(3)  # Wait for connection to stabilize
+                # Re-check: might have been marked intentional during the sleep
+                if guild_id in _intentional_leave:
+                    log.info("Leave became intentional during wait — skipping auto-rejoin")
+                    return
                 try:
                     from voice import get_active_sink, get_music_queue, get_random_dj, join_and_listen
                     sink = get_active_sink(guild_id)
