@@ -116,6 +116,7 @@ class BloodMixerSource(discord.AudioSource):
         def _reader():
             proc = None
             stop = self._stop_event  # capture the event for THIS stream
+            chunk_counter = 0
             try:
                 proc = subprocess.Popen(
                     ["ffmpeg",
@@ -137,11 +138,17 @@ class BloodMixerSource(discord.AudioSource):
                     chunk = proc.stdout.read(FRAME_SIZE)
                     if not chunk:
                         if not stop.is_set():
-                            log.info("Music stream ended (FFmpeg returned empty)")
+                            log.info("Music stream ended (FFmpeg returned empty, chunks=%d)", chunk_counter)
                         break
                     if len(chunk) < FRAME_SIZE:
                         chunk += b'\x00' * (FRAME_SIZE - len(chunk))
                     self._music_buf.append(chunk)
+                    chunk_counter += 1
+                    # Log first chunk and every 100 chunks
+                    if chunk_counter == 1:
+                        log.info("[AUDIO] First chunk from FFmpeg: %d bytes, buf_size=%d", len(chunk), len(self._music_buf))
+                    elif chunk_counter % 100 == 0:
+                        log.info("[AUDIO] FFmpeg chunk #%d, buf_size=%d", chunk_counter, len(self._music_buf))
                 proc.stdout.close()
                 # Read and log any FFmpeg errors
                 try:
@@ -265,6 +272,10 @@ class BloodMixerSource(discord.AudioSource):
         self._read_call_count += 1
         music = self._music_buf.popleft() if self._music_buf else None
         tts = self._tts_buf.popleft() if self._tts_buf else None
+
+        # Log first music chunk delivered to Discord
+        if music and not self._buf_had_data_once:
+            log.info("[AUDIO] First music chunk delivered to Discord (read #%d)", self._read_call_count)
 
         # Watchdog: detect silent audio flow (FFmpeg dead but Discord still calling read)
         if self._has_music and not self._stop_event.is_set():
