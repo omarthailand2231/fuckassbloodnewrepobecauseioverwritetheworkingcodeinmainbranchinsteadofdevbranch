@@ -301,9 +301,16 @@ class BloodMixerSource(discord.AudioSource):
 
         if music and tts:
             mvol = self._duck_vol if ducking else self._music_vol
+            log.info("[AUDIO] Mixing music+TTS: music_vol=%.2f, ducking=%s", mvol, ducking)
             return _mix_two(music, mvol, tts, 1.0)
         elif music:
             mvol = self._duck_vol if ducking else self._music_vol
+            # Log volume on first few chunks to debug silent audio
+            if self._read_call_count <= 5:
+                # Check if audio is actually silent (all zeros)
+                is_silent = all(b == 0 for b in music[:100])
+                log.info("[AUDIO] Music read #%d: volume=%.2f, ducking=%s, first_100_bytes_silent=%s",
+                         self._read_call_count, mvol, ducking, is_silent)
             if mvol >= 0.99:
                 return music
             return _scale_pcm(music, mvol)
