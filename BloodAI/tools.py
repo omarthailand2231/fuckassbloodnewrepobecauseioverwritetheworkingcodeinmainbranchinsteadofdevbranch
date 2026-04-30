@@ -1573,7 +1573,7 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
     elif name == "music_queue":
         try:
             from voice import get_queue_info
-            return get_queue_info(str(guild.id))
+            return get_queue_info(str(guild.id), guild)
         except ImportError:
             return "Voice/music module not available."
 

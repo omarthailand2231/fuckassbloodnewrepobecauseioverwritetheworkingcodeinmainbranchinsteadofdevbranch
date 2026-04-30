@@ -42,63 +42,100 @@ ws.onopen=()=>{document.getElementById('st').textContent='Connected';document.ge
 ws.onclose=()=>{document.getElementById('st').textContent='Disconnected — refresh';document.getElementById('st').style.color='#f55'};
 ws.onmessage=e=>{
 const d=JSON.parse(e.data);
+if(typeof d.music.volume==='number'){document.getElementById('m-vol').value=Math.round(d.music.volume*100);document.getElementById('m-vv').textContent=Math.round(d.music.volume*100)+'%'}
 const set=(id,txt,act,lv)=>{document.getElementById(id+'-info').textContent=txt;const dot=document.getElementById(id+'-dot');act?dot.classList.add('on'):dot.classList.remove('on');document.getElementById(id+'-meter').style.width=(lv*100)+'%'};
 set('m',d.music.active?(d.music.title||'Playing'):'No music',d.music.active,d.music.level);
 set('t',d.tts.active?('"'+d.tts.text.substring(0,60)+'"'):'Idle',d.tts.active,d.tts.level);
 const duck=document.getElementById('duck');
 if(d.ducked){duck.textContent='Music DUCKED (Blood speaking)';duck.classList.add('ducked');document.getElementById('m-dot').classList.add('ducked')}
 else{duck.textContent='Music at full volume';duck.classList.remove('ducked');document.getElementById('m-dot').classList.remove('ducked')}
+document.getElementById('duck-btn').classList.toggle('on',!!d.force_duck);
 };
 document.getElementById('m-vol').addEventListener('input',e=>{document.getElementById('m-vv').textContent=e.target.value+'%';ws.send(JSON.stringify({action:'vol',v:e.target.value/100}))});
 document.getElementById('duck-btn').addEventListener('click',()=>{const b=document.getElementById('duck-btn');const on=b.classList.toggle('on');ws.send(JSON.stringify({action:on?'duck':'unduck'}))});
 </script></body></html>"""
 
 # Shared state
-_state={"music":{"active":False,"title":"","level":0.0},"tts":{"active":False,"text":"","level":0.0},"ducked":False}
+_state={"music":{"active":False,"title":"","level":0.0,"volume":0.5},"tts":{"active":False,"text":"","level":0.0},"ducked":False,"force_duck":False}
 _clients=set()
+_loop=None
+_active_guild_id=None
 
-def update_state(music_active=None,music_title=None,music_level=None,tts_active=None,tts_text=None,tts_level=None,ducked=None):
+def bind_guild(guild_id):
+    global _active_guild_id
+    _active_guild_id=guild_id
+
+def update_state(music_active=None,music_title=None,music_level=None,music_volume=None,tts_active=None,tts_text=None,tts_level=None,ducked=None,force_duck=None):
     if music_active is not None:_state["music"]["active"]=music_active
     if music_title is not None:_state["music"]["title"]=music_title
     if music_level is not None:_state["music"]["level"]=music_level
+    if music_volume is not None:_state["music"]["volume"]=music_volume
     if tts_active is not None:_state["tts"]["active"]=tts_active
     if tts_text is not None:_state["tts"]["text"]=tts_text
     if tts_level is not None:_state["tts"]["level"]=tts_level
     if ducked is not None:_state["ducked"]=ducked
+    if force_duck is not None:_state["force_duck"]=force_duck
     _broadcast()
 
 def _broadcast():
+    if not _loop or _loop.is_closed():
+        return
     data=json.dumps(_state)
+    coro=_broadcast_async(data)
+    try:
+        running=asyncio.get_running_loop()
+    except RuntimeError:
+        running=None
+    if running is _loop:
+        asyncio.create_task(coro)
+    else:
+        asyncio.run_coroutine_threadsafe(coro, _loop)
+
+async def _broadcast_async(data):
     dead=set()
-    for ws in _clients:
+    for ws in list(_clients):
         try:
-            ws.send_str(data)
+            await ws.send_str(data)
         except Exception:
             dead.add(ws)
     for ws in dead:_clients.discard(ws)
+
+def _get_active_mixer():
+    if not _active_guild_id:
+        return None
+    try:
+        from voice import get_music_queue
+        mq=get_music_queue(_active_guild_id)
+        return mq._mixer
+    except Exception:
+        return None
 
 async def handle_ws(request):
     ws=web.WebSocketResponse()
     await ws.prepare(request)
     _clients.add(ws)
-    ws.send_str(json.dumps(_state))
+    await ws.send_str(json.dumps(_state))
     async for msg in ws:
         if msg.type==WSMsgType.TEXT:
             try:
                 d=json.loads(msg.data)
                 action=d.get("action")
                 if action=="vol":
-                    from mixer import get_mixer
-                    mixer=get_mixer()
-                    if mixer:mixer.set_volume("music",d.get("v",0.8))
+                    vol=max(0.0,min(1.0,float(d.get("v",0.5))))
+                    if _active_guild_id:
+                        from voice import set_music_volume
+                        set_music_volume(_active_guild_id,vol)
+                    update_state(music_level=vol if _state["music"]["active"] else 0.0,music_volume=vol)
                 elif action=="duck":
-                    from mixer import get_mixer
-                    mixer=get_mixer()
-                    if mixer:mixer.start_duck("music")
+                    mixer=_get_active_mixer()
+                    if mixer:
+                        mixer.set_force_duck(True)
+                        update_state(ducked=bool(mixer.has_music),force_duck=True)
                 elif action=="unduck":
-                    from mixer import get_mixer
-                    mixer=get_mixer()
-                    if mixer:mixer.stop_duck("music")
+                    mixer=_get_active_mixer()
+                    if mixer:
+                        mixer.set_force_duck(False)
+                        update_state(ducked=bool(mixer.is_ducking and mixer.has_music),force_duck=False)
             except Exception:
                 pass
     _clients.discard(ws)
@@ -111,9 +148,10 @@ app.router.add_get("/ws",handle_ws)
 _server=None
 
 async def start_web_mixer(port=7777):
-    global _server
+    global _server,_loop
     if _server:
         return
+    _loop=asyncio.get_running_loop()
     runner=web.AppRunner(app)
     await runner.setup()
     site=web.TCPSite(runner,"0.0.0.0",port)

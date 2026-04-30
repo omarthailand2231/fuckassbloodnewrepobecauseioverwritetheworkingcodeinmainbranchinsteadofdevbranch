@@ -1037,8 +1037,7 @@ if bot:
         log.info("Gateway resumed — checking voice playback state")
         await asyncio.sleep(3)  # Give voice connection time to stabilize
         try:
-            from voice import get_music_queue, get_active_sink
-            from mixer import BloodMixerSource
+            from voice import get_music_queue, get_active_sink, get_now_playing_track, play_track
             for guild in bot.guilds:
                 vc = guild.voice_client
                 if not vc or not vc.is_connected():
@@ -1046,18 +1045,11 @@ if bot:
                 guild_id = str(guild.id)
                 mq = get_music_queue(guild_id)
                 # If there's a current track but nothing is playing, restart
-                if mq.current and not vc.is_playing():
-                    mixer = mq._mixer
-                    if mixer:
-                        log.info("Resuming playback after gateway reconnect: %s", mq.current.title)
-                        vc.play(mixer)
-                    else:
-                        # Mixer was lost — recreate and replay current track
-                        log.info("Recreating mixer after gateway reconnect: %s", mq.current.title)
-                        from voice import play_track
-                        sink = get_active_sink(guild_id)
-                        tc = sink.text_channel if sink else None
-                        await play_track(guild, mq.current, tc)
+                if mq.current and not get_now_playing_track(guild):
+                    log.info("Replaying track after gateway reconnect: %s", mq.current.title)
+                    sink = get_active_sink(guild_id)
+                    tc = sink.text_channel if sink else None
+                    await play_track(guild, mq.current, tc)
         except Exception as e:
             log.warning("Voice recovery after resume failed: %s", e)
 
@@ -2900,7 +2892,7 @@ if bot:
     async def queue_cmd(ctx):
         try:
             from voice import get_queue_info
-            info = get_queue_info(str(ctx.guild.id))
+            info = get_queue_info(str(ctx.guild.id), ctx.guild)
             await ctx.reply(info)
         except ImportError:
             await ctx.reply("Voice module not available.")
@@ -2908,12 +2900,12 @@ if bot:
     @bot.hybrid_command(name="np", aliases=["nowplaying"], description="Show what's currently playing")
     async def np_cmd(ctx):
         try:
-            from voice import get_music_queue
-            mq = get_music_queue(str(ctx.guild.id))
-            if mq.current:
-                dur = f" ({mq.current.duration // 60}:{mq.current.duration % 60:02d})" if mq.current.duration else ""
-                icon = {"youtube": "🔴", "spotify": "🟢", "soundcloud": "🟠"}.get(mq.current.source_type, "🎵")
-                await ctx.reply(f"{icon} **Now playing:** {mq.current.title}{dur}")
+            from voice import get_now_playing_track
+            track = get_now_playing_track(ctx.guild)
+            if track:
+                dur = f" ({track.duration // 60}:{track.duration % 60:02d})" if track.duration else ""
+                icon = {"youtube": "🔴", "spotify": "🟢", "soundcloud": "🟠"}.get(track.source_type, "🎵")
+                await ctx.reply(f"{icon} **Now playing:** {track.title}{dur}")
             else:
                 await ctx.reply("Nothing is playing.")
         except ImportError:
@@ -2959,26 +2951,26 @@ if bot:
     @bot.hybrid_command(name="like", description="Like the current song (improves recommendations)")
     async def like_cmd(ctx):
         try:
-            from voice import record_feedback, get_music_queue
-            mq = get_music_queue(str(ctx.guild.id))
-            if not mq.current:
+            from voice import record_feedback, get_now_playing_track
+            track = get_now_playing_track(ctx.guild)
+            if not track:
                 await ctx.reply("Nothing is playing.")
                 return
-            record_feedback(str(ctx.author.id), mq.current.title, positive=True)
-            await ctx.reply(f"👍 Liked **{mq.current.title}** — I'll play more like this for you!")
+            record_feedback(str(ctx.author.id), track.title, positive=True)
+            await ctx.reply(f"👍 Liked **{track.title}** — I'll play more like this for you!")
         except ImportError:
             await ctx.reply("Voice module not available.")
 
     @bot.hybrid_command(name="dislike", description="Dislike the current song (improves recommendations)")
     async def dislike_cmd(ctx):
         try:
-            from voice import record_feedback, get_music_queue
-            mq = get_music_queue(str(ctx.guild.id))
-            if not mq.current:
+            from voice import record_feedback, get_now_playing_track
+            track = get_now_playing_track(ctx.guild)
+            if not track:
                 await ctx.reply("Nothing is playing.")
                 return
-            record_feedback(str(ctx.author.id), mq.current.title, positive=False)
-            await ctx.reply(f"👎 Noted — less of **{mq.current.title}** style for you.")
+            record_feedback(str(ctx.author.id), track.title, positive=False)
+            await ctx.reply(f"👎 Noted — less of **{track.title}** style for you.")
         except ImportError:
             await ctx.reply("Voice module not available.")
 
@@ -2993,13 +2985,13 @@ if bot:
         if emoji not in ("👍", "👎"):
             return
         try:
-            from voice import record_feedback, get_music_queue
+            from voice import record_feedback, get_now_playing_track
             guild = bot.get_guild(payload.guild_id)
             if not guild:
                 return
-            mq = get_music_queue(str(guild.id))
-            if mq.current:
-                record_feedback(str(payload.user_id), mq.current.title, positive=(emoji == "👍"))
+            track = get_now_playing_track(guild)
+            if track:
+                record_feedback(str(payload.user_id), track.title, positive=(emoji == "👍"))
         except Exception:
             pass
 

@@ -1,7 +1,3 @@
-"""
-Blood Voice System — Full VC presence with STT (Groq Whisper), TTS (edge-tts),
-wake word detection, transcript recording, and smart conversation tracking.
-"""
 
 import os
 import io
@@ -21,7 +17,6 @@ import discord
 
 log = logging.getLogger("blood.voice")
 
-# Persistent aiohttp session for STT (avoids creating new TCP pool per call)
 _stt_session: Optional[aiohttp.ClientSession] = None
 
 def _get_stt_session() -> aiohttp.ClientSession:
@@ -33,37 +28,29 @@ def _get_stt_session() -> aiohttp.ClientSession:
         )
     return _stt_session
 
-# Silence noisy voice_recv spam (WS payload, corrupted stream, CryptoError, RTCP)
 logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.CRITICAL)
 logging.getLogger("discord.ext.voice_recv.router").setLevel(logging.CRITICAL)
 logging.getLogger("discord.ext.voice_recv.reader").setLevel(logging.CRITICAL)
-
-# ── Config ────────────────────────────────────────────────────────────────────
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_STT_MODEL = "whisper-large-v3-turbo"
 
-# Wake words that activate Blood (case-insensitive, checked as substrings)
 WAKE_WORDS = ["blood", "hey blood", "เลือด", "บลัด"]
 
-# TTS voice — edge-tts voice ID (Microsoft Neural)
 TTS_VOICE = "en-US-GuyNeural"
 TTS_RATE = "+10%"
 
-# Audio settings
-SAMPLE_RATE = 48000  # Discord uses 48kHz
-CHANNELS = 2         # Stereo
-SILENCE_THRESHOLD_SEC = 1.5  # Silence gap to consider speech ended
-MAX_SPEECH_SEC = 30  # Max single speech segment
-MIN_SPEECH_SEC = 0.3  # Ignore very short blips
+SAMPLE_RATE = 48000
+CHANNELS = 2
+SILENCE_THRESHOLD_SEC = 1.5
+MAX_SPEECH_SEC = 30
+MIN_SPEECH_SEC = 0.3
 
-# ── Music Config ─────────────────────────────────────────────────────────────
-
-MUSIC_VOLUME = 0.5         # Default music volume (0.0-1.0)
-DUCK_VOLUME = 0.15         # Volume while Blood speaks
-DUCK_FADE_IN = 0.5         # Seconds before speech to duck
-DUCK_FADE_OUT = 0.3        # Seconds after speech to restore
+MUSIC_VOLUME = 0.5
+DUCK_VOLUME = 0.15
+DUCK_FADE_IN = 0.5
+DUCK_FADE_OUT = 0.3
 
 YTDL_OPTS = {
     "format": "bestaudio/best",
@@ -80,8 +67,6 @@ FFMPEG_OPTS = {
     "options": "-vn -loglevel quiet",
 }
 
-
-# ── Music Queue ──────────────────────────────────────────────────────────────
 
 class MusicTrack:
     __slots__ = ("title", "url", "stream_url", "duration", "requester", "source_type")
@@ -100,8 +85,6 @@ class MusicTrack:
 
 
 class MusicQueue:
-    """Per-guild music queue with volume control."""
-
     def __init__(self, guild_id: str):
         self.guild_id = guild_id
         self.queue: list[MusicTrack] = []
@@ -109,7 +92,7 @@ class MusicQueue:
         self.volume = MUSIC_VOLUME
         self.loop = False
         self.paused = False
-        self._mixer = None  # BloodMixerSource instance
+        self._mixer = None
 
     def add(self, track: MusicTrack):
         self.queue.append(track)
@@ -128,7 +111,6 @@ class MusicQueue:
         self.current = None
 
     def skip(self) -> Optional[MusicTrack]:
-        """Skip current, ignore loop."""
         if self.queue:
             self.current = self.queue.pop(0)
             return self.current
@@ -140,7 +122,6 @@ class MusicQueue:
         return len(self.queue) == 0 and self.current is None
 
     def cleanup_mixer(self):
-        """Stop mixer and its music feed."""
         if self._mixer:
             try:
                 self._mixer.cleanup()
@@ -149,7 +130,6 @@ class MusicQueue:
             self._mixer = None
 
 
-# guild_id -> MusicQueue
 _music_queues: dict[str, MusicQueue] = {}
 
 
@@ -159,19 +139,127 @@ def get_music_queue(guild_id: str) -> MusicQueue:
     return _music_queues[guild_id]
 
 
-# ── yt-dlp extraction ───────────────────────────────────────────────────────
+def _bind_web_mixer_guild(guild_id: Optional[str]):
+    try:
+        import web_mixer as wm
+        wm.bind_guild(guild_id)
+    except Exception:
+        pass
+
+
+def _update_web_mixer(**kwargs):
+    try:
+        import web_mixer as wm
+        wm.update_state(**kwargs)
+    except Exception:
+        pass
+
+
+def _voice_client_source(vc: Optional[discord.VoiceClient]):
+    player = getattr(vc, "_player", None)
+    return getattr(player, "source", None)
+
+
+def _stop_voice_playback(vc):
+    """Stop outgoing audio without tearing down voice receive state.
+
+    Never calls vc.stop() on VoiceRecvClient — that kills the listener.
+    Uses stop_playing() if available, falls back to _player.stop(),
+    then pause() as last resort (always safe).
+    """
+    if not vc:
+        return
+    stop_playing = getattr(vc, "stop_playing", None)
+    if callable(stop_playing):
+        stop_playing()
+        return
+    player = getattr(vc, "_player", None)
+    if player is not None:
+        try:
+            player.stop()
+            return
+        except Exception:
+            pass
+    if vc.is_playing():
+        vc.pause()
+
+
+def _voice_client_has_mixer(vc: Optional[discord.VoiceClient], mixer) -> bool:
+    if not vc or not mixer:
+        return False
+    if _voice_client_source(vc) is not mixer:
+        return False
+    return vc.is_playing() or vc.is_paused()
+
+
+def has_active_music(guild: Optional[discord.Guild]) -> bool:
+    if not guild:
+        return False
+    mq = get_music_queue(str(guild.id))
+    if not mq.current:
+        return False
+    mixer = mq._mixer
+    vc = guild.voice_client
+    return bool(mixer and (mixer.has_music or _voice_client_has_mixer(vc, mixer)))
+
+
+def get_now_playing_track(guild: Optional[discord.Guild]) -> Optional[MusicTrack]:
+    if not guild:
+        return None
+    mq = get_music_queue(str(guild.id))
+    mixer = mq._mixer
+    if not mq.current or not mixer or not mixer.has_music:
+        return None
+    return mq.current
+
+
+def _sync_web_mixer_music(guild: Optional[discord.Guild]):
+    if not guild:
+        return
+    guild_id = str(guild.id)
+    _bind_web_mixer_guild(guild_id)
+    mq = get_music_queue(guild_id)
+    mixer = mq._mixer
+    current = get_now_playing_track(guild)
+    music_active = current is not None
+    force_duck = bool(mixer.force_duck) if mixer else False
+    ducked = bool(mixer and mixer.has_music and mixer.is_ducking)
+    _update_web_mixer(
+        music_active=music_active,
+        music_title=current.title if current else "",
+        music_level=mq.volume if music_active else 0.0,
+        music_volume=mq.volume,
+        ducked=ducked,
+        force_duck=force_duck,
+    )
+
+
+def _sync_web_mixer_tts(guild: Optional[discord.Guild], *, active: bool, text: str = "", level: float = 0.0):
+    if not guild:
+        return
+    guild_id = str(guild.id)
+    mq = get_music_queue(guild_id)
+    mixer = mq._mixer
+    ducked = bool(mixer and mixer.has_music and mixer.is_ducking)
+    force_duck = bool(mixer.force_duck) if mixer else False
+    _update_web_mixer(
+        tts_active=active,
+        tts_text=text,
+        tts_level=level,
+        ducked=ducked,
+        force_duck=force_duck,
+    )
+
 
 async def extract_track(query: str, requester: str = "") -> Optional[MusicTrack]:
-    """Extract audio info from URL or search query using yt-dlp."""
     import re as _re
 
-    # Words in title that indicate non-music content (skip these)
     _skip_words = {"cover", "covers", "covered", "karaoke", "instrumental",
                    "reaction", "react", "tutorial", "lesson", "how to play",
                    "audiobook", "podcast", "lecture", "asmr", "meditation",
                    "full movie", "documentary", "10 hours", "how to",
                    "correcting", "fix ", "app tutorial"}
-    MAX_DURATION = 900  # 15 minutes — skip anything longer
+    MAX_DURATION = 900
     q_lower = query.lower()
 
     def _is_bad(title: str, duration: int) -> bool:
@@ -180,7 +268,6 @@ async def extract_track(query: str, requester: str = "") -> Optional[MusicTrack]
         t = title.lower()
         if any(w in t for w in _skip_words):
             return True
-        # Skip remixes unless the query specifically asked for one
         if "remix" not in q_lower and "remix" in t:
             return True
         return False
@@ -202,35 +289,26 @@ async def extract_track(query: str, requester: str = "") -> Optional[MusicTrack]
 
     def _extract():
         import yt_dlp
-
         is_url = _re.match(r"https?://", query.strip())
-
         with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
-            # Direct URL — just try it
             if is_url:
                 info = ydl.extract_info(query.strip(), download=False)
                 return _make_track(info) if info else None
-
-            # ── YouTube search (5 results) ──
             search_q = query.strip()
             if "audio" not in search_q.lower() and "mv" not in search_q.lower():
                 search_q += " audio"
-
             try:
                 yt_results = ydl.extract_info(f"ytsearch5:{search_q}", download=False)
                 entries = (yt_results or {}).get("entries") or []
             except Exception as e:
                 log.warning("YouTube search failed for '%s': %s", search_q[:60], e)
                 entries = []
-
-            # Try each YouTube result (skip age-restricted, bad titles, etc.)
             for entry in entries:
                 if not entry:
                     continue
                 if _is_bad(entry.get("title", ""), entry.get("duration", 0)):
                     continue
                 try:
-                    # Re-extract to get stream URL (flat search may not have it)
                     vid_url = entry.get("url") or entry.get("webpage_url")
                     if vid_url and not entry.get("url"):
                         entry = ydl.extract_info(vid_url, download=False)
@@ -239,8 +317,6 @@ async def extract_track(query: str, requester: str = "") -> Optional[MusicTrack]
                 except Exception as e:
                     log.debug("YouTube entry failed (age-gate?): %s", str(e)[:100])
                     continue
-
-            # ── SoundCloud fallback (3 results) ──
             log.info("YouTube failed for '%s' — trying SoundCloud", query[:60])
             try:
                 sc_results = ydl.extract_info(f"scsearch3:{query.strip()}", download=False)
@@ -253,7 +329,6 @@ async def extract_track(query: str, requester: str = "") -> Optional[MusicTrack]
                     return _make_track(entry, "soundcloud")
             except Exception as e:
                 log.warning("SoundCloud fallback also failed: %s", str(e)[:100])
-
             return None
 
     try:
@@ -263,11 +338,16 @@ async def extract_track(query: str, requester: str = "") -> Optional[MusicTrack]
         return None
 
 
-# ── Playback ─────────────────────────────────────────────────────────────────
+# ── Playback ──────────────────────────────────────────────────────────────────
 
 async def play_track(guild: discord.Guild, track: MusicTrack,
                      text_channel: Optional[discord.TextChannel] = None):
-    """Play a track through BloodMixerSource (thread-based, supports TTS overlay)."""
+    """Play a track through a FRESH BloodMixerSource each time.
+
+    Always creates a new mixer per track — never reuses a potentially dead one
+    whose _stop_event may already be set, which would cause start_music() to
+    exit immediately and produce silence.
+    """
     vc = guild.voice_client
     if not vc or not vc.is_connected():
         return
@@ -278,30 +358,59 @@ async def play_track(guild: discord.Guild, track: MusicTrack,
 
     try:
         from mixer import BloodMixerSource
+        loop = asyncio.get_running_loop()
 
-        # Get or create mixer
-        mixer = mq._mixer
-        if not mixer:
-            mixer = BloodMixerSource(asyncio.get_event_loop())
-            mq._mixer = mixer
+        # Stop and discard the old mixer — its _stop_event may already be set
+        # from a previous stop_music() call, which would cause the new
+        # start_music() reader thread to exit immediately (silent playback).
+        old_mixer = mq._mixer
+        if old_mixer:
+            try:
+                old_mixer.stop_music()
+            except Exception:
+                pass
 
-        # Start vc.play with mixer if not already active
-        if not vc.is_playing():
-            vc.play(mixer)
+        # Fresh mixer — _stop_event starts cleared, ready for a new stream
+        mixer = BloodMixerSource(loop)
+        mq._mixer = mixer
 
-        # Define what happens when this track ends naturally
+        # Stop whatever Discord is currently playing before attaching new mixer
+        if vc.is_playing() or vc.is_paused():
+            _stop_voice_playback(vc)
+            await asyncio.sleep(0.05)
+
         async def on_track_end():
             await _play_next(guild, text_channel)
 
-        # Feed music into mixer (starts FFmpeg in a background thread)
+        # Start FFmpeg FIRST so it produces audio before Discord starts calling read()
         mixer.start_music(track.stream_url, volume=mq.volume, on_end=on_track_end)
+        await asyncio.sleep(0.1)  # Give FFmpeg time to start and fill buffer
+        _sync_web_mixer_music(guild)
 
-        # Announce in text channel
+        def _on_player_stop(error):
+            def _log_result(future):
+                try:
+                    future.result()
+                except Exception as exc:
+                    log.warning("Player-stop sync failed for '%s': %s", track.title, exc)
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    _handle_player_stop(guild, track, text_channel, error),
+                    loop,
+                )
+                future.add_done_callback(_log_result)
+            except Exception as exc:
+                log.warning("Failed to schedule player-stop sync for '%s': %s", track.title, exc)
+
+        vc.play(mixer, after=_on_player_stop)
+
         if text_channel:
             dur = f" ({track.duration // 60}:{track.duration % 60:02d})" if track.duration else ""
             icon = {"youtube": "🔴", "spotify": "🟢", "soundcloud": "🟠"}.get(track.source_type, "🎵")
             try:
-                await text_channel.send(f"{icon} **Now playing:** {track.title}{dur} — requested by {track.requester}")
+                await text_channel.send(
+                    f"{icon} **Now playing:** {track.title}{dur} — requested by {track.requester}"
+                )
             except Exception:
                 pass
 
@@ -313,7 +422,6 @@ async def play_track(guild: discord.Guild, track: MusicTrack,
 
 async def _play_next(guild: discord.Guild,
                      text_channel: Optional[discord.TextChannel] = None):
-    """Play the next track in queue, or stop mixer."""
     guild_id = str(guild.id)
     mq = get_music_queue(guild_id)
     nxt = mq.next()
@@ -321,98 +429,108 @@ async def _play_next(guild: discord.Guild,
         await play_track(guild, nxt, text_channel)
     else:
         mq.current = None
-        # Queue empty — stop mixer so bot doesn't send silence
         if mq._mixer:
             mq._mixer.stop_music()
         vc = guild.voice_client
-        if vc and vc.is_playing():
-            vc.stop()
+        if vc and (vc.is_playing() or vc.is_paused()):
+            _stop_voice_playback(vc)
         mq._mixer = None
+        _sync_web_mixer_music(guild)
+
+
+async def _handle_player_stop(guild: discord.Guild, expected_track: MusicTrack,
+                              text_channel: Optional[discord.TextChannel],
+                              error: Optional[Exception]):
+    await asyncio.sleep(0.1)
+    guild_id = str(guild.id)
+    mq = get_music_queue(guild_id)
+    if mq.current is not expected_track:
+        return
+    mixer = mq._mixer
+    vc = guild.voice_client
+    if mixer and _voice_client_has_mixer(vc, mixer):
+        return
+    if error:
+        log.warning("Voice player stopped for '%s': %s", expected_track.title, error)
+    if mq.queue:
+        log.warning("Voice player stopped mid-track on '%s' — advancing queue", expected_track.title)
+        await _play_next(guild, text_channel)
+        return
+    log.warning("Voice player stopped mid-track on '%s' — clearing stale state", expected_track.title)
+    mq.current = None
+    if mixer and not mixer.has_music:
+        mq._mixer = None
+    _sync_web_mixer_music(guild)
 
 
 async def play_music(guild: discord.Guild, query: str, requester: str = "",
                      text_channel: Optional[discord.TextChannel] = None,
                      requester_id: Optional[str] = None) -> str:
-    """High-level: extract track, add to queue, play if not playing."""
     guild_id = str(guild.id)
     vc = guild.voice_client
     if not vc or not vc.is_connected():
         return "❌ Not in a voice channel. Use /joinvc first."
-
     track = await extract_track(query, requester)
     if not track:
         return f"❌ Could not find anything for: {query}"
-
-    # Auto-record positive taste — if user asked for it, they probably like it
     if requester_id and track.title:
         record_feedback(requester_id, track.title, positive=True)
-
     mq = get_music_queue(guild_id)
-    # Check if music is currently playing (mixer has active music feed)
-    is_playing = mq._mixer and mq._mixer.has_music and mq.current
+    is_playing = has_active_music(guild)
     if is_playing:
         mq.add(track)
         pos = len(mq.queue)
         return f"📋 **Queued #{pos}:** {track.title}"
     else:
-        mq.current = track
         await play_track(guild, track, text_channel)
         return f"🎵 **Playing:** {track.title}"
 
 
 async def skip_music(guild: discord.Guild) -> str:
-    """Skip current track."""
     guild_id = str(guild.id)
     mq = get_music_queue(guild_id)
-
-    # Nothing playing — check if there's at least a current track set
     if not mq.current and (not mq._mixer or not mq._mixer.has_music):
         return "Nothing is playing."
-
     old_title = mq.current.title if mq.current else "track"
-
-    # Stop the music feed (kills FFmpeg, clears buffer)
     if mq._mixer:
         mq._mixer.stop_music()
-
     nxt = mq.skip()
     if nxt:
         await play_track(guild, nxt)
     else:
         mq.current = None
-        # If DJ is active, don't kill mixer/player — let DJ loop queue next
         dj = get_random_dj(guild_id)
         if dj.is_active:
             log.info("Skip '%s' with active DJ — DJ loop will queue next", old_title)
         else:
             vc = guild.voice_client
-            if vc and vc.is_playing():
-                vc.stop()
+            if vc and (vc.is_playing() or vc.is_paused()):
+                _stop_voice_playback(vc)
             mq._mixer = None
-
+        _sync_web_mixer_music(guild)
     log.info("Skipped '%s'", old_title)
     return "⏭️ Skipped."
 
 
 async def stop_music(guild: discord.Guild) -> str:
-    """Stop playback and clear queue."""
     guild_id = str(guild.id)
     mq = get_music_queue(guild_id)
     mq.cleanup_mixer()
     mq.clear()
     vc = guild.voice_client
     if vc and (vc.is_playing() or vc.is_paused()):
-        vc.stop()
+        _stop_voice_playback(vc)
+    _sync_web_mixer_music(guild)
     return "⏹️ Stopped and cleared queue."
 
 
-def get_queue_info(guild_id: str) -> str:
-    """Return formatted queue info."""
+def get_queue_info(guild_id: str, guild: Optional[discord.Guild] = None) -> str:
     mq = get_music_queue(guild_id)
     lines = []
-    if mq.current:
-        dur = f" ({mq.current.duration // 60}:{mq.current.duration % 60:02d})" if mq.current.duration else ""
-        lines.append(f"▶️ **Now:** {mq.current.title}{dur}")
+    current = get_now_playing_track(guild) if guild else mq.current
+    if current:
+        dur = f" ({current.duration // 60}:{current.duration % 60:02d})" if current.duration else ""
+        lines.append(f"▶️ **Now:** {current.title}{dur}")
     if mq.queue:
         for i, t in enumerate(mq.queue[:10], 1):
             dur = f" ({t.duration // 60}:{t.duration % 60:02d})" if t.duration else ""
@@ -426,12 +544,15 @@ def get_queue_info(guild_id: str) -> str:
 
 
 def set_music_volume(guild_id: str, vol: float) -> str:
-    """Set volume (0.0-1.0)."""
     vol = max(0.0, min(1.0, vol))
     mq = get_music_queue(guild_id)
     mq.volume = vol
     if mq._mixer:
         mq._mixer.set_music_volume(vol)
+    _update_web_mixer(
+        music_level=vol if mq._mixer and mq._mixer.has_music and mq.current else 0.0,
+        music_volume=vol,
+    )
     return f"🔊 Volume set to {int(vol * 100)}%"
 
 
@@ -440,7 +561,6 @@ def set_music_volume(guild_id: str, vol: float) -> str:
 TASTE_DIR = os.path.join(os.path.dirname(__file__), "data", "music_taste")
 os.makedirs(TASTE_DIR, exist_ok=True)
 
-# In-memory cache: user_id -> {"liked": [...], "disliked": [...]}
 _taste_cache: dict[str, dict] = {}
 
 
@@ -473,12 +593,10 @@ def _save_taste(user_id: str, data: dict):
 _taste_embed_model = None
 
 def _get_taste_model():
-    """Get or lazily load the SentenceTransformer model (shared with memory.py if possible)."""
     global _taste_embed_model
     if _taste_embed_model is not None:
         return _taste_embed_model
     try:
-        # Try reusing memory.py's already-loaded model
         import memory
         mem = memory.Memory
         if hasattr(mem, '_embed_model') and mem._embed_model is not None:
@@ -492,18 +610,13 @@ def _get_taste_model():
 
 
 def _is_taste_relevant(entry: str, existing_liked: list[str], threshold: float = 0.35) -> bool:
-    """Check if a song title is semantically related to existing taste using embeddings.
-    Returns True if the song is similar enough to at least one liked song,
-    or if there are fewer than 5 liked songs (cold start — accept everything)."""
     if len(existing_liked) < 5:
-        return True  # Cold start: accept everything to build initial profile
+        return True
     try:
         model = _get_taste_model()
         entry_emb = model.encode(entry)
-        # Compare against last 20 liked songs
         recent_liked = existing_liked[-20:]
         liked_embs = model.encode(recent_liked)
-        # Cosine similarity
         import numpy as np
         sims = np.dot(liked_embs, entry_emb) / (
             np.linalg.norm(liked_embs, axis=1) * np.linalg.norm(entry_emb) + 1e-8
@@ -513,84 +626,62 @@ def _is_taste_relevant(entry: str, existing_liked: list[str], threshold: float =
         return best >= threshold
     except Exception as e:
         log.debug("[TASTE] Embedding check failed, accepting: %s", e)
-        return True  # Fail open — don't block taste recording
+        return True
 
 
 def _has_repeated_pattern(entry: str, existing_liked: list[str], min_matches: int = 2) -> bool:
-    """Check if the entry matches a repeated artist/genre pattern in liked songs."""
     entry_lower = entry.lower()
-    # Extract artist if format is 'Artist - Song'
     artist = entry_lower.split(" - ")[0].strip() if " - " in entry_lower else ""
     if not artist or len(artist) < 2:
         return False
-    # Count how many liked songs share this artist
     count = sum(1 for s in existing_liked if artist in s.lower())
     return count >= min_matches
 
 
 def record_feedback(user_id: str, track_title: str, positive: bool):
-    """Record user's music taste feedback with smart validation.
-    For likes: only adds if the song is related to existing taste (embedding similarity)
-    or matches a repeated pattern (same artist). Prevents junk entries."""
     data = _load_taste(user_id)
     entry = track_title.strip()
     if positive:
         if entry not in data["liked"]:
-            # Smart filter: check if this song belongs in the taste profile
             if (_is_taste_relevant(entry, data["liked"])
                     or _has_repeated_pattern(entry, data["liked"])):
                 data["liked"].append(entry)
                 log.debug("[TASTE] Added to liked: %s", entry[:50])
             else:
                 log.debug("[TASTE] Rejected from liked (not relevant): %s", entry[:50])
-                return  # Don't save — not relevant enough
-        # Remove from disliked if present
+                return
         data["disliked"] = [d for d in data["disliked"] if d != entry]
     else:
         if entry not in data["disliked"]:
             data["disliked"].append(entry)
         data["liked"] = [l for l in data["liked"] if l != entry]
-    # Keep last 100 each
     data["liked"] = data["liked"][-100:]
     data["disliked"] = data["disliked"][-100:]
     _save_taste(user_id, data)
 
 
-# AI-powered recommendation cache: user_id -> list of "Artist - Song" strings
 _rec_cache: dict[str, list[str]] = {}
-# Track recently played to avoid repeats across batches
 _recent_played: dict[str, list[str]] = {}
 RECENT_MAX = 30
 
-# Mood cache: user_id -> {"mood": str, "timestamp": float}
 _mood_cache: dict[str, dict] = {}
-MOOD_CACHE_TTL = 600  # Re-detect mood every 10 minutes
+MOOD_CACHE_TTL = 600
 
 
 async def _detect_mood(user_id: str, guild_id: str) -> str:
-    """Use AI to infer user's current mood from chat context + music behavior.
-    Returns one of: chill, hype, sad, focus, angry, neutral."""
     from provider import call_ai
-
-    # Check cache
     cached = _mood_cache.get(user_id)
     if cached and time.time() - cached.get("timestamp", 0) < MOOD_CACHE_TTL:
         return cached["mood"]
-
-    # Gather context signals
     recent_chat = []
     for entry in _convo_buffer.get(guild_id, [])[-10:]:
         if entry.get("user_name") != "Blood":
             recent_chat.append(entry.get("text", ""))
-
     recent = _recent_played.get(user_id, [])[-5:]
     data = _load_taste(user_id)
-    # Count recent skips (disliked songs that were recently played indicate wrong mood)
     recent_skips = [d for d in data.get("disliked", [])[-5:] if d in recent]
-
-    # Time of day hint
     from datetime import datetime, timezone, timedelta
-    local_hour = (datetime.now(timezone.utc) + timedelta(hours=7)).hour  # UTC+7 for Thailand
+    local_hour = (datetime.now(timezone.utc) + timedelta(hours=7)).hour
     if 0 <= local_hour < 6:
         time_hint = "very late night / early morning"
     elif 6 <= local_hour < 12:
@@ -601,11 +692,9 @@ async def _detect_mood(user_id: str, guild_id: str) -> str:
         time_hint = "evening"
     else:
         time_hint = "night"
-
     chat_text = "; ".join(recent_chat[-5:]) if recent_chat else "no recent chat"
     recent_text = ", ".join(recent) if recent else "none"
     skip_text = f"Recently skipped: {', '.join(recent_skips)}" if recent_skips else ""
-
     prompt = (
         f"Given this context, classify the user's current mood for music.\n"
         f"- Recent chat: {chat_text}\n"
@@ -614,7 +703,6 @@ async def _detect_mood(user_id: str, guild_id: str) -> str:
         f"- Time: {time_hint}\n\n"
         f"Reply with ONLY one word: chill, hype, sad, focus, angry, or neutral"
     )
-
     try:
         result = await call_ai(
             system="You classify a user's mood for music. Reply with ONLY one word.",
@@ -628,63 +716,45 @@ async def _detect_mood(user_id: str, guild_id: str) -> str:
     except Exception as e:
         log.warning("Mood detection failed: %s", e)
         mood = "neutral"
-
     _mood_cache[user_id] = {"mood": mood, "timestamp": time.time()}
     return mood
 
 
 async def _spotify_recommendations(user_id: str, guild_id: str, count: int = 15) -> list[str]:
-    """Get Spotify mood-based recommendations. Returns list of 'Artist - Title' or empty list."""
     try:
         from spotify import resolve_spotify_ids, get_mood_recommendations
     except ImportError:
         return []
-
     data = _load_taste(user_id)
     liked = data.get("liked", [])[-10:]
     recent = _recent_played.get(user_id, [])[-15:]
-
     if not liked:
         return []
-
-    # Detect mood
     mood = await _detect_mood(user_id, guild_id)
-
-    # Resolve Spotify IDs for liked songs (cached in spotify.py)
     seed_ids = await resolve_spotify_ids(liked[-5:])
     if not seed_ids:
-        log.debug("No Spotify IDs found for seed tracks")
         return []
-
-    # Get mood-based recommendations
     songs = await get_mood_recommendations(mood, seed_ids, count + 5)
     if not songs:
         return []
-
-    # Filter out recently played
     filtered = [s for s in songs if s not in recent]
     log.info("Spotify mood=%s → %d recommendations (from %d)", mood, len(filtered), len(songs))
     return filtered[:count]
 
 
 async def _ai_recommendations(user_id: str, count: int = 15) -> list[str]:
-    """AI-only fallback recommendations (no Spotify needed)."""
     import random
     from provider import call_ai
-
     data = _load_taste(user_id)
     liked = data.get("liked", [])[-20:]
     disliked = data.get("disliked", [])[-10:]
     recent = _recent_played.get(user_id, [])[-15:]
-
     if liked:
         taste_info = f"Songs they liked: {', '.join(liked)}"
     else:
         taste_info = "No listening history yet — suggest a diverse mix of popular and interesting songs across genres."
-
     dislike_info = f"\nSongs they DISLIKED (avoid similar): {', '.join(disliked)}" if disliked else ""
     recent_info = f"\nRecently played (DO NOT repeat these): {', '.join(recent)}" if recent else ""
-
     prompt = (
         f"You are a music recommendation engine like Spotify or YouTube Music.\n"
         f"Generate {count} song recommendations for this listener.\n\n"
@@ -699,7 +769,6 @@ async def _ai_recommendations(user_id: str, count: int = 15) -> list[str]:
         f"- Prefer original recordings, not covers or live versions\n"
         f"- Include a good variety of energy levels (chill, upbeat, hype)\n"
     )
-
     try:
         result = await call_ai(
             system="You are a music recommendation engine. Output ONLY song names, one per line.",
@@ -709,8 +778,7 @@ async def _ai_recommendations(user_id: str, count: int = 15) -> list[str]:
         text = result.get("message", {}).get("content", "")
         songs = []
         for line in text.strip().split("\n"):
-            line = line.strip().lstrip("0123456789.-) •●")
-            line = line.strip()
+            line = line.strip().lstrip("0123456789.-) •●").strip()
             if (line and 5 < len(line) < 100
                     and " - " in line
                     and not any(w in line.lower() for w in ("actually", "maybe", "could be", "let me", "i think", "note:", "here"))):
@@ -720,8 +788,6 @@ async def _ai_recommendations(user_id: str, count: int = 15) -> list[str]:
             return songs
     except Exception as e:
         log.warning("AI recommendation failed: %s", e)
-
-    # Fallback: diverse cold-start
     fallback = [
         "Dua Lipa - Levitating", "The Weeknd - Blinding Lights",
         "Tame Impala - The Less I Know The Better", "Arctic Monkeys - Do I Wanna Know",
@@ -737,60 +803,43 @@ async def _ai_recommendations(user_id: str, count: int = 15) -> list[str]:
 
 
 async def _generate_recommendations(user_id: str, count: int = 15, guild_id: str = "") -> list[str]:
-    """Generate song recommendations. Tries Spotify mood-based first, falls back to AI."""
-    # Try Spotify mood-based recommendations first
     if guild_id:
         songs = await _spotify_recommendations(user_id, guild_id, count)
         if songs:
             return songs
         log.debug("Spotify recs unavailable — falling back to AI")
-
-    # Fallback: AI-only recommendations
     return await _ai_recommendations(user_id, count)
 
 
-# How often to play a liked song vs new recommendation (0.0 - 1.0)
-LIKED_SONG_CHANCE = 0.30  # 30% chance to play from liked, 70% new discovery
+LIKED_SONG_CHANCE = 0.30
 
 async def get_next_song(user_id: str, guild_id: str = "") -> str:
-    """Get next song recommendation. Mixes liked songs with new discoveries.
-    ~30% chance to replay a liked song, ~70% new recommendation."""
     import random as _rng
-
     data = _load_taste(user_id)
     liked = data.get("liked", [])
     recent = _recent_played.get(user_id, [])
-
-    # Roll: play a liked song or a new recommendation?
     if liked and _rng.random() < LIKED_SONG_CHANCE:
-        # Pick a random liked song that wasn't recently played
         available = [s for s in liked if s not in recent]
         if not available:
-            available = liked  # All played recently — allow repeats
+            available = liked
         song = _rng.choice(available)
         _track_played(user_id, song)
         log.debug("[DJ] Playing liked song: %s", song[:50])
         return song
-
-    # New recommendation from cache or fresh batch
     if user_id in _rec_cache and _rec_cache[user_id]:
         song = _rec_cache[user_id].pop(0)
         _track_played(user_id, song)
         return song
-
-    # Cache empty — generate new batch
     songs = await _generate_recommendations(user_id, guild_id=guild_id)
     if not songs:
         return "popular music mix 2025"
-
     song = songs.pop(0)
-    _rec_cache[user_id] = songs  # Cache the rest
+    _rec_cache[user_id] = songs
     _track_played(user_id, song)
     return song
 
 
 def _track_played(user_id: str, song: str):
-    """Record a song as recently played."""
     if user_id not in _recent_played:
         _recent_played[user_id] = []
     _recent_played[user_id].append(song)
@@ -801,23 +850,13 @@ def _track_played(user_id: str, song: str):
 # ── Random Music DJ System ────────────────────────────────────────────────────
 
 class RandomDJ:
-    """Multi-user random music DJ with priority rotation.
-
-    Priority system:
-    - First user to /randommusic gets priority
-    - 1 user: play normally
-    - 2 users: priority user plays 2, then user2 plays 1, repeat
-    - 3 users: priority user plays 3, user2 plays 1, user3 plays 1, repeat
-    - N users: priority user plays N, others play 1 each, repeat
-    """
-
     def __init__(self, guild_id: str):
         self.guild_id = guild_id
-        self.participants: list[str] = []  # user_ids in join order
-        self.user_names: dict[str, str] = {}  # user_id -> display_name
+        self.participants: list[str] = []
+        self.user_names: dict[str, str] = {}
         self.active = False
-        self._rotation_idx = 0  # Tracks position in rotation cycle
-        self._priority_remaining = 0  # How many priority songs left before rotating
+        self._rotation_idx = 0
+        self._priority_remaining = 0
 
     def add_user(self, user_id: str, display_name: str):
         if user_id not in self.participants:
@@ -828,36 +867,27 @@ class RandomDJ:
         if user_id in self.participants:
             self.participants.remove(user_id)
             self.user_names.pop(user_id, None)
-            # Adjust rotation if needed
             if not self.participants:
                 self.active = False
                 self._rotation_idx = 0
                 self._priority_remaining = 0
 
     def get_next_user(self) -> Optional[str]:
-        """Get the next user whose music should play based on priority rotation."""
         if not self.participants:
             return None
-
         n = len(self.participants)
         if n == 1:
             return self.participants[0]
-
-        # Priority user is always index 0 (first to join)
         priority_user = self.participants[0]
-        priority_count = n  # priority user gets N songs per cycle
-
-        # Build rotation cycle: [priority x N, user2, user3, ..., userN]
+        priority_count = n
         if self._priority_remaining > 0:
             self._priority_remaining -= 1
             return priority_user
         else:
-            # Rotate through non-priority users
             non_priority = self.participants[1:]
             if self._rotation_idx >= len(non_priority):
-                # Cycle complete, reset to priority
                 self._rotation_idx = 0
-                self._priority_remaining = priority_count - 1  # -1 because we return priority now
+                self._priority_remaining = priority_count - 1
                 return priority_user
             else:
                 user = non_priority[self._rotation_idx]
@@ -869,7 +899,6 @@ class RandomDJ:
         return self.active and len(self.participants) > 0
 
 
-# guild_id -> RandomDJ
 _random_djs: dict[str, RandomDJ] = {}
 
 
@@ -881,19 +910,14 @@ def get_random_dj(guild_id: str) -> RandomDJ:
 
 async def start_random_music(guild: discord.Guild, user_id: str, display_name: str,
                              text_channel: Optional[discord.TextChannel] = None) -> str:
-    """Add user to random DJ and start playing if not already."""
     guild_id = str(guild.id)
     dj = get_random_dj(guild_id)
-
     already_in = user_id in dj.participants
     dj.add_user(user_id, display_name)
-
     if already_in:
         return f"🎲 You're already in the DJ rotation! ({len(dj.participants)} participants)"
-
     if not dj.active:
         dj.active = True
-        # Start the DJ loop
         asyncio.create_task(_dj_loop(guild, text_channel))
         return f"🎲 **Random DJ started!** Playing music based on your taste. Say 'I like this' or 'skip' to teach me."
     else:
@@ -904,7 +928,6 @@ async def start_random_music(guild: discord.Guild, user_id: str, display_name: s
 
 
 async def stop_random_music(guild_id: str, user_id: str) -> str:
-    """Remove user from random DJ."""
     dj = get_random_dj(guild_id)
     if user_id not in dj.participants:
         return "You're not in the DJ rotation."
@@ -916,29 +939,23 @@ async def stop_random_music(guild_id: str, user_id: str) -> str:
 
 
 async def _dj_loop(guild: discord.Guild, text_channel: Optional[discord.TextChannel]):
-    """Background loop that auto-queues random music based on rotation."""
     guild_id = str(guild.id)
     dj = get_random_dj(guild_id)
     mq = get_music_queue(guild_id)
-
     while dj.is_active:
         vc = guild.voice_client
         if not vc or not vc.is_connected():
             dj.active = False
             break
-
-        # Only queue next when mixer has no music or no current track
-        mixer_busy = mq._mixer and mq._mixer.has_music
-        if not mixer_busy and not mq.current:
+        mixer_busy = has_active_music(guild)
+        current_track = get_now_playing_track(guild)
+        if not mixer_busy and not current_track:
             next_user = dj.get_next_user()
             if not next_user:
                 await asyncio.sleep(2)
                 continue
-
-            # Get mood-aware song recommendation (Spotify + AI)
             query = await get_next_song(next_user, guild_id=guild_id)
             user_name = dj.user_names.get(next_user, "Someone")
-
             track = await extract_track(query, f"{user_name} (DJ)")
             if track:
                 await play_track(guild, track, text_channel)
@@ -950,13 +967,10 @@ async def _dj_loop(guild: discord.Guild, text_channel: Optional[discord.TextChan
                         )
                     except Exception:
                         pass
-
-        # Wait before checking again
         await asyncio.sleep(3)
 
 
 def cleanup_user_from_dj(guild_id: str, user_id: str):
-    """Remove user from DJ when they leave VC."""
     dj = get_random_dj(guild_id)
     dj.remove_user(user_id)
     if not dj.participants:
@@ -966,20 +980,16 @@ def cleanup_user_from_dj(guild_id: str, user_id: str):
 # ── Text+VC Dual Reply Support ────────────────────────────────────────────────
 
 async def speak_in_vc(guild: discord.Guild, text: str, bot_instance):
-    """Speak text in VC via TTS (used when user chats in text while in VC with Blood)."""
     if not guild.voice_client or not guild.voice_client.is_connected():
         return
-
     guild_id = str(guild.id)
     sink = _active_sinks.get(guild_id)
     if not sink:
         return
-
     await sink._speak(text)
 
 
 def is_user_in_blood_vc(guild: discord.Guild, user) -> bool:
-    """Check if a user is in the same VC as Blood."""
     if not guild.voice_client or not guild.voice_client.channel:
         return False
     return user in guild.voice_client.channel.members
@@ -987,36 +997,19 @@ def is_user_in_blood_vc(guild: discord.Guild, user) -> bool:
 
 # ── Transcript Storage ────────────────────────────────────────────────────────
 
-# guild_id -> list of transcript entries
-# Each entry: {timestamp, user_id, user_name, text, channel_name}
 _transcripts: dict[str, list[dict]] = defaultdict(list)
-
-# guild_id -> list of VC session records
-# Each session: {channel_name, joined_at, left_at, participants, transcript_entries}
 _vc_sessions: dict[str, list[dict]] = defaultdict(list)
-
-# Currently active sessions: guild_id -> session dict
 _active_sessions: dict[str, dict] = {}
-
-# Conversation context buffer for smart replies (last N transcripts per guild)
 _convo_buffer: dict[str, list[dict]] = defaultdict(list)
 CONVO_BUFFER_SIZE = 20
-
-# Track who Blood is in "conversation" with (recently spoke)
 _active_conversation: dict[str, set] = defaultdict(set)
-_conversation_timeout = 30  # seconds before conversation goes cold
+_conversation_timeout = 30
 
-# ── Audio Buffer per User ─────────────────────────────────────────────────────
-
-# Max buffer size: ~10s of audio at 48kHz stereo 16-bit = ~1.9MB
 MAX_BUFFER_BYTES = SAMPLE_RATE * CHANNELS * 2 * 10
-# Minimum audio bytes to bother sending to STT (~0.5s)
 MIN_STT_BYTES = SAMPLE_RATE * CHANNELS * 2 * 0.5
 
 
 class UserAudioBuffer:
-    """Accumulate PCM audio per user, detect silence, trigger STT."""
-
     def __init__(self, user_id: int, user_name: str):
         self.user_id = user_id
         self.user_name = user_name
@@ -1030,7 +1023,6 @@ class UserAudioBuffer:
         if not self.is_speaking:
             self.is_speaking = True
             self.speech_start = now
-        # Cap buffer to prevent memory blowup
         if len(self.buffer) < MAX_BUFFER_BYTES:
             self.buffer.extend(pcm_data)
         self.last_packet_time = now
@@ -1044,7 +1036,6 @@ class UserAudioBuffer:
         return time.monotonic() - self.speech_start
 
     def harvest(self) -> Optional[bytes]:
-        """Return accumulated PCM and reset, or None if too short."""
         if len(self.buffer) < int(SAMPLE_RATE * CHANNELS * 2 * MIN_SPEECH_SEC):
             self.buffer.clear()
             self.is_speaking = False
@@ -1059,76 +1050,54 @@ class UserAudioBuffer:
         self.is_speaking = False
 
 
-# ── PCM to WAV ────────────────────────────────────────────────────────────────
-
 def pcm_to_wav(pcm_data: bytes, sample_rate: int = SAMPLE_RATE,
                channels: int = CHANNELS) -> bytes:
-    """Convert raw PCM16 to WAV bytes for Whisper API."""
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
         wf.setnchannels(channels)
-        wf.setsampwidth(2)  # 16-bit
+        wf.setsampwidth(2)
         wf.setframerate(sample_rate)
         wf.writeframes(pcm_data)
     return buf.getvalue()
 
 
-# ── Groq Whisper STT ─────────────────────────────────────────────────────────
-
 async def transcribe_audio(pcm_data: bytes) -> Optional[str]:
-    """Send PCM audio to Groq Whisper and return transcribed text."""
     if not GROQ_API_KEY:
         log.warning("No GROQ_API_KEY — cannot transcribe")
         return None
-
-    # Run WAV conversion in executor to avoid blocking event loop
     loop = asyncio.get_event_loop()
     wav_data = await loop.run_in_executor(None, pcm_to_wav, pcm_data)
-
-    # Skip very small files (< 1KB of actual audio)
     if len(wav_data) < 1024:
         return None
-
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-
     form = aiohttp.FormData()
     form.add_field("file", wav_data, filename="audio.wav", content_type="audio/wav")
     form.add_field("model", GROQ_STT_MODEL)
     form.add_field("response_format", "json")
-    # No language param = Whisper auto-detects (handles English/Thai/mixed)
-
+    form.add_field("language", "th")
     try:
         session = _get_stt_session()
         async with session.post(GROQ_STT_URL, headers=headers, data=form) as resp:
             if resp.status != 200:
                 err = await resp.text()
-                log.warning("[STT] Whisper API error %d: %s", resp.status, err[:200])
+                log.warning("Whisper STT error %d: %s", resp.status, err[:200])
                 return None
             data = await resp.json()
             text = data.get("text", "").strip()
-            if text:
-                log.info("[STT] Transcribed: '%s'", text[:60])
-            else:
-                log.debug("[STT] Whisper returned empty text")
             return text if text else None
     except Exception as e:
-        log.warning("[STT] API call failed: %s", e)
+        log.warning("STT failed: %s", e)
         return None
 
 
-# ── Edge TTS ──────────────────────────────────────────────────────────────────
-
 async def text_to_speech(text: str, voice: str = TTS_VOICE) -> Optional[bytes]:
-    """Convert text to speech using edge-tts, return MP3 bytes."""
     try:
         import edge_tts
         communicate = edge_tts.Communicate(text, voice, rate=TTS_RATE)
-
         buf = io.BytesIO()
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
                 buf.write(chunk["data"])
-
         mp3_data = buf.getvalue()
         if not mp3_data:
             return None
@@ -1139,15 +1108,12 @@ async def text_to_speech(text: str, voice: str = TTS_VOICE) -> Optional[bytes]:
 
 
 class MP3AudioSource(discord.AudioSource):
-    """Play MP3 bytes through FFmpeg as a Discord audio source."""
-
     def __init__(self, mp3_data: bytes):
         self._process = None
         self._mp3_data = mp3_data
         self._stdout = None
 
     async def start(self):
-        """Start ffmpeg process to decode MP3 to PCM."""
         self._process = await asyncio.create_subprocess_exec(
             "ffmpeg", "-i", "pipe:0", "-f", "s16le", "-ar", "48000",
             "-ac", "2", "-loglevel", "quiet", "pipe:1",
@@ -1155,14 +1121,12 @@ class MP3AudioSource(discord.AudioSource):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        # Feed MP3 data and close stdin
         self._process.stdin.write(self._mp3_data)
         await self._process.stdin.drain()
         self._process.stdin.close()
         self._stdout = self._process.stdout
 
     def read(self) -> bytes:
-        """Read 20ms of PCM audio (3840 bytes at 48kHz stereo 16-bit)."""
         if self._stdout is None:
             return b""
         data = self._stdout._buffer[:3840] if hasattr(self._stdout, '_buffer') else b""
@@ -1177,8 +1141,6 @@ class MP3AudioSource(discord.AudioSource):
 
 
 class FFmpegPCMAudioPipe(discord.AudioSource):
-    """Simpler approach: write MP3 to temp file, use FFmpegPCMAudio."""
-
     def __init__(self, mp3_data: bytes):
         self._mp3_data = mp3_data
         self._source = None
@@ -1208,27 +1170,19 @@ class FFmpegPCMAudioPipe(discord.AudioSource):
         return False
 
 
-# ── Wake Word Detection ───────────────────────────────────────────────────────
-
 def contains_wake_word(text: str) -> bool:
-    """Check if text contains a wake word."""
     lower = text.lower()
     return any(w in lower for w in WAKE_WORDS)
 
 
 def is_relevant_to_conversation(text: str, guild_id: str) -> bool:
-    """Check if the speech is part of an ongoing conversation with Blood."""
-    # If it contains a wake word, always relevant
     if contains_wake_word(text):
         return True
-    # If there's an active conversation (Blood recently spoke), consider relevant
     guild_convos = _active_conversation.get(guild_id)
     if guild_convos:
         return True
     return False
 
-
-# ── Transcript Management ─────────────────────────────────────────────────────
 
 TRANSCRIPT_DIR = os.path.join(os.path.dirname(__file__), "data", "transcripts")
 os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
@@ -1236,7 +1190,6 @@ os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
 
 def add_transcript_entry(guild_id: str, user_id: int, user_name: str,
                          text: str, channel_name: str):
-    """Add a transcript entry with timestamp."""
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "user_id": user_id,
@@ -1246,17 +1199,13 @@ def add_transcript_entry(guild_id: str, user_id: int, user_name: str,
     }
     _transcripts[guild_id].append(entry)
     _convo_buffer[guild_id].append(entry)
-    # Trim conversation buffer
     if len(_convo_buffer[guild_id]) > CONVO_BUFFER_SIZE:
         _convo_buffer[guild_id] = _convo_buffer[guild_id][-CONVO_BUFFER_SIZE:]
-
-    # Also append to active session
     if guild_id in _active_sessions:
         _active_sessions[guild_id]["transcript"].append(entry)
 
 
 def start_vc_session(guild_id: str, channel_name: str):
-    """Start tracking a new VC session."""
     session = {
         "channel_name": channel_name,
         "joined_at": datetime.now(timezone.utc).isoformat(),
@@ -1267,24 +1216,17 @@ def start_vc_session(guild_id: str, channel_name: str):
 
 
 def end_vc_session(guild_id: str):
-    """End the current VC session and save to disk."""
     if guild_id not in _active_sessions:
         return
     session = _active_sessions.pop(guild_id)
     session["left_at"] = datetime.now(timezone.utc).isoformat()
-
-    # Save to persistent list
     _vc_sessions[guild_id].append(session)
-    # Keep only last 50 sessions in memory
     if len(_vc_sessions[guild_id]) > 50:
         _vc_sessions[guild_id] = _vc_sessions[guild_id][-50:]
-
-    # Save to disk
     _save_session(guild_id, session)
 
 
 def _save_session(guild_id: str, session: dict):
-    """Save a VC session transcript to disk as JSON."""
     guild_dir = os.path.join(TRANSCRIPT_DIR, guild_id)
     os.makedirs(guild_dir, exist_ok=True)
     filename = f"vc_{session['joined_at'].replace(':', '-').replace('.', '-')}.json"
@@ -1298,35 +1240,27 @@ def _save_session(guild_id: str, session: dict):
 
 
 def get_recent_sessions(guild_id: str, limit: int = 5) -> list[dict]:
-    """Get the N most recent VC sessions (from memory + disk)."""
-    # First check memory
     sessions = list(_vc_sessions.get(guild_id, []))
-
-    # Also load from disk if needed
     guild_dir = os.path.join(TRANSCRIPT_DIR, guild_id)
     if os.path.isdir(guild_dir):
         files = sorted(
             [f for f in os.listdir(guild_dir) if f.endswith(".json")],
             reverse=True
         )
-        for fname in files[:limit * 2]:  # Load extra to dedup
+        for fname in files[:limit * 2]:
             path = os.path.join(guild_dir, fname)
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     s = json.load(f)
-                # Avoid duplicates (check by joined_at)
                 if not any(existing.get("joined_at") == s.get("joined_at") for existing in sessions):
                     sessions.append(s)
             except Exception:
                 pass
-
-    # Sort by joined_at descending
     sessions.sort(key=lambda s: s.get("joined_at", ""), reverse=True)
     return sessions[:limit]
 
 
 def format_transcript_txt(session: dict) -> str:
-    """Format a session transcript as a plain text string."""
     lines = []
     ch = session.get("channel_name", "unknown")
     joined = session.get("joined_at", "?")
@@ -1336,10 +1270,8 @@ def format_transcript_txt(session: dict) -> str:
     lines.append(f"Ended:   {left}")
     lines.append(f"{'=' * 40}")
     lines.append("")
-
     for entry in session.get("transcript", []):
         ts = entry.get("timestamp", "")
-        # Extract just the time portion
         try:
             dt = datetime.fromisoformat(ts)
             ts_short = dt.strftime("%H:%M:%S")
@@ -1348,26 +1280,20 @@ def format_transcript_txt(session: dict) -> str:
         user = entry.get("user_name", "Unknown")
         text = entry.get("text", "")
         lines.append(f"[{ts_short}] {user}: {text}")
-
     if not session.get("transcript"):
         lines.append("(no speech transcribed)")
-
     return "\n".join(lines)
 
 
 def summarize_transcript(session: dict) -> str:
-    """Generate a quick summary of a transcript session."""
     transcript = session.get("transcript", [])
     if not transcript:
         return "No speech was transcribed during this session."
-
-    # Count speakers
     speakers = defaultdict(int)
     total_words = 0
     for entry in transcript:
         speakers[entry.get("user_name", "Unknown")] += 1
         total_words += len(entry.get("text", "").split())
-
     ch = session.get("channel_name", "unknown")
     duration = ""
     try:
@@ -1377,7 +1303,6 @@ def summarize_transcript(session: dict) -> str:
         duration = f" ({mins}m)" if mins > 0 else ""
     except Exception:
         pass
-
     speaker_list = ", ".join(f"{name} ({count} msgs)" for name, count in speakers.items())
     return (f"**#{ch}**{duration} — {len(transcript)} messages, ~{total_words} words\n"
             f"Speakers: {speaker_list}")
@@ -1386,8 +1311,6 @@ def summarize_transcript(session: dict) -> str:
 # ── Voice Receive Sink ────────────────────────────────────────────────────────
 
 class BloodAudioSink:
-    """Custom audio sink that buffers per-user PCM and triggers STT."""
-
     def __init__(self, guild_id: str, channel_name: str, bot_instance,
                  text_channel: Optional[discord.TextChannel] = None):
         self.guild_id = guild_id
@@ -1401,43 +1324,28 @@ class BloodAudioSink:
         self._last_stt_time = 0.0
 
     def start_processing(self):
-        """Start the background task that checks for silence and transcribes."""
         self._process_task = asyncio.create_task(self._process_loop())
 
     async def _process_loop(self):
-        """Periodically check user buffers for completed speech."""
         while self._running:
             try:
-                await asyncio.sleep(1.0)  # Check every 1s — gentler on event loop
+                await asyncio.sleep(1.0)
                 now = time.monotonic()
                 for uid, buf in list(self.user_buffers.items()):
-                    # Check if user stopped speaking (silence gap)
                     if buf.is_speaking and buf.silence_duration() > SILENCE_THRESHOLD_SEC:
-                        log.debug("[STT] Silence detected for %s (%.1fs), harvesting...", buf.user_name, buf.silence_duration())
                         pcm = buf.harvest()
                         if pcm and len(pcm) >= int(MIN_STT_BYTES):
-                            log.debug("[STT] Harvested %d bytes from %s", len(pcm), buf.user_name)
-                            # Throttle: skip if last STT was < 2s ago
                             if now - self._last_stt_time < 2.0:
-                                log.debug("[STT] Throttled — last STT was %.1fs ago", now - self._last_stt_time)
                                 continue
                             if not self._stt_lock.locked():
                                 self._last_stt_time = now
-                                log.info("[STT] Sending %d bytes to Whisper for %s", len(pcm), buf.user_name)
                                 asyncio.create_task(self._guarded_handle(uid, buf.user_name, pcm))
-                            else:
-                                log.debug("[STT] Lock held — skipping")
-                        elif pcm:
-                            log.debug("[STT] Audio too short (%d bytes < %d), discarding", len(pcm), int(MIN_STT_BYTES))
-                    # Force harvest if speaking too long
                     elif buf.is_speaking and buf.speech_duration() > MAX_SPEECH_SEC:
-                        log.debug("[STT] Max speech duration reached for %s", buf.user_name)
                         pcm = buf.harvest()
                         if pcm and len(pcm) >= int(MIN_STT_BYTES):
                             if not self._stt_lock.locked():
                                 self._last_stt_time = now
                                 asyncio.create_task(self._guarded_handle(uid, buf.user_name, pcm))
-                    # Clear stale buffers (no packets for 10s)
                     elif not buf.is_speaking and buf.silence_duration() > 10:
                         buf.clear()
             except asyncio.CancelledError:
@@ -1446,30 +1354,23 @@ class BloodAudioSink:
                 log.warning("Voice process loop error: %s", e)
 
     async def _guarded_handle(self, user_id: int, user_name: str, pcm_data: bytes):
-        """Run STT+response with concurrency guard."""
         async with self._stt_lock:
             await self._handle_speech(user_id, user_name, pcm_data)
 
     @staticmethod
     def _is_junk(text: str) -> bool:
-        """Return True if STT output is junk we should ignore."""
         import re as _re
         t = text.strip()
-        # Too short
         if len(t) < 2:
             return True
-        # URL / link
         if _re.search(r"https?://\S+", t):
             return True
-        # Emoji-only (unicode emoji or Discord custom :emoji:)
         cleaned = _re.sub(r"[\U0001F000-\U0001FFFF\u2600-\u27BF\u2700-\u27BF\uFE00-\uFE0F\u200D]", "", t)
-        cleaned = _re.sub(r"<a?:\w+:\d+>", "", cleaned)  # Discord custom emoji
+        cleaned = _re.sub(r"<a?:\w+:\d+>", "", cleaned)
         if not cleaned.strip():
             return True
-        # Command triggers (slash commands, prefix commands)
         if t.startswith(("/", "!", ".", "?", "$")):
             return True
-        # Whisper hallucinations — common junk outputs
         hallucinations = [
             "thank you", "thanks for watching", "subscribe", "like and subscribe",
             "you", "bye", ".", "...", "ขอบคุณ", "สวัสดีครับ", "สวัสดีค่ะ",
@@ -1480,43 +1381,25 @@ class BloodAudioSink:
         return False
 
     async def _handle_speech(self, user_id: int, user_name: str, pcm_data: bytes):
-        """Transcribe speech and decide whether to respond."""
         text = await transcribe_audio(pcm_data)
         if not text:
             return
-
-        # Filter junk STT output
         if self._is_junk(text):
             log.debug("[VC STT] Ignored junk: %s", text[:50])
             return
-
         log.info("[VC STT] %s: %s", user_name, text)
-
-        # Record transcript
         add_transcript_entry(self.guild_id, user_id, user_name, text, self.channel_name)
-
-        # Check if Blood should respond
         has_wake = contains_wake_word(text)
         is_relevant = is_relevant_to_conversation(text, self.guild_id)
-        log.debug("[STT] Wake word: %s, Relevant: %s for '%s'", has_wake, is_relevant, text[:40])
-
         if has_wake or is_relevant:
-            # Mark conversation as active
             _active_conversation[self.guild_id] = set()
-
-            # Generate Blood's response
             response = await self._generate_response(user_id, user_name, text)
             if response:
-                # Record Blood's response in transcript
                 add_transcript_entry(
                     self.guild_id, self.bot.user.id, "Blood",
                     response, self.channel_name
                 )
-
-                # TTS and play in VC
                 await self._speak(response)
-
-                # Also send to text channel if available
                 if self.text_channel:
                     try:
                         await self.text_channel.send(
@@ -1524,22 +1407,15 @@ class BloodAudioSink:
                         )
                     except Exception:
                         pass
-
-                # Schedule conversation timeout
                 asyncio.create_task(self._conversation_timeout())
 
     async def _generate_response(self, user_id: int, user_name: str, text: str) -> Optional[str]:
-        """Generate Blood's response using the AI provider."""
-        # Check if it's a music request first — handle directly
         music_result = await self._check_music_request(text, user_name)
         if music_result:
             return music_result
-
         try:
             from provider import call_ai
             from config import CONFIG
-
-            # Compact voice-mode system prompt — NO YAPPING
             system = (
                 "You are Blood, in a voice channel. RULES:\n"
                 "- MAX 1-2 sentences. You're speaking aloud, not typing.\n"
@@ -1549,17 +1425,13 @@ class BloodAudioSink:
                 "- You still have all your normal tools and can use them.\n"
                 f"Speaker: {user_name}"
             )
-
-            # Include recent conversation context
             context_msgs = []
             for entry in _convo_buffer.get(self.guild_id, [])[-10:]:
                 role = "assistant" if entry.get("user_name") == "Blood" else "user"
                 prefix = "" if role == "assistant" else f"[{entry.get('user_name', '?')}] "
                 context_msgs.append({"role": role, "content": f"{prefix}{entry.get('text', '')}"})
-
             if not context_msgs:
                 context_msgs = [{"role": "user", "content": f"[{user_name}] {text}"}]
-
             result = await call_ai(system, context_msgs, max_tokens=150)
             content = result.get("message", {}).get("content", "").strip()
             return content if content else None
@@ -1568,8 +1440,6 @@ class BloodAudioSink:
             return None
 
     async def _classify_music_intent(self, text: str) -> dict:
-        """Use AI to classify music intent from natural speech.
-        Returns: {"intent": "like"|"dislike"|"skip"|"stop"|"play"|"random"|"queue"|"none", "query": "..."}"""
         from provider import call_ai
         try:
             result = await call_ai(
@@ -1597,34 +1467,22 @@ class BloodAudioSink:
             return {"intent": "none"}
 
     async def _check_music_request(self, text: str, requester: str) -> Optional[str]:
-        """Detect music requests in speech using AI intent classification."""
         import re as _re
-
-        # URL paste detection (no AI needed)
         url_match = _re.search(r"(https?://\S+)", text)
-
         guild = self.bot.get_guild(int(self.guild_id))
         if not guild:
             return None
-
-        mq = get_music_queue(self.guild_id)
-        has_music = mq._mixer and mq._mixer.has_music
-
-        # Get user_id from requester name
+        current_track = get_now_playing_track(guild)
+        has_music = current_track is not None
         requester_id = None
         for uid, buf in self.user_buffers.items():
             if buf.user_name == requester:
                 requester_id = str(uid)
                 break
-
-        # URL pasted — handle directly, no AI needed
         if url_match:
             result = await play_music(guild, url_match.group(1), requester, self.text_channel,
                                       requester_id=requester_id)
             return result
-
-        # Quick keyword pre-check: only call AI classifier if music is playing
-        # OR text contains music-ish words (saves API calls when just chatting)
         _music_hints = {"play", "song", "music", "skip", "stop", "next", "like", "dislike",
                         "hate", "love", "sucks", "banger", "random", "queue", "playing",
                         "เพลง", "เปิด", "ข้าม", "หยุด", "ชอบ", "ไม่ชอบ", "ห่วย", "เปลี่ยน", "เพราะ", "ดี"}
@@ -1632,91 +1490,73 @@ class BloodAudioSink:
         might_be_music = has_music or any(w in lower for w in _music_hints)
         if not might_be_music:
             return None
-
-        # AI intent classification
         intent_data = await self._classify_music_intent(text)
         intent = intent_data.get("intent", "none")
-
-        if intent == "like" and mq.current and requester_id:
-            record_feedback(requester_id, mq.current.title, positive=True)
-            return f"Noted, you like {mq.current.title}. I'll remember that."
-
-        if intent == "dislike" and mq.current and requester_id:
-            record_feedback(requester_id, mq.current.title, positive=False)
+        if intent == "like" and current_track and requester_id:
+            record_feedback(requester_id, current_track.title, positive=True)
+            return f"Noted, you like {current_track.title}. I'll remember that."
+        if intent == "dislike" and current_track and requester_id:
+            record_feedback(requester_id, current_track.title, positive=False)
             await skip_music(guild)
             return "Got it, skipping. I'll play less of that for you."
-
         if intent == "skip":
             return await skip_music(guild)
-
         if intent == "stop":
             return await stop_music(guild)
-
         if intent == "queue":
-            return get_queue_info(self.guild_id)
-
+            return get_queue_info(self.guild_id, guild)
         if intent == "random" and requester_id:
             return await start_random_music(guild, requester_id, requester, self.text_channel)
-
         if intent == "play":
             query = intent_data.get("query", "")
             if query:
                 return await play_music(guild, query, requester, self.text_channel,
                                         requester_id=requester_id)
-
         return None
 
     async def _speak(self, text: str):
-        """Convert text to speech and play in voice channel.
-        If music is playing through the mixer, TTS is mixed in with auto-ducking.
-        If no music, plays TTS directly."""
         guild = self.bot.get_guild(int(self.guild_id))
         if not guild or not guild.voice_client:
             return
-
         mp3_data = await text_to_speech(text)
         if not mp3_data:
             log.warning("TTS returned no audio")
             return
-
         vc = guild.voice_client
         mq = get_music_queue(self.guild_id)
         mixer = mq._mixer
-
-        if mixer and (mixer.has_music or vc.is_playing()):
-            # Mixer is active (music playing or mixer is current vc source)
-            # Feed TTS through mixer — auto-ducks music if any
+        mixer_active = mixer and (mixer.has_music or _voice_client_has_mixer(vc, mixer))
+        if mixer_active:
             try:
+                _sync_web_mixer_tts(guild, active=True, text=text, level=1.0)
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, mixer.feed_tts_sync, mp3_data)
                 log.info("Spoke in VC (mixed with music): %s", text[:60])
             except Exception as e:
                 log.warning("TTS via mixer failed: %s", e)
+            finally:
+                _sync_web_mixer_tts(guild, active=False, text="", level=0.0)
         else:
-            # No mixer at all — play TTS directly
             try:
-                # Make sure nothing else is playing
-                if vc.is_playing():
-                    vc.stop()
-
+                if vc.is_playing() or vc.is_paused():
+                    _stop_voice_playback(vc)
                 source = FFmpegPCMAudioPipe(mp3_data)
                 source.prepare()
-
+                _sync_web_mixer_tts(guild, active=True, text=text, level=1.0)
                 tts_done = asyncio.Event()
-
                 def on_tts_done(error):
                     if error:
                         log.warning("TTS playback error: %s", error)
                     tts_done.set()
-
                 vc.play(source, after=on_tts_done)
                 await tts_done.wait()
                 log.info("Spoke in VC: %s", text[:60])
             except Exception as e:
                 log.warning("TTS failed: %s", e)
+            finally:
+                _sync_web_mixer_tts(guild, active=False, text="", level=0.0)
 
     async def _conversation_timeout(self):
-        """Clear active conversation after timeout."""
         await asyncio.sleep(_conversation_timeout)
         if self.guild_id in _active_conversation:
             _active_conversation.pop(self.guild_id, None)
@@ -1724,52 +1564,41 @@ class BloodAudioSink:
     _voice_data_count = 0
 
     def on_voice_data(self, user, pcm_data: bytes):
-        """Called when voice data is received from a user."""
         if user.bot:
-            return  # Ignore bots
+            return
         uid = user.id
         if uid not in self.user_buffers:
             self.user_buffers[uid] = UserAudioBuffer(uid, user.display_name)
             log.info("[VC] New speaker detected: %s (ID:%s)", user.display_name, uid)
         self.user_buffers[uid].add_pcm(pcm_data)
-        # Log first few packets to confirm voice data is flowing
         self._voice_data_count += 1
         if self._voice_data_count in (1, 50, 500):
             log.info("[VC] Voice packets received: %d (from %s, %d bytes)",
                      self._voice_data_count, user.display_name, len(pcm_data))
 
     def stop(self):
-        """Stop the processing loop."""
         self._running = False
         if self._process_task:
             self._process_task.cancel()
 
 
-# ── Active Sinks Registry ────────────────────────────────────────────────────
+# ── Active Sinks Registry ─────────────────────────────────────────────────────
 
 _active_sinks: dict[str, BloodAudioSink] = {}
-
-# Track intentional disconnects so auto-rejoin doesn't fight /leavevc
-_intentional_leave: set[str] = set()  # guild_ids currently doing intentional leave
+_intentional_leave: set[str] = set()
 
 
 def get_active_sink(guild_id: str) -> Optional[BloodAudioSink]:
     return _active_sinks.get(guild_id)
 
 
-# ── High-level Join/Leave ─────────────────────────────────────────────────────
-
 async def join_and_listen(guild: discord.Guild, vc_channel: discord.VoiceChannel,
                           text_channel: Optional[discord.TextChannel], bot_instance) -> str:
-    """Join a voice channel and start listening + recording."""
     guild_id = str(guild.id)
-
     try:
         import discord.ext.voice_recv as voice_recv
     except ImportError:
         return "❌ Voice receive not available (discord-ext-voice-recv not installed)"
-
-    # Connect or move
     try:
         if guild.voice_client:
             await guild.voice_client.move_to(vc_channel)
@@ -1780,85 +1609,76 @@ async def join_and_listen(guild: discord.Guild, vc_channel: discord.VoiceChannel
         return "❌ No permission to join that voice channel"
     except Exception as e:
         return f"❌ Failed to connect: {e}"
-
-    # Wait for voice connection to be fully ready
-    for _ in range(20):  # up to 4 seconds
+    for _ in range(20):
         if voice_client.is_connected():
             break
         await asyncio.sleep(0.2)
     else:
         return "❌ Voice connection timed out"
-
-    # Create sink
     sink = BloodAudioSink(guild_id, vc_channel.name, bot_instance, text_channel)
     _active_sinks[guild_id] = sink
-
-    # Start recording session
     start_vc_session(guild_id, vc_channel.name)
-
-    # Start listening
     def callback(user, data: voice_recv.VoiceData):
         sink.on_voice_data(user, data.pcm)
-
     try:
         voice_client.listen(voice_recv.BasicSink(callback))
         log.info("[VC] Listener started on '%s' (voice_recv.BasicSink)", vc_channel.name)
     except Exception as e:
         log.error("[VC] Failed to start listener: %s", e)
         return f"❌ Failed to start listening: {e}"
-
-    # Start processing loop
     sink.start_processing()
-
-    # Start web mixer dashboard
     try:
         import web_mixer as wm
         await wm.start_web_mixer()
-        wm.update_state(music_active=False, tts_active=False, ducked=False)
+        _bind_web_mixer_guild(guild_id)
+        wm.update_state(
+            music_active=False,
+            music_title="",
+            music_level=0.0,
+            music_volume=get_music_queue(guild_id).volume,
+            tts_active=False,
+            tts_text="",
+            tts_level=0.0,
+            ducked=False,
+            force_duck=False,
+        )
     except Exception as e:
         log.warning("Web mixer not started: %s", e)
-
     log.info("Joined VC '%s' in %s — listening", vc_channel.name, guild.name)
     return f"✅ Joined **{vc_channel.name}** — listening & recording. Say 'Blood' or 'hey Blood' to talk to me!"
 
 
 async def leave_voice(guild: discord.Guild) -> str:
-    """Leave voice channel and save transcript."""
     guild_id = str(guild.id)
-
-    # Mark as intentional so auto-rejoin doesn't fire
     _intentional_leave.add(guild_id)
-
-    # Stop sink
     sink = _active_sinks.pop(guild_id, None)
     if sink:
         sink.stop()
-
-    # Stop DJ
     dj = get_random_dj(guild_id)
     if dj.is_active:
         dj.active = False
         dj.participants.clear()
-
-    # Stop mixer
     mq = get_music_queue(guild_id)
     mq.cleanup_mixer()
     mq.clear()
-
-    # End session
     end_vc_session(guild_id)
-
-    # Disconnect
     if guild.voice_client:
         await guild.voice_client.disconnect(force=True)
-
-    # Clear conversation state
     _active_conversation.pop(guild_id, None)
-
-    # Clear intentional flag after a delay (give on_voice_state_update time to see it)
+    _update_web_mixer(
+        music_active=False,
+        music_title="",
+        music_level=0.0,
+        music_volume=mq.volume,
+        tts_active=False,
+        tts_text="",
+        tts_level=0.0,
+        ducked=False,
+        force_duck=False,
+    )
+    _bind_web_mixer_guild(None)
     async def _clear_flag():
         await asyncio.sleep(5)
         _intentional_leave.discard(guild_id)
     asyncio.create_task(_clear_flag())
-
     return "✅ Left voice channel. Transcript saved."
