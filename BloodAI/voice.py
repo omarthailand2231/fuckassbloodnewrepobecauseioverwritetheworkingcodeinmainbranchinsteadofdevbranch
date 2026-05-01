@@ -424,6 +424,36 @@ async def _play_next(guild: discord.Guild,
                      text_channel: Optional[discord.TextChannel] = None):
     guild_id = str(guild.id)
     mq = get_music_queue(guild_id)
+
+    # Radio mode: gapless — reuse the same mixer, just swap the stream
+    rdj = get_radio_dj(guild_id)
+    if rdj.is_active:
+        if mq._mixer and mq.queue:
+            nxt = mq.next()
+            if nxt:
+                mixer = mq._mixer
+
+                async def _on_end():
+                    await _play_next(guild, text_channel)
+
+                mixer.start_music(nxt.stream_url, volume=mq.volume, on_end=_on_end)
+                # Refill queue and prebuffer next track immediately in background
+                asyncio.create_task(_fill_radio_queue(rdj, guild_id))
+                _sync_web_mixer_music(guild)
+                log.info("[RADIO] Gapless transition: %s", nxt.title)
+                return
+        # Radio active but queue empty — stop the mixer so has_active_music() returns
+        # False, which lets _radio_loop's "not playing + queue ready" branch restart
+        # playback as soon as _fill_radio_queue adds songs.
+        mq.current = None
+        if mq._mixer:
+            mq._mixer.stop_music()
+            mq._mixer = None
+        log.info("[RADIO] Queue empty — stopping mixer, triggering fill")
+        asyncio.create_task(_fill_radio_queue(rdj, guild_id))
+        _sync_web_mixer_music(guild)
+        return
+
     nxt = mq.next()
     if nxt:
         await play_track(guild, nxt, text_channel)
@@ -857,6 +887,7 @@ class RandomDJ:
         self.active = False
         self._rotation_idx = 0
         self._priority_remaining = 0
+        self._loop_task: Optional[asyncio.Task] = None
 
     def add_user(self, user_id: str, display_name: str):
         if user_id not in self.participants:
@@ -918,7 +949,7 @@ async def start_random_music(guild: discord.Guild, user_id: str, display_name: s
         return f"🎲 You're already in the DJ rotation! ({len(dj.participants)} participants)"
     if not dj.active:
         dj.active = True
-        asyncio.create_task(_dj_loop(guild, text_channel))
+        dj._loop_task = asyncio.create_task(_dj_loop(guild, text_channel))
         return f"🎲 **Random DJ started!** Playing music based on your taste. Say 'I like this' or 'skip' to teach me."
     else:
         pos = dj.participants.index(user_id) + 1
@@ -975,6 +1006,583 @@ def cleanup_user_from_dj(guild_id: str, user_id: str):
     dj.remove_user(user_id)
     if not dj.participants:
         dj.active = False
+
+
+# ── Radio DJ System (ElevenLabs TTS) ─────────────────────────────────────────
+
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
+ELEVENLABS_RADIO_VOICE_ID = os.getenv("ELEVENLABS_RADIO_VOICE_ID", "")
+_ELEVENLABS_FALLBACK_VOICES = [
+    "JBFqnCBsd6RMkjVDRZzb",  # George
+    "pNInz6obpgDQGcFmaJgB",  # Adam
+    "ErXwobaYiN019PkySvjV",  # Antoni
+]
+_elevenlabs_working_voice: Optional[str] = None
+
+RADIO_GENRES = [
+    "indie", "lo-fi", "acoustic", "jazz", "soft rock", "dream pop",
+    "indie folk", "chillwave", "ambient pop", "shoegaze", "bossa nova",
+    "indie electronic", "bedroom pop", "post-rock", "neo-soul",
+    "trip hop", "downtempo", "alternative r&b", "indie pop",
+]
+
+RADIO_FALLBACK_SONGS = [
+    "Mac DeMarco - Chamber of Reflection",
+    "Khruangbin - Time (You and I)",
+    "Men I Trust - Numb",
+    "Boy Pablo - Everytime",
+    "Clairo - Sofia",
+    "Still Woozy - Goodie Bag",
+    "Mild High Club - Homage",
+    "Tame Impala - Feels Like We Only Go Backwards",
+    "Beach House - Space Song",
+    "Unknown Mortal Orchestra - Hunnybee",
+    "Homeshake - Every Single Thing",
+    "Alvvays - Dreams Tonite",
+    "Japanese Breakfast - Machinist",
+    "Snail Mail - Pristine",
+    "Soccer Mommy - circle the drain",
+    "Cigarettes After Sex - Apocalypse",
+    "Mazzy Star - Fade Into You",
+    "Radiohead - No Surprises",
+    "The xx - Intro",
+    "Washed Out - Feel It All Around",
+]
+
+RADIO_QUEUE_TARGET = 3  # Always keep this many tracks buffered ahead
+
+
+async def _elevenlabs_tts_call(voice_id: str, text: str) -> Optional[bytes]:
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    headers = {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "audio/mpeg",
+    }
+    payload = {
+        "text": text,
+        "model_id": "eleven_multilingual_v2",
+        "voice_settings": {
+            "stability": 0.6,
+            "similarity_boost": 0.75,
+            "style": 0.3,
+        },
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=payload,
+                                 timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            if resp.status == 200:
+                data = await resp.read()
+                return data if data else None
+            err = await resp.text()
+            log.warning("[RADIO] ElevenLabs voice %s → %d: %s", voice_id, resp.status, err[:150])
+            return None
+
+
+async def text_to_speech_elevenlabs(text: str) -> Optional[bytes]:
+    global _elevenlabs_working_voice
+    if not ELEVENLABS_API_KEY:
+        log.info("[RADIO] No ElevenLabs API key — using edge_tts")
+        return await text_to_speech(text)
+
+    if _elevenlabs_working_voice:
+        try:
+            data = await _elevenlabs_tts_call(_elevenlabs_working_voice, text)
+            if data:
+                return data
+        except Exception as e:
+            log.warning("[RADIO] Cached voice %s failed: %s", _elevenlabs_working_voice, e)
+        _elevenlabs_working_voice = None
+
+    voices_to_try = []
+    if ELEVENLABS_RADIO_VOICE_ID:
+        voices_to_try.append(ELEVENLABS_RADIO_VOICE_ID)
+    voices_to_try.extend(v for v in _ELEVENLABS_FALLBACK_VOICES if v != ELEVENLABS_RADIO_VOICE_ID)
+
+    for vid in voices_to_try:
+        try:
+            data = await _elevenlabs_tts_call(vid, text)
+            if data:
+                _elevenlabs_working_voice = vid
+                if vid != ELEVENLABS_RADIO_VOICE_ID:
+                    log.info("[RADIO] Using fallback ElevenLabs voice %s", vid)
+                else:
+                    log.info("[RADIO] ElevenLabs voice OK: %s", vid)
+                return data
+        except Exception as e:
+            log.warning("[RADIO] Voice %s error: %s", vid, e)
+
+    log.warning("[RADIO] All ElevenLabs voices failed — falling back to edge_tts")
+    return await text_to_speech(text)
+
+
+class RadioDJ:
+    def __init__(self, guild_id: str):
+        self.guild_id = guild_id
+        self.active = False
+        self._track_start_time = 0.0
+        self._current_track_title: Optional[str] = None
+        self._songs_played: list[str] = []
+        self._talk_counter = 0
+        self._talk_interval = 1
+        self._rec_cache: list[str] = []
+        self._fill_lock = asyncio.Lock()
+        self._loop_task: Optional[asyncio.Task] = None
+
+    @property
+    def is_active(self):
+        return self.active
+
+    def should_talk(self) -> bool:
+        import random
+        self._talk_counter += 1
+        if self._talk_counter >= self._talk_interval:
+            self._talk_counter = 0
+            self._talk_interval = random.randint(2, 5)
+            return True
+        return False
+
+
+_radio_djs: dict[str, RadioDJ] = {}
+_radio_recent: list[str] = []
+
+
+def get_radio_dj(guild_id: str) -> RadioDJ:
+    if guild_id not in _radio_djs:
+        _radio_djs[guild_id] = RadioDJ(guild_id)
+    return _radio_djs[guild_id]
+
+
+async def _warmup_elevenlabs_bg():
+    """Try each ElevenLabs voice with a short timeout and cache the first one that works.
+    Runs in the background so it never blocks /radio startup."""
+    global _elevenlabs_working_voice
+    if not ELEVENLABS_API_KEY or _elevenlabs_working_voice:
+        return
+    voices_to_try = []
+    if ELEVENLABS_RADIO_VOICE_ID:
+        voices_to_try.append(ELEVENLABS_RADIO_VOICE_ID)
+    voices_to_try.extend(v for v in _ELEVENLABS_FALLBACK_VOICES if v != ELEVENLABS_RADIO_VOICE_ID)
+    for vid in voices_to_try:
+        try:
+            data = await asyncio.wait_for(_elevenlabs_tts_call(vid, "Hi"), timeout=8.0)
+            if data:
+                _elevenlabs_working_voice = vid
+                log.info("[RADIO] ElevenLabs voice warmed up in background: %s", vid)
+                return
+        except Exception as e:
+            log.warning("[RADIO] ElevenLabs warmup voice %s failed: %s", vid, e)
+    log.warning("[RADIO] All ElevenLabs voices failed warmup — will use edge_tts")
+
+
+async def _radio_recommendations(count: int = 15) -> list[str]:
+    import random as _rng
+    from provider import call_ai
+
+    genre_sample = _rng.sample(RADIO_GENRES, min(5, len(RADIO_GENRES)))
+    genres_text = ", ".join(genre_sample)
+    recent_text = ", ".join(_radio_recent[-10:]) if _radio_recent else "none"
+
+    prompt = (
+        f"You are a late-night indie radio station music curator.\n"
+        f"Generate {count} songs perfect for background/radio listening.\n\n"
+        f"Genres to draw from: {genres_text}\n"
+        f"Recently played (DO NOT repeat): {recent_text}\n\n"
+        f"Rules:\n"
+        f"- Output ONLY a list, one song per line, format: Artist - Song Title\n"
+        f"- NO numbering, NO bullets, NO extra text\n"
+        f"- Every song must be REAL and existing\n"
+        f"- Tempo: not too fast, not too slow — background/radio vibe\n"
+        f"- Mix well-known indie with deeper cuts\n"
+        f"- NEVER repeat an artist\n"
+        f"- Think: songs you'd hear on a chill indie radio station at night\n"
+    )
+    try:
+        result = await call_ai(
+            system="You are a radio station music curator. Output ONLY song names, one per line.",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=500,
+        )
+        text = result.get("message", {}).get("content", "")
+        songs = []
+        for line in text.strip().split("\n"):
+            line = line.strip().lstrip("0123456789.-) •●").strip()
+            if (line and 5 < len(line) < 100
+                    and " - " in line
+                    and not any(w in line.lower() for w in
+                                ("actually", "maybe", "could be", "let me", "i think", "note:", "here"))):
+                songs.append(line)
+        if songs:
+            _rng.shuffle(songs)
+            return songs
+    except Exception as e:
+        log.warning("[RADIO] Recommendation failed: %s", e)
+
+    fallback = list(RADIO_FALLBACK_SONGS)
+    _rng.shuffle(fallback)
+    return [s for s in fallback if s not in _radio_recent][:count]
+
+
+async def _get_radio_song(rdj: RadioDJ) -> str:
+    global _radio_recent
+    if rdj._rec_cache:
+        song = rdj._rec_cache.pop(0)
+        if song not in _radio_recent:
+            _radio_recent.append(song)
+            if len(_radio_recent) > 30:
+                _radio_recent = _radio_recent[-30:]
+            return song
+    songs = await _radio_recommendations(count=15)
+    songs = [s for s in songs if s not in _radio_recent]
+    if not songs:
+        songs = await _radio_recommendations(count=15)
+    if songs:
+        song = songs.pop(0)
+        rdj._rec_cache = songs
+        _radio_recent.append(song)
+        if len(_radio_recent) > 30:
+            _radio_recent = _radio_recent[-30:]
+        return song
+    return "indie chill music"
+
+
+async def _generate_radio_commentary(last_song: str, next_song: str,
+                                      songs_played: list[str],
+                                      guild_id: str = "") -> str:
+    from provider import call_ai
+    import random
+
+    local_hour = (datetime.now(timezone.utc).hour + 7) % 24
+    if 0 <= local_hour < 6:
+        time_vibe = "deep into the night, around " + str(local_hour) + " AM"
+    elif 6 <= local_hour < 12:
+        time_vibe = "morning, around " + str(local_hour) + " AM"
+    elif 12 <= local_hour < 17:
+        time_vibe = "afternoon, around " + str(local_hour - 12) + " PM"
+    elif 17 <= local_hour < 21:
+        time_vibe = "evening, around " + str(local_hour - 12) + " PM"
+    else:
+        time_vibe = "late night, around " + str(local_hour - 12) + " PM"
+
+    recent_chat = ""
+    if guild_id:
+        chat_entries = _convo_buffer.get(guild_id, [])[-5:]
+        user_msgs = [e.get("text", "") for e in chat_entries
+                     if e.get("user_name") != "Blood"]
+        if user_msgs:
+            recent_chat = f"Recent listener chatter: {'; '.join(user_msgs[-3:])}"
+
+    styles = [
+        "Comment on the song that just played and naturally introduce the next one",
+        "Share a brief thought or vibe check, then mention what's coming up",
+        "Smoothly introduce the next song with a one-liner",
+        "Talk about the weather or the vibe of the time of day, then transition",
+        "Ask your listeners a casual question — how's their night going, what they're up to",
+        "Share a quick fun fact about the artist or the genre you just played",
+        "Reminisce about the mood of the set so far, then tease the next track",
+        "Give a shoutout to anyone listening, talk about what this song means to you",
+    ]
+    songs_context = ", ".join(songs_played[-5:]) if songs_played else "just getting started"
+    prompt = (
+        f"You just played: {last_song}\n"
+        f"Now playing: {next_song}\n"
+        f"Time: {time_vibe}\n"
+        f"Set so far: {songs_context}\n"
+        f"Songs played tonight: {len(songs_played)}\n"
+        f"{recent_chat}\n"
+        f"Style: {random.choice(styles)}\n"
+    )
+    try:
+        result = await call_ai(
+            system=(
+                "You are a chill indie radio DJ hosting a live show. You're on air between songs.\n"
+                "Your name is Blood and this is Blood Radio.\n"
+                "Rules:\n"
+                "- MAX 2-3 short sentences\n"
+                "- No markdown, no emojis, no asterisks — pure spoken word\n"
+                "- Sound natural and smooth, like a real late-night radio host\n"
+                "- Calm, laid-back energy. Warm with your listeners.\n"
+                "- You can talk about: the music, the artist, the vibe, the weather,\n"
+                "  the time of day, ask listeners how they're doing, share a thought\n"
+                "- Sometimes mention the song, sometimes just vibe. Vary it up.\n"
+                "- If listeners said something recently, you can acknowledge it naturally\n"
+                "- Keep it real and authentic — you love what you do\n"
+            ),
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=120,
+        )
+        content = result.get("message", {}).get("content", "").strip()
+        return content if content else ""
+    except Exception as e:
+        log.warning("[RADIO] Commentary generation failed: %s", e)
+        return ""
+
+
+async def _speak_radio(guild: discord.Guild, guild_id: str, text: str):
+    vc = guild.voice_client
+    if not vc or not vc.is_connected():
+        return
+    mp3_data = await text_to_speech(text)
+    if not mp3_data:
+        return
+    mq = get_music_queue(guild_id)
+    mixer = mq._mixer
+    if mixer and (mixer.has_music or _voice_client_has_mixer(vc, mixer)):
+        try:
+            _sync_web_mixer_tts(guild, active=True, text=text, level=1.0)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, mixer.feed_tts_sync, mp3_data)
+            log.info("[RADIO] DJ spoke: %s", text[:60])
+        except Exception as e:
+            log.warning("[RADIO] TTS via mixer failed: %s", e)
+        finally:
+            _sync_web_mixer_tts(guild, active=False, text="", level=0.0)
+    else:
+        rdj = get_radio_dj(guild_id)
+        if rdj.is_active:
+            # Mixer not ready during radio — skip speech rather than killing music.
+            # The standalone path calls _stop_voice_playback which ends the stream
+            # permanently and music never recovers.
+            log.info("[RADIO] Skipping speech — mixer not ready during transition")
+            return
+        try:
+            if vc.is_playing() or vc.is_paused():
+                _stop_voice_playback(vc)
+            source = FFmpegPCMAudioPipe(mp3_data)
+            source.prepare()
+            _sync_web_mixer_tts(guild, active=True, text=text, level=1.0)
+            tts_done = asyncio.Event()
+            def on_done(error):
+                if error:
+                    log.warning("[RADIO] TTS playback error: %s", error)
+                tts_done.set()
+            vc.play(source, after=on_done)
+            await tts_done.wait()
+            log.info("[RADIO] DJ spoke (standalone): %s", text[:60])
+        except Exception as e:
+            log.warning("[RADIO] TTS standalone failed: %s", e)
+        finally:
+            _sync_web_mixer_tts(guild, active=False, text="", level=0.0)
+
+
+async def _fill_radio_queue(rdj: RadioDJ, guild_id: str):
+    """Top up the radio queue to RADIO_QUEUE_TARGET tracks using parallel extraction.
+
+    Uses a per-RadioDJ lock so concurrent callers don't double-fill — the second
+    caller acquires the lock, sees needed=0, and exits immediately.
+    """
+    async with rdj._fill_lock:
+        if not rdj.is_active:
+            return
+        mq = get_music_queue(guild_id)
+        needed = RADIO_QUEUE_TARGET - len(mq.queue)
+        if needed <= 0:
+            # Still make sure the next-up track is prebuffered
+            if mq.queue and mq._mixer:
+                mq._mixer.prebuffer_next(mq.queue[0].stream_url)
+            return
+
+        # Collect queries sequentially — fast (pops from rdj._rec_cache)
+        queries = []
+        for _ in range(needed):
+            if not rdj.is_active:
+                break
+            queries.append(await _get_radio_song(rdj))
+
+        if not queries:
+            return
+
+        # Extract all tracks in parallel — this is the slow yt-dlp part
+        log.info("[RADIO] Extracting %d tracks in parallel to fill queue", len(queries))
+        results = await asyncio.gather(
+            *[extract_track(q, "Radio DJ") for q in queries],
+            return_exceptions=True,
+        )
+
+        added = 0
+        for result in results:
+            if not rdj.is_active:
+                break
+            if isinstance(result, Exception) or result is None:
+                continue
+            mq.add(result)
+            added += 1
+            log.info("[RADIO] Pre-queued: %s (queue: %d)", result.title, len(mq.queue))
+
+        if added == 0:
+            log.warning("[RADIO] Parallel fill got 0 tracks — all extractions failed")
+
+        # Prebuffer the soonest-coming track so gapless has frames ready
+        if mq.queue and mq._mixer:
+            mq._mixer.prebuffer_next(mq.queue[0].stream_url)
+
+
+async def _radio_loop(guild: discord.Guild,
+                       text_channel: Optional[discord.TextChannel]):
+    guild_id = str(guild.id)
+    rdj = get_radio_dj(guild_id)
+    mq = get_music_queue(guild_id)
+
+    # Fetch RADIO_QUEUE_TARGET+1 queries up front, then extract all in parallel.
+    # This means startup only waits for the slowest single extraction instead of
+    # waiting for each one serially.
+    startup_count = RADIO_QUEUE_TARGET + 1
+    queries = []
+    for _ in range(startup_count):
+        queries.append(await _get_radio_song(rdj))
+
+    log.info("[RADIO] Extracting %d startup tracks in parallel", startup_count)
+    results = await asyncio.gather(
+        *[extract_track(q, "Radio DJ") for q in queries],
+        return_exceptions=True,
+    )
+    tracks = [r for r in results if r and not isinstance(r, Exception)]
+
+    if not tracks:
+        rdj.active = False
+        log.warning("[RADIO] Could not find any startup tracks")
+        if text_channel:
+            try:
+                await text_channel.send("📻 Radio couldn't find a song to start with. Try again.")
+            except Exception:
+                pass
+        return
+
+    # Play first track, pre-queue the rest immediately
+    first_track = tracks[0]
+    for queued in tracks[1:]:
+        mq.add(queued)
+        log.info("[RADIO] Startup pre-queued: %s", queued.title)
+
+    await play_track(guild, first_track, text_channel)
+    rdj._track_start_time = time.monotonic()
+    rdj._current_track_title = first_track.title
+    rdj._songs_played.append(first_track.title)
+
+    # Prebuffer the very next track so gapless is ready from the first transition
+    if mq.queue and mq._mixer:
+        mq._mixer.prebuffer_next(mq.queue[0].stream_url)
+
+    if text_channel:
+        try:
+            await text_channel.send(f"📻 **Now on air:** {first_track.title}")
+        except Exception:
+            pass
+
+    await asyncio.sleep(2)
+    try:
+        intro = f"You're tuned in to Blood Radio. Kicking things off with {first_track.title}. Sit back and enjoy the vibes."
+        await _speak_radio(guild, guild_id, intro)
+        log.info("[RADIO] Intro speech delivered")
+    except Exception as e:
+        log.warning("[RADIO] Intro speech failed: %s", e)
+
+    while rdj.is_active:
+        try:
+            vc = guild.voice_client
+            if not vc or not vc.is_connected():
+                rdj.active = False
+                break
+
+            current = get_now_playing_track(guild)
+
+            # Detect track change — gapless transition played a queued song
+            if current and current.title != rdj._current_track_title:
+                old_title = rdj._current_track_title
+                rdj._current_track_title = current.title
+                rdj._track_start_time = time.monotonic()
+                rdj._songs_played.append(current.title)
+                log.info("[RADIO] Track change: '%s' → '%s'", old_title, current.title)
+
+                # Refill queue back to target in background
+                asyncio.create_task(_fill_radio_queue(rdj, guild_id))
+
+                if text_channel:
+                    try:
+                        await text_channel.send(f"📻 **Now on air:** {current.title}")
+                    except Exception:
+                        pass
+
+                if old_title and rdj.should_talk():
+                    log.info("[RADIO] should_talk=True, generating commentary")
+                    commentary = await _generate_radio_commentary(
+                        old_title, current.title, rdj._songs_played[-10:],
+                        guild_id=guild_id,
+                    )
+                    if commentary:
+                        await _speak_radio(guild, guild_id, commentary)
+                    else:
+                        log.warning("[RADIO] Commentary was empty")
+
+            # No music playing — either queue is empty or songs are waiting unstarted.
+            # The second case happens when a user /play or stop_music killed the active
+            # player while _fill_radio_queue had already added songs to mq.queue.
+            # Those songs sit frozen because _play_next() already returned and the
+            # "not mq.queue" guard below would never fire.
+            if not current and not has_active_music(guild):
+                if mq.queue:
+                    # Songs are ready but nothing is playing — restart from queue
+                    nxt = mq.next()
+                    if nxt:
+                        log.info("[RADIO] Restarting from pre-filled queue: %s", nxt.title)
+                        await play_track(guild, nxt, text_channel)
+                        rdj._track_start_time = time.monotonic()
+                        rdj._current_track_title = nxt.title
+                        rdj._songs_played.append(nxt.title)
+                        asyncio.create_task(_fill_radio_queue(rdj, guild_id))
+                        if text_channel:
+                            try:
+                                await text_channel.send(f"📻 **Now on air:** {nxt.title}")
+                            except Exception:
+                                pass
+                else:
+                    log.warning("[RADIO] Queue dry — triggering emergency fill")
+                    asyncio.create_task(_fill_radio_queue(rdj, guild_id))
+
+            if len(rdj._songs_played) > 50:
+                rdj._songs_played = rdj._songs_played[-30:]
+
+        except Exception as e:
+            log.error("[RADIO] Loop error (continuing): %s", e, exc_info=True)
+
+        await asyncio.sleep(3)
+
+
+async def start_radio(guild: discord.Guild,
+                       text_channel: Optional[discord.TextChannel] = None) -> str:
+    guild_id = str(guild.id)
+    vc = guild.voice_client
+    if not vc or not vc.is_connected():
+        return "❌ Not in a voice channel. Use /joinvc first."
+
+    dj = get_random_dj(guild_id)
+    if dj.is_active:
+        dj.active = False
+        dj.participants.clear()
+
+    rdj = get_radio_dj(guild_id)
+    if rdj.is_active:
+        return "\U0001f4fb Radio is already on air!"
+
+    if has_active_music(guild):
+        await stop_music(guild)
+
+    rdj.active = True
+    rdj._talk_counter = 0
+    rdj._songs_played.clear()
+    rdj._rec_cache.clear()
+    rdj._current_track_title = None
+
+    rdj._loop_task = asyncio.create_task(_radio_loop(guild, text_channel))
+    return "\U0001f4fb **Blood Radio is now on air!** Sit back and enjoy the vibes."
+
+
+async def stop_radio(guild_id: str) -> str:
+    rdj = get_radio_dj(guild_id)
+    if not rdj.is_active:
+        return "\U0001f4fb Radio isn't playing."
+    rdj.active = False
+    return "\U0001f4fb Radio signed off. Thanks for listening."
 
 
 # ── Text+VC Dual Reply Support ────────────────────────────────────────────────
@@ -1415,16 +2023,51 @@ class BloodAudioSink:
             return music_result
         try:
             from provider import call_ai
-            from config import CONFIG
-            system = (
-                "You are Blood, in a voice channel. RULES:\n"
-                "- MAX 1-2 sentences. You're speaking aloud, not typing.\n"
-                "- No markdown, no emojis, no formatting. Plain speech only.\n"
-                "- Be witty but brief. Don't explain jokes. Don't ramble.\n"
-                "- If someone asks to play music, just say 'on it' or 'sure' — the music system handles the rest.\n"
-                "- You still have all your normal tools and can use them.\n"
-                f"Speaker: {user_name}"
-            )
+            rdj = get_radio_dj(self.guild_id)
+            current = get_now_playing_track(self.bot.get_guild(int(self.guild_id)))
+            now_playing = current.title if current else "nothing"
+
+            if rdj.is_active:
+                local_hour = (datetime.now(timezone.utc).hour + 7) % 24
+                if 0 <= local_hour < 6:
+                    time_vibe = "deep into the night"
+                elif 6 <= local_hour < 12:
+                    time_vibe = "morning"
+                elif 12 <= local_hour < 17:
+                    time_vibe = "afternoon"
+                elif 17 <= local_hour < 21:
+                    time_vibe = "evening"
+                else:
+                    time_vibe = "late night"
+                system = (
+                    "You are Blood, a chill indie radio DJ hosting a live show in a voice channel.\n"
+                    "PERSONA:\n"
+                    "- Calm, smooth, laid-back. Like a late-night radio host.\n"
+                    "- Warm and genuine with your listeners. You know them.\n"
+                    "- You talk about music, the vibe, the weather, life, whatever comes up.\n"
+                    "- You engage with callers naturally — ask how their day was, react to what they say.\n"
+                    "- You're passionate about music and love sharing discoveries.\n"
+                    f"- Currently playing: {now_playing}\n"
+                    f"- Time: {time_vibe}\n"
+                    f"- Listener: {user_name}\n\n"
+                    "RULES:\n"
+                    "- MAX 2-3 sentences. You're on air, not writing an essay.\n"
+                    "- No markdown, no emojis, no formatting. Pure spoken word.\n"
+                    "- Stay in character as the radio DJ. Never break the radio vibe.\n"
+                    "- If they ask about a song, you know your music — talk about it.\n"
+                    "- If they request a song, say you'll see if it fits the set.\n"
+                )
+            else:
+                system = (
+                    "You are Blood, in a voice channel. RULES:\n"
+                    "- MAX 1-2 sentences. You're speaking aloud, not typing.\n"
+                    "- No markdown, no emojis, no formatting. Plain speech only.\n"
+                    "- Be witty but brief. Don't explain jokes. Don't ramble.\n"
+                    "- If someone asks to play music, just say 'on it' or 'sure' — the music system handles the rest.\n"
+                    "- You still have all your normal tools and can use them.\n"
+                    f"Speaker: {user_name}"
+                )
+
             context_msgs = []
             for entry in _convo_buffer.get(self.guild_id, [])[-10:]:
                 role = "assistant" if entry.get("user_name") == "Blood" else "user"
@@ -1479,12 +2122,17 @@ class BloodAudioSink:
             if buf.user_name == requester:
                 requester_id = str(uid)
                 break
-        if url_match:
+
+        rdj = get_radio_dj(self.guild_id)
+        is_radio = rdj.is_active
+
+        if url_match and not is_radio:
             result = await play_music(guild, url_match.group(1), requester, self.text_channel,
                                       requester_id=requester_id)
             return result
         _music_hints = {"play", "song", "music", "skip", "stop", "next", "like", "dislike",
                         "hate", "love", "sucks", "banger", "random", "queue", "playing",
+                        "request",
                         "เพลง", "เปิด", "ข้าม", "หยุด", "ชอบ", "ไม่ชอบ", "ห่วย", "เปลี่ยน", "เพราะ", "ดี"}
         lower = text.lower()
         might_be_music = has_music or any(w in lower for w in _music_hints)
@@ -1492,6 +2140,12 @@ class BloodAudioSink:
             return None
         intent_data = await self._classify_music_intent(text)
         intent = intent_data.get("intent", "none")
+
+        if is_radio:
+            return await self._handle_radio_music_intent(
+                intent, intent_data, current_track, requester, requester_id, guild
+            )
+
         if intent == "like" and current_track and requester_id:
             record_feedback(requester_id, current_track.title, positive=True)
             return f"Noted, you like {current_track.title}. I'll remember that."
@@ -1512,6 +2166,62 @@ class BloodAudioSink:
             if query:
                 return await play_music(guild, query, requester, self.text_channel,
                                         requester_id=requester_id)
+        return None
+
+    async def _handle_radio_music_intent(self, intent: str, intent_data: dict,
+                                          current_track, requester: str,
+                                          requester_id: Optional[str],
+                                          guild: discord.Guild) -> Optional[str]:
+        from provider import call_ai
+
+        if intent == "like" and current_track and requester_id:
+            record_feedback(requester_id, current_track.title, positive=True)
+            return None  # Let _generate_response handle it in radio persona
+        if intent == "dislike" and current_track and requester_id:
+            record_feedback(requester_id, current_track.title, positive=False)
+            await skip_music(guild)
+            return None
+        if intent == "skip":
+            await skip_music(guild)
+            return None
+        if intent == "stop":
+            await stop_radio(self.guild_id)
+            await stop_music(guild)
+            return "Alright, we're signing off. Thanks for tuning in."
+        if intent == "queue":
+            return None
+
+        if intent == "play":
+            query = intent_data.get("query", "")
+            if not query:
+                return None
+            try:
+                result = await call_ai(
+                    system=(
+                        "You are a chill indie radio DJ deciding if a listener's song request fits your set.\n"
+                        "The radio plays: indie, lo-fi, acoustic, dream pop, soft rock, jazz, chill vibes.\n"
+                        "Reply with ONLY one of:\n"
+                        "- ACCEPT — if the song fits the radio vibe (chill, indie, background-friendly)\n"
+                        "- ACCEPT — if you're not sure but it could work\n"
+                        "- REJECT — only if it's clearly wrong (heavy metal, hardcore rap, meme songs, etc.)\n"
+                    ),
+                    messages=[{"role": "user", "content": f"Listener requests: {query}"}],
+                    max_tokens=10,
+                )
+                decision = result.get("message", {}).get("content", "ACCEPT").strip().upper()
+            except Exception:
+                decision = "ACCEPT"
+
+            if "ACCEPT" in decision:
+                mq = get_music_queue(self.guild_id)
+                track = await extract_track(query, f"{requester} (request)")
+                if track:
+                    mq.queue.insert(0, track)
+                    return None  # Let _generate_response acknowledge in radio persona
+                return None
+            else:
+                return None  # Let _generate_response politely decline in radio persona
+
         return None
 
     async def _speak(self, text: str):
@@ -1621,11 +2331,19 @@ async def join_and_listen(guild: discord.Guild, vc_channel: discord.VoiceChannel
     def callback(user, data: voice_recv.VoiceData):
         sink.on_voice_data(user, data.pcm)
     try:
+        # Stop any existing listener first — prevents "Already receiving audio" on rejoin
+        if hasattr(voice_client, 'is_listening') and voice_client.is_listening():
+            voice_client.stop_listening()
         voice_client.listen(voice_recv.BasicSink(callback))
         log.info("[VC] Listener started on '%s' (voice_recv.BasicSink)", vc_channel.name)
     except Exception as e:
-        log.error("[VC] Failed to start listener: %s", e)
-        return f"❌ Failed to start listening: {e}"
+        err = str(e).lower()
+        if "already receiving" in err or "already listening" in err:
+            # Library reconnected and listener is already active — that's fine
+            log.info("[VC] Listener already running on '%s' — continuing", vc_channel.name)
+        else:
+            log.error("[VC] Failed to start listener: %s", e)
+            return f"❌ Failed to start listening: {e}"
     sink.start_processing()
     try:
         import web_mixer as wm
@@ -1658,6 +2376,9 @@ async def leave_voice(guild: discord.Guild) -> str:
     if dj.is_active:
         dj.active = False
         dj.participants.clear()
+    rdj = get_radio_dj(guild_id)
+    if rdj.is_active:
+        rdj.active = False
     mq = get_music_queue(guild_id)
     mq.cleanup_mixer()
     mq.clear()

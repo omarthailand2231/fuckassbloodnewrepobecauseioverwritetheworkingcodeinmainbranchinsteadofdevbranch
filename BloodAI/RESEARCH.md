@@ -16,12 +16,13 @@ Discord AudioPlayer thread
     └── calls mixer.read() every 20ms
          ├── pops 1 frame from music_buf (deque)
          ├── pops 1 frame from tts_buf (deque)
+         ├── steps _effective_vol toward target (smooth fade)
          ├── mixes PCM samples (clamp to int16)
          └── returns 3840 bytes (20ms @ 48kHz stereo 16-bit)
 
 Music reader thread
     └── reads FFmpeg stdout → appends to music_buf
-    └── back-pressure: sleeps when buf > 50 frames
+    └── back-pressure: sleeps when buf > 250 frames
 
 TTS reader thread
     └── reads FFmpeg stdout → appends to tts_buf
@@ -32,7 +33,7 @@ TTS reader thread
 - Frame size: 3840 bytes (20ms @ 48kHz, stereo, 16-bit)
 - 1920 samples per frame
 - Duck volume: 0.15 (music drops to 15% when TTS active)
-- Back-pressure threshold: 50 frames (~1 second)
+- Back-pressure threshold: 250 frames (~5 seconds)
 
 **Gotchas**:
 - Don't use `deque(maxlen=N)` for the music buffer — it silently drops oldest frames, causing chipmunk/speedup effect. Use manual back-pressure in the reader thread instead.
@@ -42,7 +43,44 @@ TTS reader thread
 
 ---
 
-## 2. Voice Receive + STT Pipeline
+## 2. Smooth Audio Fades (Duck / Unduck / Song Fade-in)
+
+**Problem**: Instant volume jumps when music ducks for TTS or when a new song starts sound jarring and cheap. Real radio/broadcast always fades.
+
+**Solution**: Track `_effective_vol` in the mixer and interpolate it toward the target every `read()` call (every 20ms).
+
+**Implementation** (`mixer.py`):
+```python
+# Per read() call (20ms frame):
+target_vol = _duck_vol if ducking else _music_vol
+
+# Pre-fade: start unduck while TTS is still finishing
+if ducking and 0 < len(tts_buf) <= _PRE_FADE_FRAMES:
+    target_vol = _music_vol  # override — music rises before last word ends
+
+if _effective_vol < target_vol:
+    _effective_vol = min(target_vol, _effective_vol + _UNDUCK_RATE)
+elif _effective_vol > target_vol:
+    _effective_vol = max(target_vol, _effective_vol - _DUCK_RATE)
+```
+
+**Fade constants**:
+```
+_DUCK_RATE        = 0.030   # 0.8→0.15 in ~22 frames ≈ 0.4s  (fast — voice is prominent)
+_UNDUCK_RATE      = 0.018   # 0.15→0.8 in ~36 frames ≈ 0.7s  (slow — music eases back)
+_SONG_FADEIN_RATE = 0.025   # 0→0.8 in ~32 frames ≈ 0.5s     (new track fade-in)
+_PRE_FADE_FRAMES  = 25      # ~500ms before TTS buffer empties  (early unduck start)
+```
+
+**Song fade-in**: `_effective_vol` is reset to `0.0` in `start_music()`. Every new track fades in from silence. No abrupt starts.
+
+**Pre-fade crossover**: When the TTS buffer has ≤25 frames (~500ms) remaining, `target_vol` flips back to `_music_vol` even while TTS is still active. Music and voice overlap briefly at the end, creating a natural crossover feel instead of an abrupt unmute.
+
+**Broadcast audio principle**: Fade-down faster than fade-up. The voice should appear instantly prominent; the music should ease back in gently. `_DUCK_RATE > _UNDUCK_RATE` encodes this.
+
+---
+
+## 3. Voice Receive + STT Pipeline
 
 **Problem**: Getting reliable speech-to-text from Discord voice is hard. Audio comes in per-user 20ms PCM chunks via `discord-ext-voice-recv`. You need to buffer, detect silence, and batch-send to an STT API.
 
@@ -74,7 +112,7 @@ _process_loop (async, runs every 0.5s)
 
 ---
 
-## 3. AI Music Recommendations (Spotify-like)
+## 4. AI Music Recommendations (Spotify-like)
 
 **Problem**: Template-based YouTube searches ("songs similar to X") just return the same song. Users hear the same 3 tracks on loop.
 
@@ -92,7 +130,6 @@ _process_loop (async, runs every 0.5s)
 
 **Parsing pitfall**: The AI sometimes outputs reasoning ("Actually, looking at...") mixed with song names. Filter with:
 ```python
-# Reject lines that look like AI reasoning
 bad_words = ("actually", "maybe", "could be", "let me", "i think", "note:", "here")
 if any(w in line.lower() for w in bad_words):
     skip
@@ -106,7 +143,7 @@ if any(w in line.lower() for w in bad_words):
 
 ---
 
-## 4. AI Intent Classification vs Keywords
+## 5. AI Intent Classification vs Keywords
 
 **Problem**: Keyword matching for music commands is brittle. "skip" works but "nah change it" doesn't.
 
@@ -125,7 +162,7 @@ like, dislike, skip, stop, random, queue, play:QUERY, none
 
 ---
 
-## 5. Discord Gateway Heartbeat + Event Loop Health
+## 6. Discord Gateway Heartbeat + Event Loop Health
 
 **Problem**: `"Shard has stopped responding to the gateway. Closing and restarting."` — Discord kills the bot's connection if heartbeats are missed.
 
@@ -140,7 +177,7 @@ like, dislike, skip, stop, random, queue, play:QUERY, none
 
 ---
 
-## 6. Multi-User DJ Priority Rotation
+## 7. Multi-User DJ Priority Rotation
 
 **Design**: When multiple users join `/randommusic`, the first user (priority) gets more songs.
 
@@ -155,7 +192,7 @@ N users: priority gets N songs, everyone else gets 1, then cycle
 
 ---
 
-## 7. Memory Architecture (No External DB)
+## 8. Memory Architecture (No External DB)
 
 **Design choice**: All memory is file-based. No Redis, no PostgreSQL, no MongoDB. This means:
 - Zero infrastructure — just `git clone` and run
@@ -175,7 +212,7 @@ N users: priority gets N songs, everyone else gets 1, then cycle
 
 ---
 
-## 8. Provider Fallback Chain
+## 9. Provider Fallback Chain
 
 **Problem**: AI APIs go down. A lot. If your bot depends on one API, it dies when that API dies.
 
@@ -193,7 +230,7 @@ The fallback is transparent — Blood doesn't know which model answered. Respons
 
 ---
 
-## 9. Agentic Tool-Call Loop
+## 10. Agentic Tool-Call Loop
 
 **Design**: Blood doesn't just respond — it uses tools in a loop until satisfied.
 
@@ -215,7 +252,7 @@ User message → AI response
 
 ---
 
-## 10. Voice Data Flow (Complete)
+## 11. Voice Data Flow (Complete)
 
 ```
 User speaks in Discord VC
@@ -248,14 +285,14 @@ Edge-TTS → MP3 bytes
     │
     ▼
 If music playing:
-    └── mixer.feed_tts_sync(mp3_data) → mixes with music
+    └── mixer.feed_tts_sync(mp3_data) → fades music down, mixes TTS, fades back up
 If no music:
     └── vc.play(FFmpegSource) → plays directly
 ```
 
 ---
 
-## 11. Spotify Mood-Based DJ System
+## 12. Spotify Mood-Based DJ System
 
 **Problem**: AI-only recommendations plateau fast — the LLM suggests the same artists repeatedly and has no understanding of audio characteristics.
 
@@ -288,7 +325,7 @@ If no music:
 
 ---
 
-## 12. yt-dlp Age-Restricted Fallback
+## 13. yt-dlp Age-Restricted Fallback
 
 **Problem**: YouTube age-restricts random music videos. `yt-dlp` fails with "Sign in to confirm your age" — kills the entire search.
 
@@ -312,7 +349,7 @@ If ALL 5 YouTube entries fail:
 
 ---
 
-## 13. Reliable Music Skip (stop_music)
+## 14. Reliable Music Skip (stop_music)
 
 **Problem**: `skip_music` said "Skipped" but the old song kept playing. The FFmpeg process was killed but audio frames were still in the buffer.
 
@@ -321,25 +358,20 @@ If ALL 5 YouTube entries fail:
 **Fix** (order matters):
 ```python
 def stop_music(self):
-    self._music_stopping = True      # 1. Signal reader thread to stop
+    self._stop_event.set()         # 1. Signal reader thread to stop
     self._has_music = False
-    self._music_buf.clear()           # 2. Clear buffer FIRST (read() returns silence immediately)
-    proc.stdout.close()               # 3. Close stdout (unblocks reader's .read())
-    proc.kill()                       # 4. Kill FFmpeg
-    thread.join(timeout=2)            # 5. Wait for reader thread
-    self._music_buf.clear()           # 6. Clear AGAIN (catch frames written between 2-5)
+    self._music_buf.clear()        # 2. Clear buffer FIRST (read() returns silence immediately)
+    proc.stdout.close()            # 3. Close stdout (unblocks reader's .read())
+    proc.kill()                    # 4. Kill FFmpeg
+    thread.join(timeout=2)         # 5. Wait for reader thread
+    self._music_buf.clear()        # 6. Clear AGAIN (catch frames written between 2-5)
 ```
 
-**Also**: When a track ends naturally, the reader thread must wait for the buffer to drain before firing `on_music_end`. Otherwise the last ~5 seconds of every song gets cut off:
-```python
-# In reader thread finally block:
-while self._music_buf and not self._music_stopping:
-    time.sleep(0.05)  # wait for Discord's read() to consume remaining frames
-```
+**Also**: When a track ends naturally, the reader thread must wait for the buffer to drain before firing `on_music_end`. Otherwise the last ~5 seconds of every song gets cut off.
 
 ---
 
-## 14. Tool Permission Architecture
+## 15. Tool Permission Architecture
 
 **Problem**: Regular users couldn't use music via `@blood play X` even though slash commands worked. Blood would say "I can't do that" and tell them to use `/play`.
 
@@ -358,4 +390,216 @@ Music tools weren't listed → only owner got them → AI literally couldn't see
 
 **Lesson**: The default-to-owner pattern is safe (least privilege) but means new tools are invisible until explicitly granted. Always add new tools to `tool_permissions` when creating them.
 
-**Prompt reinforcement**: Even with tools available, the AI may still choose not to use them. Adding a `MUSIC:` section to the system prompt ("ALWAYS use the tool, never say do it yourself") was necessary to get reliable tool usage.
+---
+
+## 16. Gapless Audio Prebuffering
+
+**Problem**: When one song ends and the next starts, there's a 1–3 second silence gap. FFmpeg needs time to connect, start decoding, and fill the buffer.
+
+**Solution**: Start FFmpeg for the next track in a background thread while the current one is still playing. Buffer ~5 seconds of PCM, then hand off both the buffered frames AND the running FFmpeg process when the transition happens.
+
+**Architecture** (`mixer.py`):
+```
+Current track playing
+    │
+    ▼
+prebuffer_next(next_url)
+    └── Background thread starts FFmpeg
+    └── Reads up to 250 frames (~5s) into _prebuf deque
+    └── Keeps FFmpeg process alive, sets _prebuf_ready event
+
+Track ends → start_music(next_url)
+    ├── Detects _prebuf_url matches → gapless path
+    ├── Dumps prebuf frames into music_buf (instant)
+    ├── Hands FFmpeg proc to reader thread (continues reading)
+    └── Zero gap — music_buf was never empty
+```
+
+**Key details**:
+- The FFmpeg process is NOT killed — it's transferred from the prefetch thread to the main reader thread
+- If the prebuffered URL doesn't match (user skipped, etc.), the prebuffer is cancelled and a fresh FFmpeg starts
+- `_prebuf_ready` event prevents `start_music()` from using a half-filled prebuffer
+
+---
+
+## 17. Radio DJ: Parallel Queue Preloading
+
+**Problem**: Old radio system pre-queued one song at a time at the 50% mark. Short songs ended before the next song was extracted (yt-dlp takes 5–30s). Queue went empty → music stopped.
+
+**Solution**: Always maintain `RADIO_QUEUE_TARGET = 3` songs in the queue. Fetch them in **parallel** using `asyncio.gather()`.
+
+**Startup**:
+```python
+# Get 4 queries (1 to play now + 3 to queue)
+queries = [await _get_radio_song(rdj) for _ in range(RADIO_QUEUE_TARGET + 1)]
+
+# Extract all 4 in parallel — total time = slowest single extraction, not sum
+results = await asyncio.gather(*[extract_track(q) for q in queries])
+
+tracks = [r for r in results if r and not isinstance(r, Exception)]
+first_track = tracks[0]
+for t in tracks[1:]:
+    mq.add(t)  # Queue the rest immediately
+```
+
+**Continuous refill** (`_fill_radio_queue()`):
+- Called after every track change and every gapless transition
+- Acquires `rdj._fill_lock` (asyncio.Lock) to prevent concurrent over-fills
+- Calculates `needed = RADIO_QUEUE_TARGET - len(mq.queue)`
+- Gets N queries sequentially (fast, just pops from `rdj._rec_cache`)
+- Extracts N tracks in parallel
+- Prebuffers `mq.queue[0]` after fill
+
+**Critical edge case — frozen queue**: After refill adds songs but music isn't playing (e.g. a `/play` interrupted the queue), `_radio_loop` must detect this:
+```python
+if not current and not has_active_music(guild):
+    if mq.queue:
+        # Songs ready but nothing playing — restart
+        nxt = mq.next()
+        await play_track(guild, nxt, text_channel)
+    else:
+        asyncio.create_task(_fill_radio_queue(rdj, guild_id))
+```
+The `not mq.queue` condition alone is wrong — after fill completes, the queue is no longer empty but nobody started playing.
+
+---
+
+## 18. Auto-Rejoin Debouncing (4006 Reconnect Storm)
+
+**Problem**: Discord close code 4006 ("session no longer valid") causes a rapid connect/disconnect cycle. Each disconnect fires `on_voice_state_update`, which triggers our auto-rejoin code. Without deduplication, 3+ concurrent rejoin attempts race against each other and each other's sessions. Each successful connect invalidates the others → more 4006s → infinite loop. Multiple radio loops get spawned simultaneously.
+
+**Root cause sequence**:
+1. Bot disconnected (code 4014 — forced kick)
+2. Library starts 4006 reconnect cycle
+3. Each library disconnect fires `on_voice_state_update(before=channel, after=None)`
+4. Our code fires auto-rejoin for each event → N concurrent rejoin coroutines
+5. Each creates a new voice session → invalidates all others → more 4006s
+6. Each successful rejoin sees `rdj.is_active=True` → spawns new `_radio_loop` task
+7. 2–3 radio loops running simultaneously
+
+**Fix 1 — Debounce with a set**:
+```python
+_rejoining_guilds: set[str] = set()
+
+async def on_voice_state_update(member, before, after):
+    if member.id == bot.user.id:
+        if before.channel and not after.channel:
+            if guild_id in _rejoining_guilds:
+                return  # Already in progress
+            _rejoining_guilds.add(guild_id)
+            try:
+                await asyncio.sleep(3)
+                result = await join_and_listen(...)
+                # restart loops only if their task is done
+            finally:
+                _rejoining_guilds.discard(guild_id)
+```
+
+**Fix 2 — Task-based loop restart**:
+```python
+# Old (broken): starts duplicate if any condition is met
+if rdj.is_active and not (mq._mixer and mq._mixer.has_music):
+    asyncio.create_task(_radio_loop(...))
+
+# New (correct): only restart if the task actually died
+if rdj.is_active and (rdj._loop_task is None or rdj._loop_task.done()):
+    rdj._loop_task = asyncio.create_task(_radio_loop(...))
+```
+
+Store `_loop_task` in both `RadioDJ` and `RandomDJ`. Set it in `start_radio()` and `start_random_music()`.
+
+**Fix 3 — Handle "Already receiving audio"**:
+When the library reconnects before our 3-second sleep fires, the voice client already has a listener. `voice_client.listen()` throws "Already receiving audio". This used to abort the rejoin and skip the loop restart check.
+
+```python
+try:
+    if hasattr(vc, 'is_listening') and vc.is_listening():
+        vc.stop_listening()
+    vc.listen(voice_recv.BasicSink(callback))
+except Exception as e:
+    if "already receiving" in str(e).lower():
+        pass  # Library reconnected first — listener is fine
+    else:
+        raise
+```
+
+---
+
+## 19. TTS Drain Timeout + Stuck Ducking Fix
+
+**Problem (original)**: `feed_tts_sync()` drain loop had no exit — if Discord's AudioPlayer stopped calling `read()`, TTS frames were never consumed, `_tts_active` stayed True, music was stuck at 15% volume permanently.
+
+**Problem (newer)**: Even with the 15-second timeout, a disconnect during TTS could jump past the drain loop via an exception, leaving `_tts_active = True` since the assignment was after the try/except.
+
+**Fix**: Use `try/finally` to guarantee cleanup:
+```python
+def feed_tts_sync(self, mp3_data):
+    with self._tts_lock:
+        self._tts_active = True
+        try:
+            # FFmpeg conversion into tts_buf
+            ...
+        except Exception as e:
+            log.warning("TTS feed error: %s", e)
+            self._tts_buf.clear()  # Don't drain what we couldn't fill
+
+        try:
+            drain_start = time.monotonic()
+            while self._tts_buf:
+                time.sleep(0.02)
+                if time.monotonic() - drain_start > 15:
+                    self._tts_buf.clear()
+                    break
+                if time.monotonic() - self._last_read_time > 1.0:
+                    self._tts_buf.clear()  # AudioPlayer stopped
+                    break
+            time.sleep(0.1)
+        finally:
+            self._tts_buf.clear()   # Guarantee no leftover frames
+            self._tts_active = False  # Guarantee duck is always released
+```
+
+**Why the double clear**: The `finally` clear ensures no orphaned frames can re-trigger ducking on the next TTS call if somehow the drain didn't finish.
+
+---
+
+## 20. Radio Queue + User /play Interaction
+
+**Problem**: If a user calls `/play` while `/radio` is active, the user's song gets added to `mq.queue`. This interacts with `_fill_radio_queue()`'s `needed = RADIO_QUEUE_TARGET - len(mq.queue)` calculation — the user song inflates the count and delays radio refills.
+
+**Bigger problem**: If the user's `/play` call triggers `play_track()` directly (because `has_active_music()` was False at that moment, e.g. during a queue-empty transition), a new mixer is created. `_play_next()` fires when that song ends. It calls `_fill_radio_queue()` in the background. The fill adds songs, but `_play_next()` already returned — nobody calls `play_track()` on the newly queued songs. They sit frozen.
+
+**Why the naïve "queue-dry" check fails**:
+```python
+# This never fires after fill completes:
+if not current and not has_active_music(guild) and not mq.queue:
+    # mq.queue is NOT empty — fill ran and added songs
+    # So this condition is always False
+    # Songs sit in queue forever
+```
+
+**Fix**: Split the "not playing" check from the "queue empty" check:
+```python
+if not current and not has_active_music(guild):
+    if mq.queue:
+        # Songs ready but nothing playing — restart playback
+        nxt = mq.next()
+        await play_track(guild, nxt, text_channel)
+        asyncio.create_task(_fill_radio_queue(rdj, guild_id))
+    else:
+        # Queue truly empty — trigger fill
+        asyncio.create_task(_fill_radio_queue(rdj, guild_id))
+```
+
+The `_radio_loop` polls every 3 seconds, so worst-case the frozen songs sit for 3s before this branch detects and restarts.
+
+**Also**: When `_play_next()` detects radio is active but queue is empty, stop the mixer cleanly so `has_active_music()` returns False — this lets the loop's "not playing" branch fire correctly:
+```python
+if rdj.is_active and not mq.queue:
+    mq.current = None
+    if mq._mixer:
+        mq._mixer.stop_music()
+        mq._mixer = None
+    asyncio.create_task(_fill_radio_queue(rdj, guild_id))
+    return
+```

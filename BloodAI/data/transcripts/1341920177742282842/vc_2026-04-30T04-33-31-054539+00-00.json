@@ -1,0 +1,28 @@
+{
+  "channel_name": "𝗟𝗼𝘂𝗻𝗴𝗲",
+  "joined_at": "2026-04-30T04:33:31.054539+00:00",
+  "left_at": "2026-04-30T04:34:42.080567+00:00",
+  "transcript": [
+    {
+      "timestamp": "2026-04-30T04:33:46.829765+00:00",
+      "user_id": 726942906199310376,
+      "user_name": "Enforcer •  Penguin",
+      "text": "[left voice channel]",
+      "channel_name": "𝗟𝗼𝘂𝗻𝗴𝗲"
+    },
+    {
+      "timestamp": "2026-04-30T04:34:01.782661+00:00",
+      "user_id": 1421582461556625509,
+      "user_name": "SMA • Vinny",
+      "text": "[left voice channel]",
+      "channel_name": "𝗟𝗼𝘂𝗻𝗴𝗲"
+    },
+    {
+      "timestamp": "2026-04-30T04:34:06.800756+00:00",
+      "user_id": 1421582461556625509,
+      "user_name": "SMA • Vinny",
+      "text": "[joined voice channel]",
+      "channel_name": "𝗟𝗼𝘂𝗻𝗴𝗲"
+    }
+  ]
+}

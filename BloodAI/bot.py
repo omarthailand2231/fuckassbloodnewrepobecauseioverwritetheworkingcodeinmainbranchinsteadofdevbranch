@@ -2920,30 +2920,41 @@ if bot:
         except ImportError:
             await ctx.reply("Voice module not available.")
 
+    # TODO: /randommusic disabled — needs proper recommendation algorithm
+    #       (mood detection, taste profiling, like/dislike weighting, discovery mix)
+    #       Currently just echoes liked songs back. Re-enable after rework.
+
     @bot.hybrid_command(name="randommusic", aliases=["rdj", "djme"], description="Start random music DJ based on your taste")
     async def randommusic_cmd(ctx):
+        await ctx.reply("🔧 Random DJ is being reworked — use `/radio` for now!")
+
+    @bot.hybrid_command(name="stopdj", description="Leave the random music DJ rotation")
+    async def stopdj_cmd(ctx):
+        await ctx.reply("🔧 Random DJ is being reworked — use `/stopradio` for now!")
+
+    @bot.hybrid_command(name="radio", description="Start Blood Radio — chill indie/background music with a DJ host")
+    async def radio_cmd(ctx):
         try:
-            from voice import start_random_music, join_and_listen
+            from voice import start_radio, join_and_listen
         except ImportError:
             await ctx.reply("Voice module not available.")
             return
-        # Auto-join user's VC if not connected
         if not ctx.guild.voice_client:
             if ctx.author.voice and ctx.author.voice.channel:
                 await join_and_listen(ctx.guild, ctx.author.voice.channel, ctx.channel, bot)
             else:
                 await ctx.reply("Join a voice channel first.")
                 return
-        result = await start_random_music(
-            ctx.guild, str(ctx.author.id), ctx.author.display_name, ctx.channel
-        )
+        result = await start_radio(ctx.guild, ctx.channel)
         await ctx.reply(result)
 
-    @bot.hybrid_command(name="stopdj", description="Leave the random music DJ rotation")
-    async def stopdj_cmd(ctx):
+    @bot.hybrid_command(name="stopradio", description="Turn off Blood Radio")
+    async def stopradio_cmd(ctx):
         try:
-            from voice import stop_random_music
-            result = await stop_random_music(str(ctx.guild.id), str(ctx.author.id))
+            from voice import stop_radio, stop_music
+            result = await stop_radio(str(ctx.guild.id))
+            if "signed off" in result:
+                await stop_music(ctx.guild)
             await ctx.reply(result)
         except ImportError:
             await ctx.reply("Voice module not available.")
@@ -2997,6 +3008,8 @@ if bot:
 
     # ── Voice State Tracking ──────────────────────────────────────────────
 
+    _rejoining_guilds: set[str] = set()
+
     @bot.event
     async def on_voice_state_update(member, before, after):
         """Track VC joins/leaves for transcript and activity monitoring."""
@@ -3011,27 +3024,43 @@ if bot:
                 if guild_id in _intentional_leave:
                     log.info("Intentional leave from VC '%s' — skipping auto-rejoin", before.channel.name)
                     return
-                log.warning("Blood was disconnected from VC '%s' — attempting auto-rejoin", before.channel.name)
-                await asyncio.sleep(3)  # Wait for connection to stabilize
-                # Re-check: might have been marked intentional during the sleep
-                if guild_id in _intentional_leave:
-                    log.info("Leave became intentional during wait — skipping auto-rejoin")
+                # Debounce: only one rejoin attempt per guild at a time.
+                # The library fires this event for every disconnect in a 4006 storm,
+                # which would spawn concurrent rejoin loops without this guard.
+                if guild_id in _rejoining_guilds:
                     return
+                _rejoining_guilds.add(guild_id)
+                log.warning("Blood was disconnected from VC '%s' — attempting auto-rejoin", before.channel.name)
                 try:
-                    from voice import get_active_sink, get_music_queue, get_random_dj, join_and_listen
+                    await asyncio.sleep(3)  # Wait for connection to stabilize
+                    # Re-check: might have been marked intentional during the sleep
+                    if guild_id in _intentional_leave:
+                        log.info("Leave became intentional during wait — skipping auto-rejoin")
+                        return
+                    from voice import get_active_sink, get_music_queue, get_random_dj, get_radio_dj, join_and_listen
                     sink = get_active_sink(guild_id)
                     tc = sink.text_channel if sink else None
                     result = await join_and_listen(guild, before.channel, tc, bot)
                     log.info("Auto-rejoin result: %s", result[:80])
-                    # Resume DJ if it was active
-                    dj = get_random_dj(guild_id)
                     mq = get_music_queue(guild_id)
-                    if dj.is_active and not (mq._mixer and mq._mixer.has_music):
+                    # Resume DJ loop only if it isn't already running
+                    dj = get_random_dj(guild_id)
+                    if dj.is_active and (dj._loop_task is None or dj._loop_task.done()):
                         from voice import _dj_loop
-                        asyncio.create_task(_dj_loop(guild, tc))
+                        dj._loop_task = asyncio.create_task(_dj_loop(guild, tc))
                         log.info("Restarted DJ loop after auto-rejoin")
+                    # Resume Radio loop only if it isn't already running
+                    rdj = get_radio_dj(guild_id)
+                    if rdj.is_active and (rdj._loop_task is None or rdj._loop_task.done()):
+                        from voice import _radio_loop
+                        rdj._loop_task = asyncio.create_task(_radio_loop(guild, tc))
+                        log.info("Restarted Radio loop after auto-rejoin")
+                    elif rdj.is_active:
+                        log.info("Radio loop still alive after rejoin — not restarting")
                 except Exception as e:
                     log.warning("Auto-rejoin failed: %s", e)
+                finally:
+                    _rejoining_guilds.discard(guild_id)
             return  # Don't track bot's own state changes
 
         if member.bot:
