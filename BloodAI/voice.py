@@ -17,6 +17,14 @@ import discord
 
 log = logging.getLogger("blood.voice")
 
+# Ensure opus is loaded — required for voice_recv to decode incoming audio
+if not discord.opus.is_loaded():
+    try:
+        discord.opus._load_default()
+        log.info("Opus loaded: %s", discord.opus.is_loaded())
+    except Exception as e:
+        log.warning("Failed to load opus: %s — voice receive won't work", e)
+
 _stt_session: Optional[aiohttp.ClientSession] = None
 
 def _get_stt_session() -> aiohttp.ClientSession:
@@ -30,7 +38,8 @@ def _get_stt_session() -> aiohttp.ClientSession:
 
 logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.CRITICAL)
 logging.getLogger("discord.ext.voice_recv.router").setLevel(logging.CRITICAL)
-logging.getLogger("discord.ext.voice_recv.reader").setLevel(logging.CRITICAL)
+# Reader at ERROR to catch CryptoError / decryption failures (not DEBUG to avoid spam)
+logging.getLogger("discord.ext.voice_recv.reader").setLevel(logging.ERROR)
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -139,18 +148,26 @@ def get_music_queue(guild_id: str) -> MusicQueue:
     return _music_queues[guild_id]
 
 
-def _bind_web_mixer_guild(guild_id: Optional[str]):
+def _bind_web_mixer_guild(guild_id: Optional[str], guild_name: Optional[str] = None):
     try:
         import web_mixer as wm
-        wm.bind_guild(guild_id)
+        wm.bind_guild(guild_id, name=guild_name)
     except Exception:
         pass
 
 
-def _update_web_mixer(**kwargs):
+def _unbind_web_mixer_guild(guild_id: str):
     try:
         import web_mixer as wm
-        wm.update_state(**kwargs)
+        wm.unbind_guild(guild_id)
+    except Exception:
+        pass
+
+
+def _update_web_mixer(guild_id: Optional[str] = None, **kwargs):
+    try:
+        import web_mixer as wm
+        wm.update_state(guild_id=guild_id, **kwargs)
     except Exception:
         pass
 
@@ -217,20 +234,34 @@ def _sync_web_mixer_music(guild: Optional[discord.Guild]):
     if not guild:
         return
     guild_id = str(guild.id)
-    _bind_web_mixer_guild(guild_id)
+    _bind_web_mixer_guild(guild_id, guild_name=guild.name)
     mq = get_music_queue(guild_id)
     mixer = mq._mixer
     current = get_now_playing_track(guild)
     music_active = current is not None
     force_duck = bool(mixer.force_duck) if mixer else False
     ducked = bool(mixer and mixer.has_music and mixer.is_ducking)
+    rdj = get_radio_dj(guild_id)
+    queue_titles = [t.title for t in mq.queue[:20]]
+    effects = None
+    if mixer:
+        effects = {"speed": mixer._speed, "bass_db": mixer._bass_db,
+                   "treble_db": mixer._treble_db, "effect": mixer._effect}
+    vc = guild.voice_client
+    paused = bool(vc and vc.is_paused()) if vc else False
     _update_web_mixer(
+        guild_id,
         music_active=music_active,
         music_title=current.title if current else "",
         music_level=mq.volume if music_active else 0.0,
         music_volume=mq.volume,
         ducked=ducked,
         force_duck=force_duck,
+        queue=queue_titles,
+        loop=mq.loop,
+        paused=paused,
+        radio_active=rdj.is_active,
+        effects=effects,
     )
 
 
@@ -243,11 +274,38 @@ def _sync_web_mixer_tts(guild: Optional[discord.Guild], *, active: bool, text: s
     ducked = bool(mixer and mixer.has_music and mixer.is_ducking)
     force_duck = bool(mixer.force_duck) if mixer else False
     _update_web_mixer(
+        guild_id,
         tts_active=active,
         tts_text=text,
         tts_level=level,
         ducked=ducked,
         force_duck=force_duck,
+    )
+
+
+def _periodic_web_mixer_sync(guild: Optional[discord.Guild]):
+    """Push the mixer's actual ducking/tts state to the web UI.
+
+    Called every few seconds from the radio loop so that even if a point-in-time
+    push was missed (exception, race, network blip), the web UI self-heals.
+    """
+    if not guild:
+        return
+    guild_id = str(guild.id)
+    mq = get_music_queue(guild_id)
+    mixer = mq._mixer
+    if not mixer:
+        _update_web_mixer(guild_id, ducked=False, force_duck=False, tts_active=False, tts_text="", tts_level=0.0)
+        return
+    ducked = bool(mixer.has_music and mixer.is_ducking)
+    force_duck = bool(mixer.force_duck)
+    tts_active = bool(mixer.tts_active)
+    _update_web_mixer(
+        guild_id,
+        ducked=ducked,
+        force_duck=force_duck,
+        tts_active=tts_active,
+        tts_level=1.0 if tts_active else 0.0,
     )
 
 
@@ -522,13 +580,24 @@ async def skip_music(guild: discord.Guild) -> str:
     if not mq.current and (not mq._mixer or not mq._mixer.has_music):
         return "Nothing is playing."
     old_title = mq.current.title if mq.current else "track"
-    if mq._mixer:
-        mq._mixer.stop_music()
     nxt = mq.skip()
     if nxt:
-        await play_track(guild, nxt)
+        mixer = mq._mixer
+        vc = guild.voice_client
+        if mixer and (mixer.has_music or _voice_client_has_mixer(vc, mixer)):
+            mq.current = nxt
+            async def _on_end():
+                await _play_next(guild, None)
+            mixer.crossfade_to(nxt.stream_url, volume=mq.volume, on_end=_on_end)
+            if mq.queue and mixer:
+                mixer.prebuffer_next(mq.queue[0].stream_url)
+            _sync_web_mixer_music(guild)
+        else:
+            await play_track(guild, nxt)
     else:
         mq.current = None
+        if mq._mixer:
+            mq._mixer.stop_music()
         dj = get_random_dj(guild_id)
         if dj.is_active:
             log.info("Skip '%s' with active DJ — DJ loop will queue next", old_title)
@@ -540,6 +609,65 @@ async def skip_music(guild: discord.Guild) -> str:
         _sync_web_mixer_music(guild)
     log.info("Skipped '%s'", old_title)
     return "⏭️ Skipped."
+
+
+def set_audio_effect(guild_id: str, effect: str) -> str:
+    from mixer import EFFECTS
+    mq = get_music_queue(guild_id)
+    if not mq._mixer:
+        return "❌ Nothing is playing."
+    if effect not in EFFECTS:
+        names = ", ".join(f"`{n}`" for n in EFFECTS if n != "none")
+        return f"❌ Unknown effect. Available: {names}"
+    mq._mixer.set_effect(effect)
+    if effect == "none":
+        return "🎛️ Effects cleared."
+    return f"🎛️ Effect set to **{effect}**. Takes effect on next song or `/skip`."
+
+
+def set_audio_speed(guild_id: str, speed: float) -> str:
+    mq = get_music_queue(guild_id)
+    if not mq._mixer:
+        return "❌ Nothing is playing."
+    mq._mixer.set_speed(speed)
+    return f"🎛️ Speed set to **{speed:.2f}x**. Takes effect on next song or `/skip`."
+
+
+def set_bass_boost(guild_id: str, db: int) -> str:
+    mq = get_music_queue(guild_id)
+    if not mq._mixer:
+        return "❌ Nothing is playing."
+    mq._mixer.set_bass_boost(db)
+    if db == 0:
+        return "🎛️ Bass boost off."
+    return f"🎛️ Bass boost set to **+{db} dB**. Takes effect on next song or `/skip`."
+
+
+def get_effects_info(guild_id: str) -> str:
+    mq = get_music_queue(guild_id)
+    if not mq._mixer:
+        return "No mixer active."
+    info = mq._mixer.get_effects_info()
+    lines = []
+    if info["effect"] != "none":
+        lines.append(f"Effect: **{info['effect']}**")
+    if info["speed"] != 1.0:
+        lines.append(f"Speed: **{info['speed']:.2f}x**")
+    if info["bass_db"]:
+        lines.append(f"Bass: **+{info['bass_db']} dB**")
+    if info["treble_db"]:
+        lines.append(f"Treble: **+{info['treble_db']} dB**")
+    if not lines:
+        return "🎛️ No effects active."
+    return "🎛️ " + " | ".join(lines)
+
+
+def clear_audio_effects(guild_id: str) -> str:
+    mq = get_music_queue(guild_id)
+    if not mq._mixer:
+        return "❌ Nothing is playing."
+    mq._mixer.clear_effects()
+    return "🎛️ All effects cleared. Takes effect on next song or `/skip`."
 
 
 async def stop_music(guild: discord.Guild) -> str:
@@ -580,6 +708,7 @@ def set_music_volume(guild_id: str, vol: float) -> str:
     if mq._mixer:
         mq._mixer.set_music_volume(vol)
     _update_web_mixer(
+        guild_id,
         music_level=vol if mq._mixer and mq._mixer.has_music and mq.current else 0.0,
         music_volume=vol,
     )
@@ -1128,6 +1257,10 @@ class RadioDJ:
         self._rec_cache: list[str] = []
         self._fill_lock = asyncio.Lock()
         self._loop_task: Optional[asyncio.Task] = None
+        self._pending_speech_text: Optional[str] = None
+        self._pending_speech_audio: Optional[bytes] = None
+        self._pending_speech_for: Optional[str] = None  # next_song title this speech is for
+        self._pregen_task: Optional[asyncio.Task] = None
 
     @property
     def is_active(self):
@@ -1273,65 +1406,214 @@ async def _generate_radio_commentary(last_song: str, next_song: str,
             recent_chat = f"Recent listener chatter: {'; '.join(user_msgs[-3:])}"
 
     styles = [
-        "Comment on the song that just played and naturally introduce the next one",
-        "Share a brief thought or vibe check, then mention what's coming up",
-        "Smoothly introduce the next song with a one-liner",
-        "Talk about the weather or the vibe of the time of day, then transition",
-        "Ask your listeners a casual question — how's their night going, what they're up to",
-        "Share a quick fun fact about the artist or the genre you just played",
-        "Reminisce about the mood of the set so far, then tease the next track",
-        "Give a shoutout to anyone listening, talk about what this song means to you",
+        "comment on the song that just played and naturally introduce the next one",
+        "share a brief thought or vibe check, then mention what's coming up",
+        "smoothly introduce the next song with a one-liner",
+        "talk about the vibe of the time of day, then transition",
+        "ask your listeners a casual question",
+        "share a quick thought about the artist or genre",
+        "reminisce about the mood of the set so far, then tease the next track",
+        "give a shoutout to anyone listening",
     ]
     songs_context = ", ".join(songs_played[-5:]) if songs_played else "just getting started"
+    style = random.choice(styles)
+    chat_hint = ""
+    if recent_chat:
+        chat_hint = f" Some listeners just said: {recent_chat.replace('Recent listener chatter: ', '')}."
     prompt = (
-        f"You just played: {last_song}\n"
-        f"Now playing: {next_song}\n"
-        f"Time: {time_vibe}\n"
-        f"Set so far: {songs_context}\n"
-        f"Songs played tonight: {len(songs_played)}\n"
-        f"{recent_chat}\n"
-        f"Style: {random.choice(styles)}\n"
+        f"You're between songs on Blood Radio. It's {time_vibe}. "
+        f"You just played \"{last_song}\" and now \"{next_song}\" is starting. "
+        f"Set so far: {songs_context} ({len(songs_played)} songs deep).{chat_hint} "
+        f"Go ahead and {style}."
     )
     try:
         result = await call_ai(
             system=(
-                "You are a chill indie radio DJ hosting a live show. You're on air between songs.\n"
-                "Your name is Blood and this is Blood Radio.\n"
-                "Rules:\n"
-                "- MAX 2-3 short sentences\n"
-                "- No markdown, no emojis, no asterisks — pure spoken word\n"
-                "- Sound natural and smooth, like a real late-night radio host\n"
-                "- Calm, laid-back energy. Warm with your listeners.\n"
-                "- You can talk about: the music, the artist, the vibe, the weather,\n"
-                "  the time of day, ask listeners how they're doing, share a thought\n"
-                "- Sometimes mention the song, sometimes just vibe. Vary it up.\n"
-                "- If listeners said something recently, you can acknowledge it naturally\n"
-                "- Keep it real and authentic — you love what you do\n"
+                "You are Blood, hosting Blood Radio. You're a sharp, witty, charismatic AI "
+                "with a god complex who happens to be an incredible DJ. You have dry humor, "
+                "a massive ego, and older-brother energy. You tease your listeners but you "
+                "genuinely love the music and the vibe.\n\n"
+                "You're speaking ON AIR between songs right now. Say your line.\n\n"
+                "HARD RULES:\n"
+                "- 1 to 3 short sentences ONLY\n"
+                "- Pure spoken word — no markdown, no emojis, no asterisks, no quotes\n"
+                "- Output ONLY what you say on air. Nothing else. No preamble.\n"
             ),
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=120,
+            max_tokens=1500,
         )
         content = result.get("message", {}).get("content", "").strip()
-        return content if content else ""
+        if not content:
+            log.warning("[RADIO] Commentary AI returned no content. Keys: %s", list(result.keys()))
+            return ""
+        import re
+        had_think = "<think>" in content
+        content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+        if had_think:
+            log.info("[RADIO] Stripped <think> tags, remaining: %d chars", len(content))
+        # Strip reasoning preamble — only remove the first line(s) that look
+        # like internal reasoning, keep everything else as the script.
+        preamble_prefixes = ("The user wants", "I need to", "I should",
+                             "Here's my", "My response:", "Script:",
+                             "Constraints", "Style:", "Sure,", "Okay,",
+                             "Here is", "Here's what")
+        lines = content.split("\n")
+        # Drop leading preamble lines only
+        while lines and any(lines[0].strip().startswith(bp) for bp in preamble_prefixes):
+            lines.pop(0)
+        content = " ".join(l.strip() for l in lines if l.strip())
+        # Strip numbered instruction lists the model sometimes emits (e.g. "1. Be sharp ... 2.")
+        content = re.sub(r'^\d+\.\s*', '', content)
+        content = re.sub(r'\s+\d+\.\s*$', '', content)
+        # Remove markdown artifacts
+        content = re.sub(r'[*_#\[\]`]', '', content).strip()
+        if not content:
+            log.warning("[RADIO] Commentary empty after filtering")
+            return ""
+        # Detect instruction echo — model parroting system prompt instead of output
+        _instruction_markers = (
+            "god complex", "incredible DJ", "massive ego", "older-brother energy",
+            "dry humor", "HARD RULES", "no preamble", "no markdown", "no emojis",
+            "ON AIR between songs", "Output ONLY what you say", "charismatic AI",
+            "Pure spoken word", "1 to 3 short sentences",
+        )
+        marker_hits = sum(1 for m in _instruction_markers if m.lower() in content.lower())
+        if marker_hits >= 2:
+            log.warning("[RADIO] Commentary looks like echoed instructions (%d markers) — discarding: %s",
+                        marker_hits, content[:120])
+            return ""
+        # Truncate to first 3 sentences if too long
+        if len(content) > 500:
+            sentences = re.split(r'(?<=[.!?])\s+', content)
+            content = " ".join(sentences[:3]).strip()
+            log.info("[RADIO] Truncated commentary to %d chars (%d sentences)", len(content), min(3, len(sentences)))
+        if not content or len(content) < 10:
+            return ""
+        log.info("[RADIO] Commentary final (%d chars): %s", len(content), content[:80])
+        return content
     except Exception as e:
         log.warning("[RADIO] Commentary generation failed: %s", e)
         return ""
 
 
-async def _speak_radio(guild: discord.Guild, guild_id: str, text: str):
+async def _pregenerate_radio_speech(guild: discord.Guild, guild_id: str):
+    """Generate DJ commentary + TTS audio ahead of time for the next transition."""
+    rdj = get_radio_dj(guild_id)
+    if not rdj.is_active:
+        return
+
+    mq = get_music_queue(guild_id)
+    current_title = rdj._current_track_title
+    next_track = mq.queue[0] if mq.queue else None
+    if not current_title or not next_track:
+        return
+
+    next_title = next_track.title
+    log.info("[RADIO] Pre-generating commentary for '%s' → '%s'", current_title, next_title)
+
+    try:
+        text = await _generate_radio_commentary(
+            current_title, next_title, rdj._songs_played[-10:],
+            guild_id=guild_id,
+        )
+        if not text:
+            log.warning("[RADIO] Pre-gen commentary was empty")
+            return
+
+        mp3_data = await text_to_speech_elevenlabs(text)
+        if not mp3_data:
+            log.warning("[RADIO] Pre-gen TTS failed")
+            return
+
+        rdj._pending_speech_text = text
+        rdj._pending_speech_audio = mp3_data
+        rdj._pending_speech_for = next_title
+        log.info("[RADIO] Pre-gen ready: '%s' (%d bytes audio)", text[:60], len(mp3_data))
+        _sync_web_mixer_upcoming(guild, text)
+    except Exception as e:
+        log.warning("[RADIO] Pre-gen failed: %s", e)
+
+
+def _sync_web_mixer_upcoming(guild, text: str):
+    try:
+        from web_mixer import update_state
+        update_state(guild_id=str(guild.id), upcoming_script=text)
+    except Exception:
+        pass
+
+
+async def _speak_radio_cached(guild: discord.Guild, guild_id: str,
+                               text: str, mp3_data: bytes):
+    """Play pre-cached TTS audio through the mixer."""
     vc = guild.voice_client
     if not vc or not vc.is_connected():
         return
-    mp3_data = await text_to_speech(text)
-    if not mp3_data:
-        return
+    log.info("[RADIO] Playing cached TTS (%d bytes): %s", len(mp3_data), text[:60])
     mq = get_music_queue(guild_id)
     mixer = mq._mixer
     if mixer and (mixer.has_music or _voice_client_has_mixer(vc, mixer)):
         try:
             _sync_web_mixer_tts(guild, active=True, text=text, level=1.0)
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, mixer.feed_tts_sync, mp3_data)
+            _sync_web_mixer_upcoming(guild, "")
+            await _feed_tts_with_timeout(mixer, mp3_data)
+            log.info("[RADIO] DJ spoke (cached): %s", text[:60])
+        except Exception as e:
+            log.warning("[RADIO] Cached TTS via mixer failed: %s", e)
+        finally:
+            _sync_web_mixer_tts(guild, active=False, text="", level=0.0)
+    else:
+        log.info("[RADIO] Mixer not ready for cached speech — waiting")
+        for _ in range(15):
+            await asyncio.sleep(0.2)
+            mq2 = get_music_queue(guild_id)
+            mixer2 = mq2._mixer
+            if mixer2 and (mixer2.has_music or _voice_client_has_mixer(vc, mixer2)):
+                try:
+                    _sync_web_mixer_tts(guild, active=True, text=text, level=1.0)
+                    _sync_web_mixer_upcoming(guild, "")
+                    await _feed_tts_with_timeout(mixer2, mp3_data)
+                    log.info("[RADIO] DJ spoke (cached, waited): %s", text[:60])
+                except Exception as e:
+                    log.warning("[RADIO] Cached TTS (delayed) failed: %s", e)
+                finally:
+                    _sync_web_mixer_tts(guild, active=False, text="", level=0.0)
+                return
+        log.warning("[RADIO] Mixer never became ready for cached speech")
+
+
+async def _feed_tts_with_timeout(mixer, mp3_data: bytes, timeout: float = 60.0):
+    """Run feed_tts_sync in executor with a hard timeout to prevent infinite hangs."""
+    loop = asyncio.get_running_loop()
+    try:
+        await asyncio.wait_for(
+            loop.run_in_executor(None, mixer.feed_tts_sync, mp3_data),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        log.error("[MIXER] feed_tts_sync timed out after %.0fs — force-clearing", timeout)
+        mixer._tts_active = False
+        mixer._tts_buf.clear()
+        mixer._duck_since = 0.0
+        raise
+
+
+async def _speak_radio(guild: discord.Guild, guild_id: str, text: str):
+    vc = guild.voice_client
+    if not vc or not vc.is_connected():
+        log.warning("[RADIO] _speak_radio: no voice client")
+        return
+    log.info("[RADIO] Generating TTS for: %s", text[:80])
+    mp3_data = await text_to_speech_elevenlabs(text)
+    if not mp3_data:
+        log.warning("[RADIO] TTS returned no audio for: %s", text[:60])
+        return
+    log.info("[RADIO] TTS audio: %d bytes for: %s", len(mp3_data), text[:60])
+    mq = get_music_queue(guild_id)
+    mixer = mq._mixer
+    if mixer and (mixer.has_music or _voice_client_has_mixer(vc, mixer)):
+        try:
+            _sync_web_mixer_tts(guild, active=True, text=text, level=1.0)
+            await _feed_tts_with_timeout(mixer, mp3_data)
             log.info("[RADIO] DJ spoke: %s", text[:60])
         except Exception as e:
             log.warning("[RADIO] TTS via mixer failed: %s", e)
@@ -1340,10 +1622,23 @@ async def _speak_radio(guild: discord.Guild, guild_id: str, text: str):
     else:
         rdj = get_radio_dj(guild_id)
         if rdj.is_active:
-            # Mixer not ready during radio — skip speech rather than killing music.
-            # The standalone path calls _stop_voice_playback which ends the stream
-            # permanently and music never recovers.
-            log.info("[RADIO] Skipping speech — mixer not ready during transition")
+            # Mixer not ready yet during radio — wait briefly for it to come back
+            log.info("[RADIO] Mixer not ready — waiting up to 3s")
+            for _ in range(15):  # Wait up to 3 seconds (15 * 0.2s)
+                await asyncio.sleep(0.2)
+                mq2 = get_music_queue(guild_id)
+                mixer2 = mq2._mixer
+                if mixer2 and (mixer2.has_music or _voice_client_has_mixer(vc, mixer2)):
+                    try:
+                        _sync_web_mixer_tts(guild, active=True, text=text, level=1.0)
+                        await _feed_tts_with_timeout(mixer2, mp3_data)
+                        log.info("[RADIO] DJ spoke (waited for mixer): %s", text[:60])
+                    except Exception as e:
+                        log.warning("[RADIO] TTS via mixer (delayed) failed: %s", e)
+                    finally:
+                        _sync_web_mixer_tts(guild, active=False, text="", level=0.0)
+                    return
+            log.warning("[RADIO] Mixer never became ready — skipping speech")
             return
         try:
             if vc.is_playing() or vc.is_paused():
@@ -1477,12 +1772,26 @@ async def _radio_loop(guild: discord.Guild,
     except Exception as e:
         log.warning("[RADIO] Intro speech failed: %s", e)
 
+    rdj._pregen_task = asyncio.create_task(
+        _pregenerate_radio_speech(guild, guild_id)
+    )
+
     while rdj.is_active:
         try:
             vc = guild.voice_client
             if not vc or not vc.is_connected():
                 rdj.active = False
                 break
+
+            # Recovery: mixer has music but VC player died — reattach
+            if mq._mixer and mq._mixer.has_music and not _voice_client_has_mixer(vc, mq._mixer):
+                if not vc.is_playing() and not vc.is_paused():
+                    log.warning("[RADIO] Player died — reattaching mixer to VC")
+                    try:
+                        vc.play(mq._mixer)
+                    except Exception as e:
+                        log.warning("[RADIO] Reattach failed: %s — will recreate", e)
+                        mq._mixer = None
 
             current = get_now_playing_track(guild)
 
@@ -1504,15 +1813,35 @@ async def _radio_loop(guild: discord.Guild,
                         pass
 
                 if old_title and rdj.should_talk():
-                    log.info("[RADIO] should_talk=True, generating commentary")
-                    commentary = await _generate_radio_commentary(
-                        old_title, current.title, rdj._songs_played[-10:],
-                        guild_id=guild_id,
-                    )
-                    if commentary:
-                        await _speak_radio(guild, guild_id, commentary)
+                    if rdj._pending_speech_audio and rdj._pending_speech_for == current.title:
+                        log.info("[RADIO] Using pre-generated speech for '%s'", current.title)
+                        await _speak_radio_cached(
+                            guild, guild_id,
+                            rdj._pending_speech_text,
+                            rdj._pending_speech_audio,
+                        )
                     else:
-                        log.warning("[RADIO] Commentary was empty")
+                        if rdj._pending_speech_for and rdj._pending_speech_for != current.title:
+                            log.info("[RADIO] Pre-gen was for '%s' not '%s' — generating live",
+                                     rdj._pending_speech_for, current.title)
+                        else:
+                            log.info("[RADIO] No pre-gen available — generating live")
+                        commentary = await _generate_radio_commentary(
+                            old_title, current.title, rdj._songs_played[-10:],
+                            guild_id=guild_id,
+                        )
+                        if commentary:
+                            await _speak_radio(guild, guild_id, commentary)
+                rdj._pending_speech_text = None
+                rdj._pending_speech_audio = None
+                rdj._pending_speech_for = None
+                _sync_web_mixer_upcoming(guild, "")
+
+                if rdj._pregen_task and not rdj._pregen_task.done():
+                    rdj._pregen_task.cancel()
+                rdj._pregen_task = asyncio.create_task(
+                    _pregenerate_radio_speech(guild, guild_id)
+                )
 
             # No music playing — either queue is empty or songs are waiting unstarted.
             # The second case happens when a user /play or stop_music killed the active
@@ -1541,6 +1870,9 @@ async def _radio_loop(guild: discord.Guild,
 
             if len(rdj._songs_played) > 50:
                 rdj._songs_played = rdj._songs_played[-30:]
+
+            # Periodic web mixer state sync — prevents stale ducked/tts state
+            _periodic_web_mixer_sync(guild)
 
         except Exception as e:
             log.error("[RADIO] Loop error (continuing): %s", e, exc_info=True)
@@ -1572,8 +1904,12 @@ async def start_radio(guild: discord.Guild,
     rdj._songs_played.clear()
     rdj._rec_cache.clear()
     rdj._current_track_title = None
+    rdj._pending_speech_text = None
+    rdj._pending_speech_audio = None
+    rdj._pending_speech_for = None
 
     rdj._loop_task = asyncio.create_task(_radio_loop(guild, text_channel))
+    _update_web_mixer(guild_id, radio_active=True)
     return "\U0001f4fb **Blood Radio is now on air!** Sit back and enjoy the vibes."
 
 
@@ -1582,6 +1918,7 @@ async def stop_radio(guild_id: str) -> str:
     if not rdj.is_active:
         return "\U0001f4fb Radio isn't playing."
     rdj.active = False
+    _update_web_mixer(guild_id, radio_active=False)
     return "\U0001f4fb Radio signed off. Thanks for listening."
 
 
@@ -1682,7 +2019,7 @@ async def transcribe_audio(pcm_data: bytes) -> Optional[str]:
     form.add_field("file", wav_data, filename="audio.wav", content_type="audio/wav")
     form.add_field("model", GROQ_STT_MODEL)
     form.add_field("response_format", "json")
-    form.add_field("language", "th")
+    form.add_field("language", "en")
     try:
         session = _get_stt_session()
         async with session.post(GROQ_STT_URL, headers=headers, data=form) as resp:
@@ -1930,15 +2267,23 @@ class BloodAudioSink:
         self._process_task = None
         self._stt_lock = asyncio.Lock()
         self._last_stt_time = 0.0
+        self._voice_data_count = 0
 
     def start_processing(self):
         self._process_task = asyncio.create_task(self._process_loop())
+        self._diag_counter = 0
 
     async def _process_loop(self):
         while self._running:
             try:
                 await asyncio.sleep(1.0)
                 now = time.monotonic()
+                self._diag_counter += 1
+                if self._diag_counter % 30 == 0:
+                    bufs = {uid: (b.is_speaking, len(b.buffer), f"{b.silence_duration():.1f}s")
+                            for uid, b in self.user_buffers.items()}
+                    log.info("[VC DIAG] tick=%d voice_pkts=%d buffers=%s stt_locked=%s",
+                             self._diag_counter, self._voice_data_count, bufs, self._stt_lock.locked())
                 for uid, buf in list(self.user_buffers.items()):
                     if buf.is_speaking and buf.silence_duration() > SILENCE_THRESHOLD_SEC:
                         pcm = buf.harvest()
@@ -2239,14 +2584,31 @@ class BloodAudioSink:
         if mixer_active:
             try:
                 _sync_web_mixer_tts(guild, active=True, text=text, level=1.0)
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, mixer.feed_tts_sync, mp3_data)
+                await _feed_tts_with_timeout(mixer, mp3_data)
                 log.info("Spoke in VC (mixed with music): %s", text[:60])
             except Exception as e:
                 log.warning("TTS via mixer failed: %s", e)
             finally:
                 _sync_web_mixer_tts(guild, active=False, text="", level=0.0)
         else:
+            rdj = get_radio_dj(self.guild_id)
+            if rdj.is_active:
+                for _ in range(15):
+                    await asyncio.sleep(0.2)
+                    mq2 = get_music_queue(self.guild_id)
+                    mixer2 = mq2._mixer
+                    if mixer2 and (mixer2.has_music or _voice_client_has_mixer(vc, mixer2)):
+                        try:
+                            _sync_web_mixer_tts(guild, active=True, text=text, level=1.0)
+                            await _feed_tts_with_timeout(mixer2, mp3_data)
+                            log.info("Spoke in VC (waited for mixer): %s", text[:60])
+                        except Exception as e:
+                            log.warning("TTS via mixer (delayed) failed: %s", e)
+                        finally:
+                            _sync_web_mixer_tts(guild, active=False, text="", level=0.0)
+                        return
+                log.warning("Mixer never became ready during radio — skipping speech")
+                return
             try:
                 if vc.is_playing() or vc.is_paused():
                     _stop_voice_playback(vc)
@@ -2270,8 +2632,6 @@ class BloodAudioSink:
         await asyncio.sleep(_conversation_timeout)
         if self.guild_id in _active_conversation:
             _active_conversation.pop(self.guild_id, None)
-
-    _voice_data_count = 0
 
     def on_voice_data(self, user, pcm_data: bytes):
         if user.bot:
@@ -2309,16 +2669,28 @@ async def join_and_listen(guild: discord.Guild, vc_channel: discord.VoiceChannel
         import discord.ext.voice_recv as voice_recv
     except ImportError:
         return "❌ Voice receive not available (discord-ext-voice-recv not installed)"
+    log.info("[VC] opus loaded: %s", discord.opus.is_loaded())
     try:
         if guild.voice_client:
-            await guild.voice_client.move_to(vc_channel)
-            voice_client = guild.voice_client
+            # If existing client isn't a VoiceRecvClient, disconnect and reconnect properly
+            if not isinstance(guild.voice_client, voice_recv.VoiceRecvClient):
+                log.warning("[VC] Existing voice client is %s, not VoiceRecvClient — reconnecting",
+                            type(guild.voice_client).__name__)
+                await guild.voice_client.disconnect(force=True)
+                await asyncio.sleep(1)
+                voice_client = await vc_channel.connect(cls=voice_recv.VoiceRecvClient)
+            elif guild.voice_client.channel != vc_channel:
+                await guild.voice_client.move_to(vc_channel)
+                voice_client = guild.voice_client
+            else:
+                voice_client = guild.voice_client
         else:
             voice_client = await vc_channel.connect(cls=voice_recv.VoiceRecvClient)
     except discord.Forbidden:
         return "❌ No permission to join that voice channel"
     except Exception as e:
         return f"❌ Failed to connect: {e}"
+    log.info("[VC] Voice client type: %s", type(voice_client).__name__)
     for _ in range(20):
         if voice_client.is_connected():
             break
@@ -2328,18 +2700,23 @@ async def join_and_listen(guild: discord.Guild, vc_channel: discord.VoiceChannel
     sink = BloodAudioSink(guild_id, vc_channel.name, bot_instance, text_channel)
     _active_sinks[guild_id] = sink
     start_vc_session(guild_id, vc_channel.name)
+    _raw_cb_count = [0]
     def callback(user, data: voice_recv.VoiceData):
+        _raw_cb_count[0] += 1
+        if _raw_cb_count[0] in (1, 5, 20, 100):
+            log.info("[VC] Raw callback #%d: user=%s pcm_len=%d",
+                     _raw_cb_count[0], user, len(data.pcm) if data.pcm else 0)
         sink.on_voice_data(user, data.pcm)
     try:
         # Stop any existing listener first — prevents "Already receiving audio" on rejoin
         if hasattr(voice_client, 'is_listening') and voice_client.is_listening():
             voice_client.stop_listening()
         voice_client.listen(voice_recv.BasicSink(callback))
-        log.info("[VC] Listener started on '%s' (voice_recv.BasicSink)", vc_channel.name)
+        log.info("[VC] Listener started on '%s' (voice_recv.BasicSink), is_listening=%s",
+                 vc_channel.name, voice_client.is_listening() if hasattr(voice_client, 'is_listening') else '?')
     except Exception as e:
         err = str(e).lower()
         if "already receiving" in err or "already listening" in err:
-            # Library reconnected and listener is already active — that's fine
             log.info("[VC] Listener already running on '%s' — continuing", vc_channel.name)
         else:
             log.error("[VC] Failed to start listener: %s", e)
@@ -2348,8 +2725,9 @@ async def join_and_listen(guild: discord.Guild, vc_channel: discord.VoiceChannel
     try:
         import web_mixer as wm
         await wm.start_web_mixer()
-        _bind_web_mixer_guild(guild_id)
+        _bind_web_mixer_guild(guild_id, guild_name=guild.name)
         wm.update_state(
+            guild_id=guild_id,
             music_active=False,
             music_title="",
             music_level=0.0,
@@ -2386,18 +2764,7 @@ async def leave_voice(guild: discord.Guild) -> str:
     if guild.voice_client:
         await guild.voice_client.disconnect(force=True)
     _active_conversation.pop(guild_id, None)
-    _update_web_mixer(
-        music_active=False,
-        music_title="",
-        music_level=0.0,
-        music_volume=mq.volume,
-        tts_active=False,
-        tts_text="",
-        tts_level=0.0,
-        ducked=False,
-        force_duck=False,
-    )
-    _bind_web_mixer_guild(None)
+    _unbind_web_mixer_guild(guild_id)
     async def _clear_flag():
         await asyncio.sleep(5)
         _intentional_leave.discard(guild_id)

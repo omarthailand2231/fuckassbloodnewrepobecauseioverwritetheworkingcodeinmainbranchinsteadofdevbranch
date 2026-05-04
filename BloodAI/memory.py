@@ -815,17 +815,23 @@ class MemoryManager:
         if len(self._vector_queue) > self._VECTOR_QUEUE_MAX:
             self._vector_queue = self._vector_queue[-self._VECTOR_QUEUE_MAX:]
 
+    _FLUSH_BATCH_MAX = 50
+
     def _flush_vector_queue(self):
-        """Flush queued entries to ChromaDB. Called before search."""
+        """Flush queued entries to ChromaDB. Called before search.
+
+        Caps at _FLUSH_BATCH_MAX entries per flush to avoid blocking for
+        seconds when the queue has hundreds of pending messages.
+        """
         if not self._vector_queue:
             return
         if not self._init_vector():
             self._vector_queue.clear()
             return
         import hashlib
-        queued = self._vector_queue[:]
-        self._vector_queue.clear()
-        for guild_id, text, meta in queued:
+        batch = self._vector_queue[:self._FLUSH_BATCH_MAX]
+        self._vector_queue = self._vector_queue[self._FLUSH_BATCH_MAX:]
+        for guild_id, text, meta in batch:
             col = self._get_collection(guild_id)
             if col is None:
                 continue

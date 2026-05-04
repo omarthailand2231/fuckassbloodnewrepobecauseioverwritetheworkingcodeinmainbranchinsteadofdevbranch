@@ -1375,7 +1375,11 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
         keyword = args.get("keyword", "")
         limit = max(1, min(int(args.get("limit", 30)), 100))
         ch = args.get("channel") or None
-        results = memory.hybrid_search(str(guild.id), keyword, limit=limit, channel_id=ch)
+        import asyncio as _aio
+        _loop = _aio.get_running_loop()
+        results = await _loop.run_in_executor(
+            None, lambda: memory.hybrid_search(str(guild.id), keyword, limit=limit, channel_id=ch)
+        )
         if results and results != f"Nothing found for '{keyword}'.":
             results = "⚠️ CONFIDENCE NOTE: These are approximate semantic matches, NOT exact evidence. Do NOT punish users based solely on these results. Use read_channel_history to verify exact quotes before taking mod actions.\n\n" + results
         return results

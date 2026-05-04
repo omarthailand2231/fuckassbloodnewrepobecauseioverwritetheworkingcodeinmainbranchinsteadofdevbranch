@@ -1,5 +1,11 @@
 """
 Blood Audio Mixer — thread-based real-time mixing for Discord.
+
+Features:
+  - Real-time music + TTS mixing with auto-ducking
+  - Crossfade transitions between tracks
+  - Audio effects: speed, bass boost, nightcore, slowed+reverb, 8D
+  - Gapless playback via pre-buffering
 """
 
 import array
@@ -24,6 +30,7 @@ _DUCK_RATE        = 0.030   # music fades DOWN when speech starts  → full duck
 _UNDUCK_RATE      = 0.018   # music fades UP   when speech ends    → full unduck in ~0.7 s
 _SONG_FADEIN_RATE = 0.025   # new-song fade-in from silence        → full vol in ~0.5 s
 _PRE_FADE_FRAMES  = 25      # start unduck this many frames before TTS buffer empties (~500 ms)
+_CROSSFADE_RATE   = 0.012   # crossfade out speed — ~1.3s to fade from 0.8→0
 
 
 def _scale_pcm(pcm: bytes, volume: float) -> bytes:
@@ -57,6 +64,46 @@ def _mix_two(pcm_a: bytes, vol_a: float, pcm_b: bytes, vol_b: float) -> bytes:
     return out.tobytes()
 
 
+# ── Audio effects: FFmpeg filter builders ────────────────────────────────────
+
+EFFECTS = {
+    "none":     "",
+    "bass":     "bass=g={bass_db}:f=110:w=0.6",
+    "nightcore": "asetrate=48000*1.25,aresample=48000",
+    "slowed":   "atempo=0.85,aecho=0.8:0.88:60:0.4",
+    "8d":       "apulsator=hz=0.125:amount=0.7",
+    "vapor":    "atempo=0.8,aecho=0.8:0.85:40:0.5",
+    "treble":   "treble=g={treble_db}:f=3000:w=0.5",
+    "deep":     "bass=g=8:f=80:w=0.5,atempo=0.92",
+}
+
+
+def build_filter_chain(*, speed: float = 1.0, bass_db: int = 0,
+                        treble_db: int = 0, effect: str = "none") -> str:
+    parts = []
+
+    if effect and effect != "none" and effect in EFFECTS:
+        tpl = EFFECTS[effect]
+        parts.append(tpl.format(bass_db=bass_db or 10, treble_db=treble_db or 6))
+
+    if bass_db and effect not in ("bass", "deep"):
+        parts.append(f"bass=g={bass_db}:f=110:w=0.6")
+
+    if treble_db and effect != "treble":
+        parts.append(f"treble=g={treble_db}:f=3000:w=0.5")
+
+    if speed != 1.0 and effect not in ("nightcore", "slowed", "vapor", "deep"):
+        s = max(0.5, min(2.0, speed))
+        if s <= 0.5:
+            parts.append("atempo=0.5")
+        elif s >= 2.0:
+            parts.append("atempo=2.0")
+        else:
+            parts.append(f"atempo={s:.3f}")
+
+    return ",".join(p for p in parts if p)
+
+
 class BloodMixerSource(discord.AudioSource):
     """Discord AudioSource that mixes music + TTS in real-time."""
 
@@ -68,22 +115,22 @@ class BloodMixerSource(discord.AudioSource):
 
         self._music_vol = 0.8
         self._duck_vol = 0.15
-        self._effective_vol = 0.0   # Actual volume applied — fades smoothly toward target
+        self._effective_vol = 0.0
 
         self._tts_active = False
         self._tts_lock = threading.Lock()
         self._has_music = False
         self._force_duck = False
+        self._duck_since: float = 0.0  # monotonic time ducking started
+        self._DUCK_TIMEOUT = 45.0
 
         self._music_proc: Optional[subprocess.Popen] = None
         self._music_thread: Optional[threading.Thread] = None
-        # Use an Event instead of a bool flag — avoids the reset race condition.
         self._stop_event = threading.Event()
         self._on_music_end: Optional[Callable] = None
 
         self._last_read_time = time.monotonic()
 
-        # Audio flow watchdog: detect if FFmpeg isn't producing data
         self._read_call_count = 0
         self._buf_had_data_once = False
         self._silence_streak = 0
@@ -95,6 +142,21 @@ class BloodMixerSource(discord.AudioSource):
         self._prebuf_thread: Optional[threading.Thread] = None
         self._prebuf_stop = threading.Event()
         self._prebuf_ready = threading.Event()
+
+        # Crossfade: old track fading out while new one fades in
+        self._fadeout_buf: deque = deque()
+        self._fadeout_vol: float = 0.0
+        self._fadeout_proc: Optional[subprocess.Popen] = None
+        self._fadeout_thread: Optional[threading.Thread] = None
+        self._fadeout_stop: Optional[threading.Event] = None
+
+        # Audio effects
+        self._speed: float = 1.0
+        self._bass_db: int = 0
+        self._treble_db: int = 0
+        self._effect: str = "none"
+
+    # ── Properties ���──────────────────────────────────────────────────────────
 
     @property
     def has_music(self) -> bool:
@@ -112,11 +174,82 @@ class BloodMixerSource(discord.AudioSource):
     def is_ducking(self) -> bool:
         return self._force_duck or self.tts_active
 
+    @property
+    def is_crossfading(self) -> bool:
+        return self._fadeout_vol > 0.0 and bool(self._fadeout_buf)
+
+    # ── Volume / Effects ──────────────────────────────���──────────────────────
+
     def set_music_volume(self, vol: float):
         self._music_vol = max(0.0, min(2.0, vol))
 
+    def _push_unduck_to_web(self):
+        try:
+            from web_mixer import update_state
+            update_state(tts_active=False, tts_text="", tts_level=0.0,
+                         ducked=False, force_duck=False)
+        except Exception:
+            pass
+
     def set_force_duck(self, enabled: bool):
         self._force_duck = bool(enabled)
+        if not enabled:
+            # Also clear any stuck TTS state so ducking fully releases
+            self._tts_active = False
+            self._tts_buf.clear()
+            self._duck_since = 0.0
+
+    def set_speed(self, factor: float):
+        self._speed = max(0.5, min(2.0, factor))
+
+    def set_bass_boost(self, db: int):
+        self._bass_db = max(0, min(20, db))
+
+    def set_treble_boost(self, db: int):
+        self._treble_db = max(0, min(15, db))
+
+    def set_effect(self, name: str):
+        self._effect = name if name in EFFECTS else "none"
+
+    def clear_effects(self):
+        self._speed = 1.0
+        self._bass_db = 0
+        self._treble_db = 0
+        self._effect = "none"
+
+    def get_effects_info(self) -> dict:
+        return {
+            "speed": self._speed,
+            "bass_db": self._bass_db,
+            "treble_db": self._treble_db,
+            "effect": self._effect,
+            "filter_chain": self._current_filter_chain(),
+        }
+
+    def _current_filter_chain(self) -> str:
+        return build_filter_chain(
+            speed=self._speed, bass_db=self._bass_db,
+            treble_db=self._treble_db, effect=self._effect,
+        )
+
+    # ── FFmpeg command builder ───────────────────────────────────────────────
+
+    def _ffmpeg_cmd(self, stream_url: str, *, pipe_input: bool = False) -> list[str]:
+        cmd = ["ffmpeg"]
+        if not pipe_input:
+            cmd += ["-reconnect", "1", "-reconnect_streamed", "1",
+                    "-reconnect_delay_max", "5"]
+        cmd += ["-i", "pipe:0" if pipe_input else stream_url]
+
+        af = self._current_filter_chain()
+        if af:
+            cmd += ["-af", af]
+
+        cmd += ["-f", "s16le", "-ar", "48000", "-ac", "2",
+                "-loglevel", "error", "-nostats", "pipe:1"]
+        return cmd
+
+    # ── Pre-buffer ───────────────��─────────────────────────��─────────────────
 
     def prebuffer_next(self, stream_url: str):
         """Pre-start FFmpeg and buffer ~5s of audio for the next track."""
@@ -130,12 +263,7 @@ class BloodMixerSource(discord.AudioSource):
             proc = None
             try:
                 proc = subprocess.Popen(
-                    ["ffmpeg",
-                     "-reconnect", "1", "-reconnect_streamed", "1",
-                     "-reconnect_delay_max", "5",
-                     "-i", stream_url,
-                     "-f", "s16le", "-ar", "48000", "-ac", "2",
-                     "-loglevel", "error", "-nostats", "pipe:1"],
+                    self._ffmpeg_cmd(stream_url),
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 )
                 count = 0
@@ -171,7 +299,6 @@ class BloodMixerSource(discord.AudioSource):
         self._prebuf_thread.start()
 
     def _cancel_prebuffer(self):
-        """Cancel any running pre-buffer."""
         self._prebuf_stop.set()
         if self._prebuf_thread and self._prebuf_thread.is_alive():
             self._prebuf_thread.join(timeout=2)
@@ -186,20 +313,65 @@ class BloodMixerSource(discord.AudioSource):
         self._prebuf_url = None
         self._prebuf_ready.clear()
 
-    def start_music(self, stream_url: str, volume: float = 0.8,
-                    on_end: Optional[Callable] = None):
-        """Start streaming music from URL in a background thread."""
-        self.stop_music()
+    # ── Crossfade ───────���──────────────────────────────���─────────────────────
 
-        self._music_vol = volume
+    def _kill_fadeout(self):
+        if self._fadeout_stop:
+            self._fadeout_stop.set()
+        if self._fadeout_proc:
+            try:
+                self._fadeout_proc.stdout.close()
+            except Exception:
+                pass
+            try:
+                self._fadeout_proc.kill()
+            except Exception:
+                pass
+            self._fadeout_proc = None
+        if self._fadeout_thread and self._fadeout_thread.is_alive():
+            self._fadeout_thread.join(timeout=1)
+        self._fadeout_thread = None
+        self._fadeout_buf.clear()
+        self._fadeout_vol = 0.0
+        self._fadeout_stop = None
+
+    def crossfade_to(self, stream_url: str, volume: float = 0.8,
+                     on_end: Optional[Callable] = None):
+        """Start a new track while crossfading out the current one.
+
+        The old track's remaining buffered audio fades out over ~1.3s
+        while the new track fades in from silence.
+        """
+        self._kill_fadeout()
+
+        # Snapshot current state into fadeout
+        self._fadeout_buf = deque(self._music_buf)
+        self._fadeout_vol = self._effective_vol if self._effective_vol > 0.01 else self._music_vol
+        self._fadeout_proc = self._music_proc
+        self._fadeout_thread = self._music_thread
+        self._fadeout_stop = self._stop_event
+
+        # Detach old stream so stop_music doesn't kill the fadeout
+        self._music_proc = None
+        self._music_thread = None
+        self._stop_event = threading.Event()
+
+        # Tell old reader thread to stop feeding new frames into _music_buf
+        # (fadeout buf already has the snapshot; the thread may add a few more
+        #  to _music_buf before it sees the stop — that's fine, start_music
+        #  clears _music_buf anyway.)
+        if self._fadeout_stop:
+            self._fadeout_stop.set()
+
+        # Start new track — this clears _music_buf and begins fade-in from 0
+        self._music_buf.clear()
         self._on_music_end = on_end
         self._has_music = True
         self._stop_event = threading.Event()
         self._buf_had_data_once = False
         self._silence_streak = 0
-        self._effective_vol = 0.0   # Fade in from silence on every new track
+        self._effective_vol = 0.0
 
-        # Check for pre-buffered data matching this URL
         prebuf_frames = None
         prebuf_proc = None
         if (self._prebuf_url == stream_url
@@ -212,16 +384,24 @@ class BloodMixerSource(discord.AudioSource):
             self._prebuf_url = None
             self._prebuf_proc = None
             self._prebuf_ready.clear()
-            log.info("[MIXER] Gapless: using %d pre-buffered frames", len(prebuf_frames))
+            log.info("[MIXER] Crossfade gapless: using %d pre-buffered frames", len(prebuf_frames))
         else:
             self._cancel_prebuffer()
 
+        self._start_reader(stream_url, prebuf_frames, prebuf_proc)
+        log.info("[MIXER] Crossfade started → %s...", stream_url[:60])
+
+    # ── Music playback ───────────────���───────────────────────────────────────
+
+    def _start_reader(self, stream_url: str,
+                      prebuf_frames: Optional[list] = None,
+                      prebuf_proc: Optional[subprocess.Popen] = None):
+        stop = self._stop_event
+
         def _reader():
             proc = prebuf_proc
-            stop = self._stop_event
             chunk_counter = 0
             try:
-                # Dump pre-buffered frames first (instant — no gap)
                 if prebuf_frames:
                     for chunk in prebuf_frames:
                         if stop.is_set():
@@ -229,17 +409,10 @@ class BloodMixerSource(discord.AudioSource):
                         self._music_buf.append(chunk)
                         chunk_counter += 1
 
-                # Start new FFmpeg or continue with pre-buffered proc
                 if proc is None:
                     proc = subprocess.Popen(
-                        ["ffmpeg",
-                         "-reconnect", "1", "-reconnect_streamed", "1",
-                         "-reconnect_delay_max", "5",
-                         "-i", stream_url,
-                         "-f", "s16le", "-ar", "48000", "-ac", "2",
-                         "-loglevel", "error", "-nostats",
-                         "pipe:1"],
-                        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                        self._ffmpeg_cmd(stream_url),
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     )
                 self._music_proc = proc
                 while not stop.is_set():
@@ -298,11 +471,11 @@ class BloodMixerSource(discord.AudioSource):
                     log.info("Track ended naturally — firing on_track_end callback")
                     try:
                         future = asyncio.run_coroutine_threadsafe(cb(), self._loop)
-                        future.add_done_callback(_log_track_end_result)
+                        future.add_done_callback(_log_end)
                     except Exception as e:
                         log.warning("on_track_end callback failed: %s", e)
 
-        def _log_track_end_result(future):
+        def _log_end(future):
             try:
                 future.result()
             except Exception as e:
@@ -312,6 +485,37 @@ class BloodMixerSource(discord.AudioSource):
             target=_reader, daemon=True, name="blood-music-feed"
         )
         self._music_thread.start()
+
+    def start_music(self, stream_url: str, volume: float = 0.8,
+                    on_end: Optional[Callable] = None):
+        """Start streaming music from URL in a background thread."""
+        self.stop_music()
+
+        self._music_vol = volume
+        self._on_music_end = on_end
+        self._has_music = True
+        self._stop_event = threading.Event()
+        self._buf_had_data_once = False
+        self._silence_streak = 0
+        self._effective_vol = 0.0
+
+        prebuf_frames = None
+        prebuf_proc = None
+        if (self._prebuf_url == stream_url
+                and self._prebuf_ready.is_set()
+                and self._prebuf
+                and self._prebuf_proc):
+            prebuf_frames = list(self._prebuf)
+            prebuf_proc = self._prebuf_proc
+            self._prebuf.clear()
+            self._prebuf_url = None
+            self._prebuf_proc = None
+            self._prebuf_ready.clear()
+            log.info("[MIXER] Gapless: using %d pre-buffered frames", len(prebuf_frames))
+        else:
+            self._cancel_prebuffer()
+
+        self._start_reader(stream_url, prebuf_frames, prebuf_proc)
         if prebuf_frames:
             log.info("Music feed started (gapless, %d pre-buffered): %s...",
                      len(prebuf_frames), stream_url[:60])
@@ -319,12 +523,13 @@ class BloodMixerSource(discord.AudioSource):
             log.info("Music feed thread started for: %s...", stream_url[:60])
 
     def stop_music(self):
-        """Stop current music stream and clear buffer. Blocks until thread exits."""
+        """Stop current music stream and clear buffer."""
         self._stop_event.set()
         self._has_music = False
         self._force_duck = False
         self._music_buf.clear()
         self._cancel_prebuffer()
+        self._kill_fadeout()
 
         if self._music_proc:
             try:
@@ -342,14 +547,16 @@ class BloodMixerSource(discord.AudioSource):
             if self._music_thread.is_alive():
                 log.warning("Music feed thread did not exit in 2s")
         self._music_thread = None
-        # Clear again — thread may have written frames between kill and join
         self._music_buf.clear()
-        # NOTE: do NOT reset _stop_event here. start_music() creates a fresh one.
+
+    # ── TTS ──────��────────────────────────────────��──────────────────────────
 
     def feed_tts_sync(self, mp3_data: bytes):
         """Convert MP3→PCM, feed into TTS buffer, block until drained."""
+        log.info("[MIXER] feed_tts_sync called with %d bytes of MP3", len(mp3_data))
         with self._tts_lock:
             self._tts_active = True
+            self._duck_since = 0.0
             try:
                 proc = subprocess.Popen(
                     ["ffmpeg", "-i", "pipe:0",
@@ -358,79 +565,119 @@ class BloodMixerSource(discord.AudioSource):
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL
                 )
-                proc.stdin.write(mp3_data)
-                proc.stdin.close()
+                # Use communicate() to avoid pipe deadlock: writing 137KB MP3
+                # can deadlock if FFmpeg's stdout pipe fills before we finish
+                # writing to stdin.
+                pcm_data, _ = proc.communicate(input=mp3_data, timeout=30)
 
-                while True:
-                    chunk = proc.stdout.read(FRAME_SIZE)
-                    if not chunk:
-                        break
+                frame_count = 0
+                offset = 0
+                while offset < len(pcm_data):
+                    chunk = pcm_data[offset:offset + FRAME_SIZE]
                     if len(chunk) < FRAME_SIZE:
                         chunk += b'\x00' * (FRAME_SIZE - len(chunk))
                     self._tts_buf.append(chunk)
-                proc.stdout.close()
-                proc.wait()
+                    frame_count += 1
+                    offset += FRAME_SIZE
+                log.info("[MIXER] TTS buffer filled: %d frames (%.1fs of audio)",
+                         frame_count, frame_count * 0.02)
             except Exception as e:
                 log.warning("TTS feed error: %s", e)
                 self._tts_buf.clear()
+                self._tts_active = False
+                return
 
             try:
                 drain_start = time.monotonic()
                 while self._tts_buf:
                     time.sleep(0.02)
-                    if time.monotonic() - drain_start > 15:
-                        log.warning("[MIXER] TTS drain timeout — clearing stuck buffer")
+                    elapsed = time.monotonic() - drain_start
+                    if elapsed > 40:
+                        log.warning("[MIXER] TTS drain timeout (%.0fs) — remaining: %d frames",
+                                    elapsed, len(self._tts_buf))
                         self._tts_buf.clear()
                         break
                     if time.monotonic() - self._last_read_time > 1.0:
-                        log.warning("[MIXER] AudioPlayer stopped — clearing TTS buffer")
+                        log.warning("[MIXER] AudioPlayer stopped reading — clearing TTS (%d frames left)",
+                                    len(self._tts_buf))
                         self._tts_buf.clear()
                         break
+                drain_time = time.monotonic() - drain_start
+                log.info("[MIXER] TTS drained in %.1fs", drain_time)
                 time.sleep(0.1)
             finally:
-                # Always clear ducking state — never leave music stuck at duck volume
                 self._tts_buf.clear()
                 self._tts_active = False
+
+    # ── read() — the hot path ──────────────────────────────────────��─────────
 
     def read(self) -> bytes:
         """Called by Discord's AudioPlayer thread every 20ms."""
         self._last_read_time = time.monotonic()
         self._read_call_count += 1
-        music = self._music_buf.popleft() if self._music_buf else None
-        tts = self._tts_buf.popleft() if self._tts_buf else None
 
-        # Log first music chunk delivered to Discord
+        # Pop frames (thread-safe via try/except instead of check-then-pop)
+        try:
+            music = self._music_buf.popleft()
+        except IndexError:
+            music = None
+        try:
+            tts = self._tts_buf.popleft()
+        except IndexError:
+            tts = None
+        try:
+            fadeout = self._fadeout_buf.popleft()
+        except IndexError:
+            fadeout = None
+
+        # Log first music chunk
         if music and not self._buf_had_data_once:
             log.info("[AUDIO] First music chunk delivered to Discord (read #%d)", self._read_call_count)
 
-        # Watchdog: detect silent audio flow (FFmpeg dead but Discord still calling read)
+        # Watchdog
         if self._has_music and not self._stop_event.is_set():
             if music:
                 self._buf_had_data_once = True
                 self._silence_streak = 0
             else:
                 self._silence_streak += 1
-                # If we've been returning silence for 3+ seconds (150 calls at 20ms each)
-                # and never had data, FFmpeg likely failed to start
                 if self._silence_streak > 150 and not self._buf_had_data_once:
                     log.error("[AUDIO WATCHDOG] %d read() calls, music_buf always empty — FFmpeg failed?", self._read_call_count)
-                    self._silence_streak = -999999  # Prevent spam
-                # If we HAD data but now don't for 5+ seconds, stream died mid-playback
+                    self._silence_streak = -999999
                 elif self._silence_streak > 250 and self._buf_had_data_once:
                     log.error("[AUDIO WATCHDOG] No music data for 5+ seconds — stream died?")
                     self._silence_streak = -999999
 
+        # ── Crossfade: step fadeout volume down each frame ───────────────────
+        if fadeout:
+            self._fadeout_vol = max(0.0, self._fadeout_vol - _CROSSFADE_RATE)
+            if self._fadeout_vol <= 0.005:
+                self._fadeout_buf.clear()
+                self._kill_fadeout()
+                fadeout = None
+
+        # ── Ducking timeout: force-unduck if stuck for too long ────────────
         ducking = self.is_ducking
+        now = time.monotonic()
+        if ducking:
+            if self._duck_since == 0.0:
+                self._duck_since = now
+            elif now - self._duck_since > self._DUCK_TIMEOUT:
+                log.warning("[MIXER] Ducking stuck for %.0fs — forcing unduck",
+                            now - self._duck_since)
+                self._tts_active = False
+                self._tts_buf.clear()
+                self._force_duck = False
+                self._duck_since = 0.0
+                ducking = False
+                self._push_unduck_to_web()
+        else:
+            self._duck_since = 0.0
+
         tts_frames_left = len(self._tts_buf)
-
-        # Pre-fade: when TTS buffer is nearly empty, start fading music back up
-        # early so the unduck is already in progress when the last word ends.
         pre_fading = ducking and 0 < tts_frames_left <= _PRE_FADE_FRAMES
-
-        # Determine target volume
         target_vol = self._duck_vol if (ducking and not pre_fading) else self._music_vol
 
-        # Smooth fade: step _effective_vol toward target each frame
         if self._effective_vol < target_vol:
             rate = _UNDUCK_RATE if ducking or pre_fading else _SONG_FADEIN_RATE
             self._effective_vol = min(target_vol, self._effective_vol + rate)
@@ -439,9 +686,20 @@ class BloodMixerSource(discord.AudioSource):
 
         mvol = self._effective_vol
 
+        # ── Mix all sources ──────────────────────────────────────────────────
+        # 1. Combine fadeout + new music into one "music" frame
+        if fadeout and music:
+            music = _mix_two(fadeout, self._fadeout_vol, music, mvol)
+            mvol = 1.0  # already scaled
+        elif fadeout and not music:
+            music = _scale_pcm(fadeout, self._fadeout_vol)
+            mvol = 1.0
+
+        # 2. No audio at all
         if music is None and tts is None:
             return SILENCE
 
+        # 3. Mix music + TTS
         if music and tts:
             return _mix_two(music, mvol, tts, 1.0)
         elif music:
@@ -455,12 +713,15 @@ class BloodMixerSource(discord.AudioSource):
         else:
             return tts
 
+    # ── Cleanup ��─────────────────────────────��───────────────────────────────
+
     def is_opus(self) -> bool:
         return False
 
     def cleanup(self):
         """Called when Discord stops playing this source."""
         self._cancel_prebuffer()
+        self._kill_fadeout()
         self.stop_music()
         self._tts_buf.clear()
         self._tts_active = False

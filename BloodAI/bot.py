@@ -996,11 +996,15 @@ if bot:
         log.info("Blood is online as %s (%s)", bot.user, bot.user.id)
         # Sync slash commands with Discord (per-guild for instant, global for DMs)
         try:
+            # Clear stale global commands (prevents duplicates from old global sync)
+            bot.tree.clear_commands(guild=None)
+            await bot.tree.sync()
+            synced_count = 0
             for g in bot.guilds:
                 bot.tree.copy_global_to(guild=g)
-                await bot.tree.sync(guild=g)
-            synced = await bot.tree.sync()
-            log.info("Synced %d slash commands (%d guilds)", len(synced), len(bot.guilds))
+                synced = await bot.tree.sync(guild=g)
+                synced_count = len(synced)
+            log.info("Synced %d slash commands (%d guilds)", synced_count, len(bot.guilds))
         except Exception as e:
             log.error("Failed to sync slash commands: %s", e)
         # Log available skills on startup
@@ -2029,11 +2033,21 @@ if bot:
         embed.add_field(name="Music", value=(
             "`/play <song/url>` — play from YouTube/Spotify/SoundCloud\n"
             "`/skip` — skip | `/stop` — stop & clear\n"
+            "`/pause` — pause | `/resume` — resume\n"
             "`/queue` — queue | `/np` — now playing\n"
             "`/volume <0-100>` — set volume\n"
-            "`/randommusic` — DJ mode (learns your taste!)\n"
-            "`/like` / `/dislike` — teach Blood your taste\n"
-            "`/stopdj` — leave DJ rotation"
+            "`/loop` — toggle queue loop\n"
+            "`/radio` — start Blood Radio\n"
+            "`/stopradio` — stop Blood Radio\n"
+            "`/like` / `/dislike` — teach Blood your taste"
+        ), inline=False)
+        embed.add_field(name="Effects & Mixer", value=(
+            "`/effect <name>` — bass/nightcore/slowed/8d/vapor/deep\n"
+            "`/speed <0.5-2.0>` — playback speed\n"
+            "`/bassboost <0-20>` — bass boost dB\n"
+            "`/clearfx` — remove all effects\n"
+            "`/effects` — show current effects\n"
+            "`/mixer` — open the web mixer dashboard"
         ), inline=False)
         embed.add_field(name="Remote Terminal (Admin+)", value=(
             "`/openterminal` — open remote session\n"
@@ -2705,7 +2719,11 @@ if bot:
         guild_id = str(ctx.guild.id)
         await ctx.defer()
 
-        hits = memory.vector_search(guild_id, query, n_results=15)
+        import asyncio as _aio
+        _loop = _aio.get_running_loop()
+        hits = await _loop.run_in_executor(
+            None, lambda: memory.vector_search(guild_id, query, n_results=15)
+        )
         if not hits:
             await ctx.reply("```ansi\n\u001b[1;31m[VSEARCH]\u001b[0m No results.\n```")
             return
@@ -2984,6 +3002,107 @@ if bot:
             await ctx.reply(f"👎 Noted — less of **{track.title}** style for you.")
         except ImportError:
             await ctx.reply("Voice module not available.")
+
+    @bot.hybrid_command(name="effect", description="Set audio effect (none/bass/nightcore/slowed/8d/vapor/deep)")
+    async def effect_cmd(ctx, name: str = "none"):
+        try:
+            from voice import set_audio_effect
+            result = set_audio_effect(str(ctx.guild.id), name.lower().strip())
+            await ctx.reply(result)
+        except ImportError:
+            await ctx.reply("Voice module not available.")
+
+    @bot.hybrid_command(name="speed", description="Set playback speed (0.5 - 2.0)")
+    async def speed_cmd(ctx, factor: float = 1.0):
+        try:
+            from voice import set_audio_speed
+            result = set_audio_speed(str(ctx.guild.id), factor)
+            await ctx.reply(result)
+        except ImportError:
+            await ctx.reply("Voice module not available.")
+
+    @bot.hybrid_command(name="bassboost", description="Set bass boost (0-20 dB, 0 = off)")
+    async def bassboost_cmd(ctx, db: int = 10):
+        try:
+            from voice import set_bass_boost
+            result = set_bass_boost(str(ctx.guild.id), db)
+            await ctx.reply(result)
+        except ImportError:
+            await ctx.reply("Voice module not available.")
+
+    @bot.hybrid_command(name="effects", description="Show current audio effects")
+    async def effects_cmd(ctx):
+        try:
+            from voice import get_effects_info
+            result = get_effects_info(str(ctx.guild.id))
+            await ctx.reply(result)
+        except ImportError:
+            await ctx.reply("Voice module not available.")
+
+    @bot.hybrid_command(name="clearfx", description="Clear all audio effects")
+    async def clearfx_cmd(ctx):
+        try:
+            from voice import clear_audio_effects
+            result = clear_audio_effects(str(ctx.guild.id))
+            await ctx.reply(result)
+        except ImportError:
+            await ctx.reply("Voice module not available.")
+
+    @bot.hybrid_command(name="pause", description="Pause the current song")
+    async def pause_cmd(ctx):
+        vc = ctx.guild.voice_client
+        if not vc or not vc.is_connected():
+            await ctx.reply("Not in a voice channel.")
+            return
+        if vc.is_playing():
+            vc.pause()
+            from voice import _update_web_mixer
+            _update_web_mixer(str(ctx.guild.id), paused=True)
+            await ctx.reply("⏸️ Paused.")
+        elif vc.is_paused():
+            await ctx.reply("Already paused. Use `/resume`.")
+        else:
+            await ctx.reply("Nothing is playing.")
+
+    @bot.hybrid_command(name="resume", description="Resume paused music")
+    async def resume_cmd(ctx):
+        vc = ctx.guild.voice_client
+        if not vc or not vc.is_connected():
+            await ctx.reply("Not in a voice channel.")
+            return
+        if vc.is_paused():
+            vc.resume()
+            from voice import _update_web_mixer
+            _update_web_mixer(str(ctx.guild.id), paused=False)
+            await ctx.reply("▶️ Resumed.")
+        elif vc.is_playing():
+            await ctx.reply("Already playing.")
+        else:
+            await ctx.reply("Nothing to resume.")
+
+    @bot.hybrid_command(name="loop", description="Toggle queue loop on/off")
+    async def loop_cmd(ctx):
+        try:
+            from voice import get_music_queue, _update_web_mixer
+            guild_id = str(ctx.guild.id)
+            mq = get_music_queue(guild_id)
+            mq.loop = not mq.loop
+            _update_web_mixer(guild_id, loop=mq.loop)
+            state = "ON 🔁" if mq.loop else "OFF"
+            await ctx.reply(f"Loop **{state}**")
+        except ImportError:
+            await ctx.reply("Voice module not available.")
+
+    @bot.hybrid_command(name="mixer", description="Get the Blood Mixer web dashboard URL")
+    async def mixer_cmd(ctx):
+        try:
+            import web_mixer as wm
+            if wm._server:
+                await ctx.reply("🎛️ **Blood Mixer** is live at:\n`http://localhost:7777`\n\nControl music, effects, ducking, and monitor all servers.")
+            else:
+                await ctx.reply("Mixer isn't running yet — join a VC first with `/joinvc`.")
+        except ImportError:
+            await ctx.reply("Web mixer module not available.")
 
     # ── Reaction feedback for music ──────────────────────────────────────
 

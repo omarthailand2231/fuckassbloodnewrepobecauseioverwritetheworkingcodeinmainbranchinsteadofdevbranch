@@ -1,0 +1,63 @@
+{
+  "channel_name": "𝗟𝗼𝘂𝗻𝗴𝗲",
+  "joined_at": "2026-05-04T05:23:34.156560+00:00",
+  "left_at": "2026-05-04T05:27:49.093859+00:00",
+  "transcript": [
+    {
+      "timestamp": "2026-05-04T05:23:48.828361+00:00",
+      "user_id": 1421582461556625509,
+      "user_name": "SMA • Vinny",
+      "text": "[left voice channel]",
+      "channel_name": "𝗟𝗼𝘂𝗻𝗴𝗲"
+    },
+    {
+      "timestamp": "2026-05-04T05:23:52.287571+00:00",
+      "user_id": 1421582461556625509,
+      "user_name": "SMA • Vinny",
+      "text": "[joined voice channel]",
+      "channel_name": "𝗟𝗼𝘂𝗻𝗴𝗲"
+    },
+    {
+      "timestamp": "2026-05-04T05:25:54.743327+00:00",
+      "user_id": 1245867298661597227,
+      "user_name": "PRM • King",
+      "text": "[joined voice channel]",
+      "channel_name": "𝗟𝗼𝘂𝗻𝗴𝗲"
+    },
+    {
+      "timestamp": "2026-05-04T05:26:07.148223+00:00",
+      "user_id": 1052067493528752218,
+      "user_name": "S6767 • Pharoah",
+      "text": "[left voice channel]",
+      "channel_name": "𝗟𝗼𝘂𝗻𝗴𝗲"
+    },
+    {
+      "timestamp": "2026-05-04T05:26:24.964278+00:00",
+      "user_id": 1421582461556625509,
+      "user_name": "SMA • Vinny",
+      "text": "[left voice channel]",
+      "channel_name": "𝗟𝗼𝘂𝗻𝗴𝗲"
+    },
+    {
+      "timestamp": "2026-05-04T05:26:50.634730+00:00",
+      "user_id": 1245867298661597227,
+      "user_name": "PRM • King",
+      "text": "[left voice channel]",
+      "channel_name": "𝗟𝗼𝘂𝗻𝗴𝗲"
+    },
+    {
+      "timestamp": "2026-05-04T05:27:03.135530+00:00",
+      "user_id": 1421582461556625509,
+      "user_name": "SMA • Vinny",
+      "text": "[joined voice channel]",
+      "channel_name": "𝗟𝗼𝘂𝗻𝗴𝗲"
+    },
+    {
+      "timestamp": "2026-05-04T05:27:36.326906+00:00",
+      "user_id": 934476390017953822,
+      "user_name": "SM • Rhino",
+      "text": "[left voice channel]",
+      "channel_name": "𝗟𝗼𝘂𝗻𝗴𝗲"
+    }
+  ]
+}
