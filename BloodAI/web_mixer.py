@@ -753,18 +753,11 @@ async def handle_ws(request):
                         _broadcast()
 
                 elif action == "eq":
-                    gains = d.get("gains") or []
+                    # apply_eq normalizes to 10 bands, applies to the live mixer, and
+                    # SAVES to disk so the curve survives hotreload/restart.
                     try:
-                        from voice import get_music_queue
-                        mq = get_music_queue(gid)
-                        # Persist on the queue so it survives mixer re-creation per track.
-                        # Normalize to exactly 10 bands so broadcasts always satisfy the
-                        # client's length===10 guard (untrusted WS input is the boundary).
-                        g = [max(-15.0, min(15.0, float(x))) for x in gains][:10]
-                        g += [0.0] * (10 - len(g))
-                        mq.eq_gains = g
-                        if mq._mixer:
-                            mq._mixer.set_eq_gains(mq.eq_gains)
+                        from voice import apply_eq
+                        apply_eq(gid, d.get("gains") or [])
                         _sync_effects_for(gid)
                         _broadcast()
                     except Exception as e:
@@ -772,11 +765,8 @@ async def handle_ws(request):
 
                 elif action == "eq_reset":
                     try:
-                        from voice import get_music_queue
-                        mq = get_music_queue(gid)
-                        mq.eq_gains = [0.0] * 10
-                        if mq._mixer:
-                            mq._mixer.reset_eq()
+                        from voice import apply_eq
+                        apply_eq(gid, [0.0] * 10)
                         _sync_effects_for(gid)
                         _broadcast()
                     except Exception as e:

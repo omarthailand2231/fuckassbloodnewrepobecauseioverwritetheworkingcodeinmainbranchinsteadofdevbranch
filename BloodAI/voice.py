@@ -189,8 +189,73 @@ _music_queues: dict[str, MusicQueue] = {}
 
 def get_music_queue(guild_id: str) -> MusicQueue:
     if guild_id not in _music_queues:
-        _music_queues[guild_id] = MusicQueue(guild_id)
+        mq = MusicQueue(guild_id)
+        mq.eq_gains = _get_saved_eq(guild_id)  # restore EQ across restarts/hotreload
+        _music_queues[guild_id] = mq
     return _music_queues[guild_id]
+
+
+# ── EQ persistence (survives hotreload / restart / long offline) ──────────────
+EQ_SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "data", "eq_settings.json")
+_eq_settings_cache: Optional[dict] = None
+
+
+def _load_eq_settings() -> dict:
+    global _eq_settings_cache
+    if _eq_settings_cache is not None:
+        return _eq_settings_cache
+    try:
+        with open(EQ_SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    _eq_settings_cache = data
+    return data
+
+
+def _get_saved_eq(guild_id: str) -> list:
+    g = _load_eq_settings().get(str(guild_id))
+    if isinstance(g, list) and len(g) == 10:
+        try:
+            return [float(x) for x in g]
+        except Exception:
+            pass
+    return [0.0] * 10
+
+
+def _save_eq_to_disk(guild_id: str, gains: list):
+    data = _load_eq_settings()
+    if any(abs(float(x)) > 0.05 for x in gains):
+        data[str(guild_id)] = [round(float(x), 2) for x in gains]
+    else:
+        data.pop(str(guild_id), None)  # flat EQ → drop the entry (stays clean)
+    try:
+        os.makedirs(os.path.dirname(EQ_SETTINGS_PATH), exist_ok=True)
+        tmp = EQ_SETTINGS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, EQ_SETTINGS_PATH)  # atomic — never leaves a half-written file
+    except Exception as e:
+        log.debug("[EQ] save failed: %s", e)
+
+
+def apply_eq(guild_id: str, gains) -> list:
+    """Single entry point for changing the EQ: normalize to 10 bands, set on the
+    queue (persists across tracks), apply to the live mixer if any, and SAVE to disk
+    so it survives a hotreload/restart. Returns the normalized gains."""
+    g = [max(-15.0, min(15.0, float(x))) for x in list(gains)[:10]]
+    g += [0.0] * (10 - len(g))
+    mq = get_music_queue(guild_id)
+    mq.eq_gains = g
+    if mq._mixer:
+        try:
+            mq._mixer.set_eq_gains(g)
+        except Exception:
+            pass
+    _save_eq_to_disk(guild_id, g)
+    return g
 
 
 def _bind_web_mixer_guild(guild_id: Optional[str], guild_name: Optional[str] = None):
