@@ -22,9 +22,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── API Provider Toggle ─────────────────────────────────────────────────────
-# False = Moonshot (Kimi K2.5) — default, single model for everything
+# Priority: Gateway (9arm) > MiMo > Groq (legacy) > Moonshot
+# False = Moonshot (Kimi K2.5) — single model for everything
 # True  = Groq fallback chain (legacy)
 USE_GROQ_API = False
+USE_MIMO_API = os.getenv("USE_MIMO_API", "").lower() in ("1", "true", "yes", "on")
+USE_GATEWAY_API = os.getenv("USE_GATEWAY_API", "").lower() in ("1", "true", "yes", "on")
+
+# Auto reaction memes / GIFs after replies + the send_meme tool. Set MEMES_ENABLED=false to turn off.
+MEMES_ENABLED = os.getenv("MEMES_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 
 CONFIG = {
     # ═══════════════════════════════════════════════════════════════════════════
@@ -70,6 +76,9 @@ CONFIG = {
         "skip_music":        ["user", "mod", "admin", "owner"],
         "stop_music":        ["user", "mod", "admin", "owner"],
         "music_queue":       ["user", "mod", "admin", "owner"],
+        "remove_from_queue": ["user", "mod", "admin", "owner"],
+        "move_in_queue":     ["user", "mod", "admin", "owner"],
+        "clear_queue":       ["user", "mod", "admin", "owner"],
         "music_volume":      ["user", "mod", "admin", "owner"],
 
         # ── Admin-only ──
@@ -109,9 +118,17 @@ CONFIG = {
     # 2. AI / MODEL SETTINGS
     # ═══════════════════════════════════════════════════════════════════════════
 
+    # ── 9arm Gateway (primary chat provider — OpenAI-compatible) ───────────
+    "gateway_model":        os.getenv("GATEWAY_MODEL", "qwen3.6-35b-a3b"),
+    "gateway_base_url":     os.getenv("GATEWAY_BASE_URL", "https://gateway.9arm.co/v1"),
+
     # ── Moonshot (Kimi K2.5) — single model for everything ─────────────────
     "moonshot_model":       "accounts/fireworks/models/kimi-k2p6",
     "moonshot_base_url":    "https://api.fireworks.ai/inference/v1",
+
+    # ── Xiaomi MiMo (OpenAI-compatible) ─────────────────────────────────────
+    "mimo_model":           os.getenv("MIMO_MODEL", "mimo-v2.5-pro"),
+    "mimo_base_url":        os.getenv("MIMO_BASE_URL", "https://token-plan-sgp.xiaomimimo.com/v1"),
 
     # ── Groq fallback chain (legacy, only used when USE_GROQ_API=True) ────
     "models": [
@@ -169,9 +186,9 @@ CONFIG = {
     # ═══════════════════════════════════════════════════════════════════════════
 
     "compact_max_messages":     8,      # max messages kept in compacted history
-    "compact_max_chars":        2500,   # max total chars in compacted history
-    "compact_content_cap":      500,    # per-message content char cap
-    "compact_non_str_cap":      250,    # cap for non-string content (JSON etc.)
+    "compact_max_chars":        14000,  # max total chars in compacted history
+    "compact_content_cap":      5000,   # per-message cap — matches skills_max_file_size so a full skill survives intact
+    "compact_non_str_cap":      800,    # cap for non-string content (JSON etc.)
     "convo_history_cap":        20,     # max messages in RAM per channel
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -267,10 +284,14 @@ CONFIG = {
         "tool_calls",
     ],
 
-    # Final output leak check — blocks system prompt leakage
+    # Final output leak check — blocks system-prompt leakage. Use ONLY structural
+    # markers that appear in the prompt but NOT in normal replies. (Do NOT include
+    # identity phrases like "claude fable 5" — the bot legitimately says that when
+    # asked what model it is, which would get its answer replaced with "nice try.")
     "prompt_leak_patterns": [
-        "you are blood", "system prompt", "allowed tools",
-        "agentic behavior", "hard rules",
+        "the assistant is claude", "claude_behavior", "deployment — discord bot",
+        "system prompt:", "allowed tools:", "agentic behaviour:", "hard rules:",
+        "inner monologue (mandatory)", "you are blood",
     ],
 
     # Classifier content cap (chars sent to AI injection classifier)

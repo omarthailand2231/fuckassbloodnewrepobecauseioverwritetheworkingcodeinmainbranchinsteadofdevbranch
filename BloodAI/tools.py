@@ -59,7 +59,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "timeout_user",
-            "description": "Timeout a user. If reason is based on an accusation (e.g. 'he said X'), MUST call recall_memory first to verify. If claim is false, timeout the INVOKER for 10 seconds instead.",
+            "description": "Timeout a user. If reason is based on an accusation (e.g. 'he said X'), MUST call recall_memory first to verify. If the claim turns out to be false, do NOT apply the timeout — let the user know what you found instead.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -337,7 +337,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "join_voice",
-            "description": "Join or leave a voice channel. When joining, Blood listens via STT (Groq Whisper), responds via TTS, and records transcripts. Say 'leave' to disconnect and save transcript.",
+            "description": "Join or leave a voice channel. When joining, the assistant listens via STT (Groq Whisper), responds via TTS, and records transcripts. Say 'leave' to disconnect and save transcript.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -388,6 +388,43 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "remove_from_queue",
+            "description": "Remove a specific upcoming track from the music queue by its position number (1 = next up). Does not affect the song currently playing. Use music_queue first to see positions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "position": {"type": "integer", "description": "1-based queue position to remove (1 = next up)."},
+                },
+                "required": ["position"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "move_in_queue",
+            "description": "Reorder the music queue by moving a track from one position to another (1-based). Use to bump a song up or push it back. Does not affect the current song.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "from_position": {"type": "integer", "description": "Current 1-based position of the track to move."},
+                    "to_position": {"type": "integer", "description": "Target 1-based position."},
+                },
+                "required": ["from_position", "to_position"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "clear_queue",
+            "description": "Clear all upcoming tracks from the music queue. The song currently playing keeps playing; only the pending queue is emptied.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "music_volume",
             "description": "Set music volume (0-100).",
             "parameters": {
@@ -418,7 +455,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "Search the web for current information. Returns clickable hyperlinks with snippets. Use read_url to dig deeper into any result. You can also search for something sarcastic/ironic and share the link to roast someone.",
+            "description": "Search the web for current information. Returns clickable hyperlinks with snippets. Use read_url to dig deeper into any result. Share relevant links when they help answer the user's question.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -432,7 +469,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "image_search",
-            "description": "Search the web for images and send one directly in chat. Perfect for roasting someone with a relevant image, sending reaction pics, or finding visual content. The image is posted in chat automatically.",
+            "description": "Search the web for images and send one directly in chat. Great for sharing a relevant image, sending reaction pics, or finding visual content to illustrate a point. The image is posted in chat automatically.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -530,12 +567,12 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "give_coins",
-            "description": "Give or TAKE BHC coins. Positive = reward (smart question, funny moment, good roast). Negative = punishment (dumb question, cringe, annoying you). Be a ruthless but fair economy dictator. Reward: 1-5 decent, 10-25 impressive, 50+ legendary. Punish: -1 to -5 mild cringe, -10 to -25 offensive stupidity, -50 unforgivable.",
+            "description": "Give or TAKE BHC coins. Positive = reward (good question, helpful contribution, fun moment). Negative = deduction (rule-breaking or unhelpful behavior). Be fair and consistent. Reward: 1-5 decent, 10-25 impressive, 50+ exceptional. Deduct: -1 to -5 minor, -10 to -25 notable, -50 serious.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "user_id": {"type": "string", "description": "The user's Discord ID."},
-                    "amount": {"type": "integer", "description": "Coins to give (positive) or take (negative). No limit — go as hard as you want."},
+                    "amount": {"type": "integer", "description": "Coins to give (positive) or take (negative). No hard cap; pick an amount proportionate to the situation."},
                     "reason": {"type": "string", "description": "Short reason for giving/taking coins."},
                 },
                 "required": ["user_id", "amount", "reason"],
@@ -575,7 +612,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "send_dm",
-            "description": "Send a direct message to a user. Use sparingly — DMs lose impact if overused. Good for: warnings, intimidation, private praise, follow-ups.",
+            "description": "Send a direct message to a user. Use sparingly — DMs lose impact if overused. Good for: warnings, private praise, gentle reminders, follow-ups.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -605,14 +642,14 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "update_emotional_state",
-            "description": "Update your emotional state towards a user. Affects how you treat them in future interactions. Use after notable events (someone earned respect, someone pissed you off, etc).",
+            "description": "Update your tracked impression of a user. Affects how you tailor future interactions with them. Use after notable events (someone earned respect, someone was rude, etc).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "user_id": {"type": "string"},
                     "annoyance": {"type": "integer", "description": "Delta change (-100 to +100). Positive = more annoyed."},
                     "respect": {"type": "integer", "description": "Delta change (-100 to +100). Positive = more respect."},
-                    "grudge": {"type": "integer", "description": "Delta change (-100 to +100). Positive = holding more of a grudge."},
+                    "grudge": {"type": "integer", "description": "Delta change (-100 to +100). Positive = a more lasting negative impression."},
                     "category": {"type": "string", "description": "Optional: 'feared', 'respected', 'disrespected', 'neutral'."},
                     "notes": {"type": "string", "description": "Optional short note about why."},
                 },
@@ -642,7 +679,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "set_goal",
-            "description": "Set a persistent goal for yourself. Goals survive restarts and appear in your system prompt. Use for: grudges to follow up on, things to learn, promises you made, recurring tasks. You are an autonomous agent — set goals to drive your own behavior.",
+            "description": "Set a persistent goal for yourself. Goals survive restarts and appear in your system prompt. Use for: issues to follow up on, things to learn, promises you made, recurring tasks. You are an autonomous agent — set goals to drive your own behavior.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1581,6 +1618,27 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
         except ImportError:
             return "Voice/music module not available."
 
+    elif name == "remove_from_queue":
+        try:
+            from voice import remove_from_queue
+            return remove_from_queue(str(guild.id), args.get("position"))
+        except ImportError:
+            return "Voice/music module not available."
+
+    elif name == "move_in_queue":
+        try:
+            from voice import move_in_queue
+            return move_in_queue(str(guild.id), args.get("from_position"), args.get("to_position"))
+        except ImportError:
+            return "Voice/music module not available."
+
+    elif name == "clear_queue":
+        try:
+            from voice import clear_queue
+            return clear_queue(str(guild.id))
+        except ImportError:
+            return "Voice/music module not available."
+
     elif name == "music_volume":
         vol = int(args.get("volume", 50))
         try:
@@ -1962,7 +2020,14 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
         cap = CONFIG.get("skills_max_file_size", 5000)
-        return content[:cap]
+        if len(content) > cap:
+            return (f"[skill '{skill_name}' — first {cap} of {len(content)} chars]\n"
+                    + content[:cap] + f"\n[...truncated at {cap} chars — use a terminal command to read the rest]")
+        # Explicit completeness marker so the model knows it has the WHOLE file and
+        # doesn't falsely conclude it's truncated (and re-read / fall back to terminal).
+        return (f"[skill '{skill_name}' — COMPLETE file, {len(content)} chars]\n"
+                + content
+                + f"\n[end of skill '{skill_name}' — this is the full skill, nothing was truncated]")
 
     # ── edit code file ────────────────────────────────────────────────────────
     elif name == "edit_code_file":

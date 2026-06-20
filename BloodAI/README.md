@@ -1,12 +1,14 @@
 # Blood — Discord AI Agent Bot
 
+> **Persona:** the bot now runs the **Claude Fable 5** personality (warm, helpful, honest, direct) and is live in Discord as **Clawd**. "Blood" remains the codebase/project name (repo, classes, internal identifiers); the user-facing assistant is Claude. The persona is defined in `personality_fable5.md` and loaded by `build_system_prompt()` in `bot.py`.
+
 ## What this is
-Blood is a full-featured Discord AI agent with voice presence, real-time audio mixing, AI-powered music radio with a DJ persona, moderation, coin economy, stock market trading, web browsing, and persistent memory. Supports STT/TTS for live voice conversations with simultaneous music playback and smooth audio transitions.
+A full-featured Discord AI agent with voice presence, real-time audio mixing, an AI music radio with a DJ host, moderation, a coin economy, stock-market trading, web browsing, image vision, and persistent memory. Supports optional STT + TTS for live voice conversations with simultaneous music playback and smooth audio transitions.
 
 ## Tech stack
-- **Runtime**: Python 3.14 + discord.py 2.7 (with DAVE encryption)
-- **AI**: Fireworks AI (Kimi K2.5) primary / Groq fallback chain
-- **Voice**: Groq Whisper (STT) + Edge-TTS (all speech) + discord-ext-voice-recv
+- **Runtime**: Python 3.14 + discord.py 2.7 (+ discord-ext-voice-recv)
+- **AI (chat + vision)**: 9arm gateway `qwen3.6-35b-a3b` (OpenAI-compatible) — **primary**, with automatic failover to Xiaomi MiMo → Fireworks/Moonshot → Groq. Vision runs on the same gateway (qwen is multimodal) with a Groq `llama-4-scout` fallback.
+- **Voice**: Groq Whisper (STT — optional, `STT_ENABLED`) + Edge-TTS (general speech) + ElevenLabs (radio DJ voice, "George") + discord-ext-voice-recv
 - **Audio Mixer**: Thread-based PCM mixer with smooth volume fades, live ducking, gapless prebuffering (`mixer.py`)
 - **Music**: yt-dlp (YouTube/Spotify/SoundCloud) + AI-powered recommendations
 - **Finance**: Yahoo Finance (`yfinance`) — real-time prices
@@ -19,12 +21,13 @@ bot.py          — Main bot, event loop, commands, agentic tool-call loop
 voice.py        — Voice: STT, TTS, music, DJ, Radio DJ, AI intent, transcripts, taste learning
 mixer.py        — Thread-based real-time audio mixer (music + TTS ducking + smooth fades)
 web_mixer.py    — Mixer web UI dashboard (localhost:7777)
-tools.py        — Tool definitions + executors (30+ tools)
-provider.py     — Fireworks/Groq/DeepSeek API client with smart fallback + vision
-config.py       — Permission tiers, role IDs, tool gates, model chain
-memory.py       — Memory manager (RAM + channels + summaries + coins + market)
-market.py       — Real-time stock/crypto/commodity prices + charts
-mood.py         — Blood's emotional state (resets on restart)
+tools.py             — Tool definitions + executors (50+ tools)
+provider.py          — Multi-provider chat client: gateway → MiMo → Moonshot failover + vision
+config.py            — Permission tiers, role IDs, tool gates, provider + feature toggles
+personality_fable5.md— Claude Fable 5 base system prompt (the bot's personality)
+memory.py            — Memory manager (RAM + channels + summaries + coins + market)
+market.py            — Real-time stock/crypto/commodity prices + charts
+mood.py              — Emotional-state helpers (resets on restart)
 memory/
   <guild_id>/
     channels/<channel_id>.md — Per-channel rolling chat log
@@ -85,7 +88,7 @@ Blood can use these on its own judgment:
 ### Voice Channel
 | Command | Description |
 |---------|-------------|
-| `/joinvc [channel]` | Join VC with STT listening + TTS. Omit channel to auto-join yours |
+| `/joinvc [channel]` | Join VC (TTS + music; live STT listening only when `STT_ENABLED=true`). Omit channel to auto-join yours |
 | `/leavevc` | Leave VC and save transcript |
 | `/transcript [page]` | View recent VC transcripts (5/page) with .txt export + summary |
 
@@ -98,8 +101,8 @@ Blood can use these on its own judgment:
 | `/queue` | Show current queue |
 | `/np` | Show what's currently playing |
 | `/volume <0-100>` | Set music volume |
-| `/radio` | Start Blood Radio — AI DJ plays indie/chill music with commentary |
-| `/stopradio` | Stop Blood Radio |
+| `/radio` | Start Clawd Radio — AI DJ plays indie/chill music with commentary (ElevenLabs voice) |
+| `/stopradio` | Stop Clawd Radio |
 | `/like` | Like current song (improves your recommendations) |
 | `/dislike` | Dislike current song (skips + adjusts taste) |
 
@@ -120,6 +123,7 @@ Blood can use these on its own judgment:
 |---------|-------------|
 | `/openterminal` | Open remote terminal session |
 | `/closeterminal` | Close remote terminal session |
+| `/hotreload` (`/reboot`, `/restart`) | **Owner only.** Restart the bot in-place with fresh code via `os.execv` (same terminal/PID; reloads code + `.env`). The new "online" log is the restart confirmation. |
 
 ## Voice System (`voice.py`)
 
@@ -156,18 +160,17 @@ _SONG_FADEIN_RATE = 0.025  # per read() call — full fade-in in ~0.5s
 _PRE_FADE_FRAMES  = 25     # start unduck this many frames before TTS ends (~500ms)
 ```
 
-### Blood Radio (`/radio`)
-Blood becomes a radio host — plays background/indie/chill music and talks between songs like a real DJ.
+### Clawd Radio (`/radio`)
+Clawd becomes a radio host in a dedicated thread — plays taste-aware music, shows a live player panel, and talks between songs like a real DJ.
 
-- **Instant startup**: `/radio` responds immediately. Song loading, preloading, and voice warmup all happen in background tasks.
-- **Parallel preloading**: Fetches `RADIO_QUEUE_TARGET+1` (4) songs **simultaneously** at startup via `asyncio.gather()`. Startup waits for the slowest single extraction, not 4 in a row.
-- **3-song queue buffer**: Always maintains 3 songs pre-extracted and ready. Refill runs in background after every track change.
-- **Parallel refill**: `_fill_radio_queue()` gets multiple song queries then extracts them in parallel. Uses `asyncio.Lock` to prevent concurrent over-fills.
-- **Gapless transitions**: Pre-buffers next track's PCM into memory while current song plays. `start_music()` handoffs the pre-buffered FFmpeg process — zero gap.
-- **AI commentary cadence**: Speaks after every 1–5 songs (randomized). Commentary uses time-of-day, track transition context, listener chat.
-- **Queue-stale detection**: If songs are in queue but nothing is playing (e.g. after a `/play` interruption), `_radio_loop` detects and restarts playback within 3 seconds.
-- **Task tracking**: `RadioDJ._loop_task` and `RandomDJ._loop_task` store the live asyncio Task so auto-rejoin never spawns duplicate loops.
-- **Voice**: Edge-TTS (ElevenLabs optional — swap `text_to_speech()` to `text_to_speech_elevenlabs()` in `_speak_radio()` when paid plan active)
+- **Dedicated thread + live player panel** (`radio_panel.py`): `/radio` opens a `📻 Clawd Radio` thread and drops a single control panel into it — cover art, track name, a progress bar that ticks every 5s, and **Like / Dislike / Skip / Pause / Stop** buttons.
+- **Sticks to the bottom**: any message in the thread (from a user **or** the bot) deletes and re-sends the panel so it always sits at the bottom, like a pinned now-playing bar. A self-id guard + debounce prevent repost loops.
+- **Taste-aware curation**: `_radio_recommendations()` blends the liked songs of **whoever is currently in the VC** (`_collect_room_taste()` over `_listener_ids`), mixes ~60% taste / ~30% discovery / ~10% wildcard, and reads the room (time of day + recent chat via `_radio_vibe_hint()`) so the set leans toward the current mood.
+- **Dislike stacks; skip doesn't**: `record_feedback()` accumulates `dislike_weights` per song and escalates to the **whole artist** once dislikes stack (≥2). A **skip is just "not in the mood"** → per-session cooldown (`record_radio_skip()`), never a taste change. An explicit like overrides artist-level avoidance. A hard gate (`_radio_passes()`) drops disliked / skipped / recently-played songs before they can queue.
+- **Per-guild history**: recently-played is keyed per guild, so one server never suppresses another's songs.
+- **Instant startup / parallel preload / 3-song buffer / gapless transitions**: unchanged — startup waits for the slowest single extraction (`asyncio.gather()`), `_fill_radio_queue()` refills in parallel under a lock, and `start_music()` hands off a pre-buffered FFmpeg process for zero-gap transitions.
+- **Cover art**: `extract_track()` captures the yt-dlp thumbnail onto `MusicTrack.thumbnail` for the panel image.
+- **Voice**: **ElevenLabs** ("George", `eleven_multilingual_v2`) via `text_to_speech_elevenlabs()`, with Edge-TTS as automatic fallback if ElevenLabs errors or no key is set
 
 ### AI Music Intent Classification
 Instead of rigid keyword matching, Blood uses AI to understand natural language music commands:
@@ -201,11 +204,46 @@ Instead of rigid keyword matching, Blood uses AI to understand natural language 
 ## Environment variables
 ```
 DISCORD_TOKEN=...
-GROQ_API_KEY=...
-MOONSHOT_API_KEY=...          # Fireworks AI key (fw_...)
-TAVILY_API_KEY=...            # optional, for web search
-ELEVENLABS_API_KEY=...        # optional, enables ElevenLabs TTS for radio DJ
-ELEVENLABS_RADIO_VOICE_ID=... # optional, ElevenLabs voice ID for radio host
-SPOTIFY_CLIENT_ID=...         # optional, enables Spotify mood-based recommendations
+
+# ── Chat + vision provider (PRIMARY): 9arm gateway, OpenAI-compatible ──
+GATEWAY_API_KEY=...
+GATEWAY_BASE_URL=https://gateway.9arm.co/v1
+GATEWAY_MODEL=qwen3.6-35b-a3b
+USE_GATEWAY_API=true
+
+# ── Fallback providers (used automatically, in order, if the gateway is down) ──
+MIMO_API_KEY=...              # Xiaomi MiMo (OpenAI-compatible)
+MIMO_BASE_URL=https://token-plan-sgp.xiaomimimo.com/v1
+MIMO_MODEL=mimo-v2.5-pro
+MOONSHOT_API_KEY=...          # Fireworks AI key (fw_...) — Kimi
+GROQ_API_KEY=...              # Groq — also the VISION fallback (llama-4-scout) + Whisper STT
+
+# ── Feature toggles ──
+STT_ENABLED=false             # voice-channel transcription (Groq Whisper). false = music/TTS only, no audio receive
+MEMES_ENABLED=false           # auto reaction GIFs/memes after replies + the send_meme tool
+
+# ── Optional integrations ──
+TAVILY_API_KEY=...            # web search
+ELEVENLABS_API_KEY=...        # radio DJ voice ("George"); falls back to Edge-TTS if unset/erroring
+ELEVENLABS_RADIO_VOICE_ID=JBFqnCBsd6RMkjVDRZzb
+SPOTIFY_CLIENT_ID=...         # mood-based music recommendations
 SPOTIFY_CLIENT_SECRET=...
 ```
+> Note: `.env` is git-ignored (secrets stay local). See `.env.example` for the template.
+
+## Configuration & feature toggles
+| Var | Default | Effect |
+|-----|---------|--------|
+| `USE_GATEWAY_API` | `true` | Use the 9arm gateway as the primary chat/vision provider. If false (and no `GATEWAY_API_KEY`), falls back to MiMo/Moonshot. |
+| `STT_ENABLED` | `true` | When `false`, the bot joins voice for **music + TTS only** — it does not attach the audio receiver, so there's no opus decoding or transcription (and no related log noise). |
+| `MEMES_ENABLED` | `true` | When `false`, no auto reaction GIF/meme after replies, the meme list is dropped from the prompt, and `send_meme` is removed from the toolset. |
+
+### Provider failover (`call_ai`)
+Chat tries providers in order — **Gateway → MiMo → Moonshot** — failing over fast (short retry budget on non-final providers, raise-on-last-attempt) so a gateway outage (e.g. HTTP 502) doesn't take the bot down. If all fail, it returns a graceful "providers are down" message instead of throwing. The gateway stays first, so it automatically resumes once healthy. **Vision** (`call_vision` / `call_fast_vision`) uses the gateway first, then Groq `llama-4-scout`.
+
+## Recent changes
+- **Persona → Claude Fable 5** (loaded from `personality_fable5.md`); all internal sub-prompts (meme picker, reflection, QA checker, background agent, radio/voice DJ) reframed from the old "Blood/House" persona to Claude. Radio rebranded **Clawd Radio**.
+- **Providers**: primary chat + vision on the 9arm gateway (`qwen3.6-35b-a3b`) with MiMo/Moonshot/Groq failover. Vision repointed off MiMo (quota-exhausted) to the gateway + Groq fallback.
+- **`/hotreload`** owner command for in-place restarts (`os.execv`).
+- **STT** and **memes/GIFs** are now toggleable (currently off).
+- **Fixes**: per-user concurrency lock no longer strands users on "i'm still working…"; injection screening exempts owners/admins and the AI classifier is robust to reasoning-model output; the prompt-leak guard no longer false-fires on the bot identifying itself; music cut-offs reduced via FFmpeg reconnect/timeout flags; VC listener survives corrupt opus frames; history-compaction caps raised so skills/tool results survive across turns.

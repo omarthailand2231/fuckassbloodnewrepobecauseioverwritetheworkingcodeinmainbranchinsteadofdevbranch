@@ -113,6 +113,9 @@ let G={};           // guild_id -> state
 let activeG=null;   // selected guild_id
 let renderedG=null; // guild_id whose panel DOM is currently in place
 const dragging={};  // slider id -> true while user is dragging
+let eqGains=Array(10).fill(0);
+let eqBands=[31,62,125,250,500,1000,2000,4000,8000,16000];
+let eqDragIdx=-1, eqSendT=0, eqDragG=null, eqHeldUntil=0, eqSpec=null;
 
 ws.onopen=()=>{$('st').textContent='Connected';$('st').style.color='#0f0'};
 ws.onclose=()=>{$('st').textContent='Disconnected — refresh';$('st').style.color='#f55'};
@@ -127,6 +130,7 @@ function send(action,extra){
 
 ws.onmessage=e=>{
   const msg=JSON.parse(e.data);
+  if(msg.spec){const s=msg.spec[activeG];if(s){eqSpec=s;eqDraw()}return}
   console.log('RX guilds:',Object.keys(msg.guilds||{}));
   if(!msg.guilds)return;
   G=msg.guilds;
@@ -210,6 +214,19 @@ function buildPanel(){
   <ul class="queue-list" id="q-list"></ul>
   <div class="queue-empty" id="q-empty">Queue is empty</div>
 </div>
+<div class="full-span"><div class="card" id="eq-card">
+  <div class="card-title">Equalizer
+    <span style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap">
+      <button class="btn" id="eq-flat">Flat</button>
+      <button class="btn" id="eq-bassp">Bass</button>
+      <button class="btn" id="eq-vocal">Vocal</button>
+      <button class="btn" id="eq-treblep">Treble</button>
+      <button class="btn danger" id="eq-reset">Reset</button>
+    </span>
+  </div>
+  <canvas id="eq-canvas" width="820" height="240" style="width:100%;height:auto;display:block;background:#0d1424;border:1px solid #1c2740;border-radius:8px;touch-action:none;cursor:ns-resize;margin-top:8px"></canvas>
+  <div class="info" id="eq-info" style="font-size:.72rem;margin-top:6px">Flat</div>
+</div></div>
 <div class="full-span"><div class="duck-indicator" id="duck">Music at full volume</div></div>
 </div>`;
 
@@ -273,6 +290,75 @@ function updatePanel(d){
   // Radio
   $('radio-dot').style.display=d.radio_active?'':'none';
   $('radio-badge').style.display=d.radio_active?'':'none';
+  // EQ — don't clobber while dragging, nor during the brief post-release window
+  // (stale throttled-send echoes can still be in flight and would flicker backward).
+  if(Array.isArray(d.eq_bands)&&d.eq_bands.length===10)eqBands=d.eq_bands;
+  if(Array.isArray(d.eq)&&d.eq.length===10&&eqDragIdx<0&&Date.now()>=eqHeldUntil){eqGains=d.eq.slice();eqDraw();eqLabel()}
+}
+
+// ── Graphic EQ (canvas) ──────────────────────────────────────────────────
+function eqGeom(c){return {L:42,R:14,T:18,B:30,W:c.width,H:c.height}}
+function eqXY(c,i,g){const m=eqGeom(c),pw=m.W-m.L-m.R,ph=m.H-m.T-m.B;
+  return {x:m.L+(i/(eqBands.length-1))*pw, y:m.T+(1-(g+15)/30)*ph}}
+function eqGainFromY(c,y){const m=eqGeom(c),ph=m.H-m.T-m.B;
+  let g=(1-(y-m.T)/ph)*30-15;return Math.max(-15,Math.min(15,Math.round(g*2)/2))}
+function eqNearest(c,x){let best=0,bd=1e9;for(let i=0;i<eqBands.length;i++){const d=Math.abs(eqXY(c,i,0).x-x);if(d<bd){bd=d;best=i}}return best}
+function eqHz(f){return f>=1000?(f/1000)+'k':f}
+function eqLabel(){const a=eqGains.map((g,i)=>Math.abs(g)>0.1?((g>0?'+':'')+g+' @'+eqHz(eqBands[i])):null).filter(Boolean);
+  const el=$('eq-info');if(el)el.textContent=a.length?a.join('   '):'Flat'}
+function eqDraw(){
+  const c=$('eq-canvas');if(!c)return;const ctx=c.getContext('2d');const m=eqGeom(c);
+  const ph=c.height-m.T-m.B,pw=c.width-m.L-m.R;ctx.clearRect(0,0,c.width,c.height);
+  // live spectrum (behind grid + EQ curve)
+  if(eqSpec&&eqSpec.length>1){
+    const sx=i=>m.L+(i/(eqSpec.length-1))*pw, sy=i=>m.T+ph-Math.max(0,Math.min(1,eqSpec[i]))*ph;
+    ctx.beginPath();ctx.moveTo(m.L,m.T+ph);
+    for(let i=0;i<eqSpec.length;i++)ctx.lineTo(sx(i),sy(i));
+    ctx.lineTo(m.L+pw,m.T+ph);ctx.closePath();
+    ctx.fillStyle='rgba(110,168,255,0.10)';ctx.fill();
+    ctx.beginPath();for(let i=0;i<eqSpec.length;i++){i?ctx.lineTo(sx(i),sy(i)):ctx.moveTo(sx(i),sy(i))}
+    ctx.strokeStyle='rgba(150,170,205,0.5)';ctx.lineWidth=1;ctx.stroke();
+  }
+  ctx.font='10px system-ui';ctx.textAlign='right';ctx.textBaseline='middle';
+  for(let db=15;db>=-15;db-=5){const y=m.T+(1-(db+15)/30)*ph;
+    ctx.strokeStyle=db===0?'#3a4a6a':'#18223a';ctx.lineWidth=db===0?1.4:1;
+    ctx.beginPath();ctx.moveTo(m.L,y);ctx.lineTo(c.width-m.R,y);ctx.stroke();
+    ctx.fillStyle='#5a6a8a';ctx.fillText((db>0?'+':'')+db,m.L-6,y)}
+  // response curve
+  ctx.beginPath();for(let i=0;i<eqBands.length;i++){const p=eqXY(c,i,eqGains[i]);i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)}
+  ctx.strokeStyle='#6ea8ff';ctx.lineWidth=2;ctx.stroke();
+  // handles + freq labels
+  ctx.textAlign='center';ctx.textBaseline='top';
+  for(let i=0;i<eqBands.length;i++){const p=eqXY(c,i,eqGains[i]);
+    ctx.beginPath();ctx.arc(p.x,p.y,6,0,7);
+    ctx.fillStyle=Math.abs(eqGains[i])>0.1?'#6ea8ff':'#dfe7ff';ctx.fill();
+    ctx.fillStyle='#5a6a8a';ctx.fillText(eqHz(eqBands[i]),p.x,c.height-m.B+6)}
+}
+function eqSendNow(){send('eq',{gains:eqGains})}
+function eqSendThrottled(){const n=Date.now();if(n-eqSendT>60){eqSendT=n;eqSendNow()}}
+function eqEvXY(c,ev){const r=c.getBoundingClientRect();const t=ev.touches&&ev.touches[0]?ev.touches[0]:ev;
+  return {x:(t.clientX-r.left)*(c.width/r.width),y:(t.clientY-r.top)*(c.height/r.height)}}
+function eqInit(){
+  const c=$('eq-canvas');if(!c)return;
+  eqDragIdx=-1;eqDragG=null;  // abandon any in-flight drag when the panel is rebuilt
+  // Per-canvas pointer-down (new canvas DOM on each guild switch).
+  if(!c._eqDown){c._eqDown=true;
+    const down=ev=>{const cc=$('eq-canvas');if(!cc)return;ev.preventDefault();const p=eqEvXY(cc,ev);
+      eqDragG=activeG;eqDragIdx=eqNearest(cc,p.x);eqGains[eqDragIdx]=eqGainFromY(cc,p.y);eqDraw();eqLabel();eqSendThrottled()};
+    c.addEventListener('mousedown',down);c.addEventListener('touchstart',down,{passive:false});}
+  // Global move/up wired ONCE (reference the live canvas, no leak across rebuilds).
+  if(!window._eqWired){window._eqWired=true;
+    const move=ev=>{if(eqDragIdx<0||activeG!==eqDragG)return;const cc=$('eq-canvas');if(!cc)return;ev.preventDefault();
+      const p=eqEvXY(cc,ev);eqGains[eqDragIdx]=eqGainFromY(cc,p.y);eqDraw();eqLabel();eqSendThrottled()};
+    const up=()=>{if(eqDragIdx>=0){const ok=activeG===eqDragG;eqDragIdx=-1;eqDragG=null;eqHeldUntil=Date.now()+250;if(ok)eqSendNow()}};
+    window.addEventListener('mousemove',move);window.addEventListener('touchmove',move,{passive:false});
+    window.addEventListener('mouseup',up);window.addEventListener('touchend',up);}
+  // Presets + reset (re-bind each build — buttons are fresh DOM).
+  const presets={'eq-flat':[0,0,0,0,0,0,0,0,0,0],'eq-bassp':[10,8,6,3,1,0,0,0,0,0],
+    'eq-vocal':[-2,-2,0,2,4,4,3,1,0,-1],'eq-treblep':[0,0,0,0,0,1,3,6,8,9]};
+  Object.keys(presets).forEach(id=>{const b=$(id);if(b)b.onclick=()=>{eqGains=presets[id].slice();eqDraw();eqLabel();eqSendNow()}});
+  const rb=$('eq-reset');if(rb)rb.onclick=()=>{eqGains=Array(10).fill(0);eqDraw();eqLabel();send('eq_reset')};
+  eqDraw();eqLabel();
 }
 
 function bindEvents(){
@@ -309,6 +395,8 @@ function bindEvents(){
   $('bass-sl').oninput=e=>{$('bass-vv').textContent=e.target.value+' dB';send('bass',{v:parseInt(e.target.value)})};
   $('fx-sel').onchange=e=>send('effect',{v:e.target.value});
   $('fx-clear').onclick=()=>send('clear_fx');
+  // EQ canvas
+  eqInit();
 }
 </script></body></html>"""
 
@@ -330,6 +418,8 @@ def _default_state():
         "upcoming_script": "",
         "paused": False, "loop": False, "radio_active": False,
         "effects": {"speed": 1.0, "bass_db": 0, "treble_db": 0, "effect": "none"},
+        "eq": [0.0] * 10,
+        "eq_bands": [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000],
         "queue": [],
     }
 
@@ -507,6 +597,14 @@ def _sync_effects_for(guild_id):
             "speed": mixer._speed, "bass_db": mixer._bass_db,
             "treble_db": mixer._treble_db, "effect": mixer._effect,
         }
+    # EQ: live mixer gains if there's a mixer, else the gains persisted on the queue.
+    if st is not None:
+        try:
+            from voice import get_music_queue
+            mq = get_music_queue(guild_id)
+            st["eq"] = mixer.get_eq_gains() if mixer else list(mq.eq_gains)
+        except Exception as e:
+            log.debug("EQ state sync failed for %s: %s", guild_id, e)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -654,6 +752,36 @@ async def handle_ws(request):
                         _sync_effects_for(gid)
                         _broadcast()
 
+                elif action == "eq":
+                    gains = d.get("gains") or []
+                    try:
+                        from voice import get_music_queue
+                        mq = get_music_queue(gid)
+                        # Persist on the queue so it survives mixer re-creation per track.
+                        # Normalize to exactly 10 bands so broadcasts always satisfy the
+                        # client's length===10 guard (untrusted WS input is the boundary).
+                        g = [max(-15.0, min(15.0, float(x))) for x in gains][:10]
+                        g += [0.0] * (10 - len(g))
+                        mq.eq_gains = g
+                        if mq._mixer:
+                            mq._mixer.set_eq_gains(mq.eq_gains)
+                        _sync_effects_for(gid)
+                        _broadcast()
+                    except Exception as e:
+                        log.warning("eq action failed: %s", e)
+
+                elif action == "eq_reset":
+                    try:
+                        from voice import get_music_queue
+                        mq = get_music_queue(gid)
+                        mq.eq_gains = [0.0] * 10
+                        if mq._mixer:
+                            mq._mixer.reset_eq()
+                        _sync_effects_for(gid)
+                        _broadcast()
+                    except Exception as e:
+                        log.warning("eq_reset failed: %s", e)
+
             except Exception as exc:
                 log.warning("WS action error: %s", exc, exc_info=True)
     _clients.discard(ws)
@@ -667,6 +795,43 @@ app.router.add_get("/ws", handle_ws)
 _server = None
 
 
+async def _spectrum_loop():
+    """Stream a live FFT spectrum to connected clients at ~15Hz (separate from the
+    full state broadcast). Capture is enabled on mixers only while clients watch."""
+    while True:
+        try:
+            if not _clients:
+                # No watchers — turn capture off so the audio thread does no extra work.
+                for gid in list(_states):
+                    m = _get_mixer(gid)
+                    if m:
+                        m.set_spectrum_on(False)
+                await asyncio.sleep(0.5)
+                continue
+            await asyncio.sleep(0.066)
+            specs = {}
+            for gid in list(_states):
+                m = _get_mixer(gid)
+                if not m:
+                    continue
+                m.set_spectrum_on(True)
+                s = m.get_spectrum()
+                if s:
+                    specs[gid] = s
+            if specs:
+                payload = json.dumps({"spec": specs})
+                for ws in list(_clients):
+                    try:
+                        await ws.send_str(payload)
+                    except Exception:
+                        _clients.discard(ws)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.debug("spectrum loop error: %s", e)
+            await asyncio.sleep(0.5)
+
+
 async def start_web_mixer(port=7777):
     global _server, _loop
     if _server:
@@ -677,4 +842,5 @@ async def start_web_mixer(port=7777):
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     _server = runner
+    asyncio.create_task(_spectrum_loop())
     log.info("Mixer web UI running at http://localhost:%d", port)

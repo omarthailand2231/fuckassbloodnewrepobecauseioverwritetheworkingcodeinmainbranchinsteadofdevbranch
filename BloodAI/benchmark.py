@@ -568,15 +568,15 @@ async def bench_persona():
     invoker = make_member("111", "Ava")
     channel = make_channel("general", "777")
 
-    # 5a. System prompt contains "Blood"
+    # 5a. System prompt establishes the Claude persona
     t0 = time.perf_counter()
     try:
         prompt = build_system_prompt(invoker, guild, channel)
         lat = (time.perf_counter() - t0) * 1000
-        record("System prompt: contains 'Blood'", "Blood" in prompt, lat)
+        record("System prompt: contains 'Claude'", "Claude" in prompt, lat)
     except Exception as e:
         lat = (time.perf_counter() - t0) * 1000
-        record("System prompt: contains 'Blood'", False, lat, str(e))
+        record("System prompt: contains 'Claude'", False, lat, str(e))
 
     # 5b. Invoker name is in the prompt
     t0 = time.perf_counter()

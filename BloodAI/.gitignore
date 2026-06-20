@@ -1,4 +1,8 @@
 .env
 memory/
+backups/
 __pycache__/
 .venv/
+on_join_sfx/
+# Runtime/personal data — transcripts & taste profiles
+data/

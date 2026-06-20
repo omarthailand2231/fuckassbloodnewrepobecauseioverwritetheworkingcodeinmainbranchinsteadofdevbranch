@@ -64,6 +64,107 @@ def _mix_two(pcm_a: bytes, vol_a: float, pcm_b: bytes, vol_b: float) -> bytes:
     return out.tobytes()
 
 
+def _mix_many(frames: list) -> bytes:
+    """Sum any number of 20ms PCM frames into one, clamped to int16 range."""
+    if not frames:
+        return SILENCE
+    if len(frames) == 1:
+        return frames[0]
+    
+    acc = [0] * NUM_SAMPLES
+    for f in frames:
+        if len(f) < FRAME_SIZE:
+            f = f + b'\x00' * (FRAME_SIZE - len(f))
+        a = array.array('h')
+        a.frombytes(f[:FRAME_SIZE])
+        for i in range(NUM_SAMPLES):
+            acc[i] += a[i]
+    
+    out = array.array('h', [0] * NUM_SAMPLES)  # Fixed: create mutable array with proper size
+    for i in range(NUM_SAMPLES):
+        v = acc[i]
+        out[i] = 32767 if v > 32767 else (-32768 if v < -32768 else v)
+    
+    result = out.tobytes()
+    if len(result) != FRAME_SIZE:
+        log.warning("[MIX] output frame size mismatch: expected %d, got %d", FRAME_SIZE, len(result))
+    return result
+
+
+def decode_to_frames(audio_data: bytes, timeout: float = 30.0) -> list:
+    """Decode any audio bytes (mp3/wav/ogg/...) to a list of 20ms s16le/48k/stereo frames."""
+    try:
+        proc = subprocess.Popen(
+            ["ffmpeg", "-i", "pipe:0",
+             "-f", "s16le", "-ar", "48000", "-ac", "2",
+             "-loglevel", "quiet", "pipe:1"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        pcm, err = proc.communicate(input=audio_data, timeout=timeout)
+    except Exception as e:
+        log.warning("[SFX] decode failed: %s", e)
+        return []
+    
+    if not pcm:
+        log.warning("[SFX] FFmpeg returned empty PCM (input: %d bytes). Error: %s", len(audio_data), err.decode('utf-8', errors='ignore') if err else "none")
+        return []
+    
+    frames = []
+    for off in range(0, len(pcm), FRAME_SIZE):
+        chunk = pcm[off:off + FRAME_SIZE]
+        if len(chunk) < FRAME_SIZE:
+            chunk += b'\x00' * (FRAME_SIZE - len(chunk))
+        frames.append(chunk)
+    log.debug("[SFX] decoded %d bytes → %d frames", len(pcm), len(frames))
+    return frames
+
+
+class SfxLayer:
+    """Mixes an arbitrary number of concurrent short clips into one stream.
+
+    Each clip is a list of pre-decoded 20ms frames. ``mix_frame()`` pops one
+    frame from every active clip and sums them, so overlapping sounds play
+    *on top of each other* (intentionally chaotic). Thread-safe: ``add()`` can
+    be called from the asyncio thread while ``mix_frame()`` runs on Discord's
+    player thread.
+    """
+
+    def __init__(self):
+        self._voices: list = []          # list[deque[bytes]]
+        self._lock = threading.Lock()
+
+    def add(self, frames: list) -> None:
+        if not frames:
+            return
+        with self._lock:
+            self._voices.append(deque(frames))
+
+    @property
+    def active(self) -> bool:
+        with self._lock:
+            return any(self._voices)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._voices.clear()
+
+    def mix_frame(self):
+        """Next mixed 20ms frame, or None if nothing is playing."""
+        with self._lock:
+            if not self._voices:
+                return None
+            frames, still = [], []
+            for v in self._voices:
+                if v:
+                    frames.append(v.popleft())
+                    if v:
+                        still.append(v)
+            self._voices = still
+        if not frames:
+            return None
+        return _mix_many(frames)
+
+
 # ── Audio effects: FFmpeg filter builders ────────────────────────────────────
 
 EFFECTS = {
@@ -102,6 +203,109 @@ def build_filter_chain(*, speed: float = 1.0, bass_db: int = 0,
             parts.append(f"atempo={s:.3f}")
 
     return ",".join(p for p in parts if p)
+
+
+# ── True graphic EQ (real-time biquad bank, applied in the PCM domain) ─────────
+
+# 10-band ISO octave centres — what the web mixer's EQ graph drives.
+EQ_BANDS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
+EQ_GAIN_LIMIT = 15.0  # dB clamp per band
+
+
+class Equalizer:
+    """A cascade of RBJ peaking biquads (one per band) applied live to 48k stereo
+    PCM. Gains are adjustable on the fly from the web UI — coefficients rebuild and
+    filter state is preserved so there are no clicks. Falls back to passthrough if
+    numpy/scipy aren't importable or anything goes wrong on the hot path."""
+
+    def __init__(self, sample_rate: int = 48000):
+        self.sr = sample_rate
+        self.bands = list(EQ_BANDS)
+        self.gains = [0.0] * len(self.bands)
+        self._enabled = False
+        self._lock = threading.Lock()
+        self._sos = None
+        self._zi_l = None
+        self._zi_r = None
+        self._np = None
+        self._sosfilt = None
+        try:
+            import numpy as np
+            from scipy.signal import sosfilt
+            self._np = np
+            self._sosfilt = sosfilt
+        except Exception as e:
+            log.warning("[EQ] numpy/scipy unavailable — EQ disabled: %s", e)
+
+    def _peaking_sos(self, f0: float, gain_db: float, q: float = 1.41):
+        """RBJ cookbook peaking-EQ second-order section, normalized by a0."""
+        import math
+        A = 10 ** (gain_db / 40.0)
+        w0 = 2 * math.pi * f0 / self.sr
+        cw, sw = math.cos(w0), math.sin(w0)
+        alpha = sw / (2 * q)
+        b0 = 1 + alpha * A
+        b1 = -2 * cw
+        b2 = 1 - alpha * A
+        a0 = 1 + alpha / A
+        a1 = -2 * cw
+        a2 = 1 - alpha / A
+        return [b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0]
+
+    def _rebuild(self):
+        np = self._np
+        sos = np.array([self._peaking_sos(f, g) for f, g in zip(self.bands, self.gains)],
+                       dtype=np.float64)
+        self._sos = sos
+        if self._zi_l is None or self._zi_l.shape[0] != sos.shape[0]:
+            self._zi_l = np.zeros((sos.shape[0], 2), dtype=np.float64)
+            self._zi_r = np.zeros((sos.shape[0], 2), dtype=np.float64)
+
+    def set_gains(self, gains):
+        n = len(self.bands)
+        g = [float(max(-EQ_GAIN_LIMIT, min(EQ_GAIN_LIMIT, x))) for x in list(gains)[:n]]
+        g += [0.0] * (n - len(g))
+        with self._lock:
+            self.gains = g
+            self._enabled = bool(self._np) and any(abs(x) > 0.1 for x in g)
+            if self._enabled:
+                self._rebuild()
+
+    def get_gains(self) -> list:
+        return list(self.gains)
+
+    def reset(self):
+        self.set_gains([0.0] * len(self.bands))
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def process_scaled(self, pcm: bytes, scale: float = 1.0):
+        """Apply the EQ then the music volume in ONE float pass and clip ONCE, so a
+        boosted band keeps full headroom instead of hard-clipping at full scale before
+        the later volume/duck attenuation (which would bake in irreversible distortion).
+        Returns int16 bytes, or None if the EQ is disabled or anything fails — the caller
+        then applies its own volume normally."""
+        if not self._enabled or self._sos is None:
+            return None
+        try:
+            np = self._np
+            with self._lock:
+                sos = self._sos
+                samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float64)
+                yL, self._zi_l = self._sosfilt(sos, samples[0::2], zi=self._zi_l)
+                yR, self._zi_r = self._sosfilt(sos, samples[1::2], zi=self._zi_r)
+                out = np.empty_like(samples)
+                out[0::2] = yL
+                out[1::2] = yR
+                if scale != 1.0:
+                    out *= scale
+                np.clip(out, -32768, 32767, out=out)
+                return out.astype(np.int16).tobytes()
+        except Exception as e:
+            log.debug("[EQ] process failed (passthrough): %s", e)
+            return None
 
 
 class BloodMixerSource(discord.AudioSource):
@@ -155,6 +359,17 @@ class BloodMixerSource(discord.AudioSource):
         self._bass_db: int = 0
         self._treble_db: int = 0
         self._effect: str = "none"
+
+        # Overlapping join sounds, layered on top of music (no ducking — chaos)
+        self.sfx = SfxLayer()
+
+        # Live graphic EQ applied to the music frame (passthrough when flat)
+        self._eq = Equalizer(48000)
+
+        # Spectrum visualizer — recent output frames captured for an off-thread FFT.
+        self._spec_frames: deque = deque(maxlen=10)
+        self._spec_on = False
+        self._spec_smooth = None
 
     # ── Properties ���──────────────────────────────────────────────────────────
 
@@ -217,6 +432,60 @@ class BloodMixerSource(discord.AudioSource):
         self._treble_db = 0
         self._effect = "none"
 
+    # ── Live graphic EQ ──────────────────────────────────────────────────────
+    def set_eq_gains(self, gains):
+        self._eq.set_gains(gains)
+
+    def get_eq_gains(self) -> list:
+        return self._eq.get_gains()
+
+    def reset_eq(self):
+        self._eq.reset()
+
+    # ── Spectrum visualizer ──────────────────────────────────────────────────
+    def set_spectrum_on(self, on: bool):
+        self._spec_on = bool(on)
+        if not on:
+            self._spec_frames.clear()
+            self._spec_smooth = None
+
+    def get_spectrum(self, nbins: int = 96):
+        """FFT the recently captured output, log-bin it to nbins (31Hz→16kHz) and
+        return a smoothed list of 0..1 magnitudes for the web visualizer. Runs in the
+        caller's thread (web loop), never on the audio thread. None if unavailable."""
+        np = self._eq._np
+        if np is None:
+            return None
+        try:
+            frames = list(self._spec_frames)
+        except Exception:
+            return None
+        if not frames:
+            return None
+        try:
+            data = np.concatenate(frames).astype(np.float64)
+            n = len(data)
+            if n < 512:
+                return None
+            mag = np.abs(np.fft.rfft(data * np.hanning(n)))
+            freqs = np.fft.rfftfreq(n, 1.0 / 48000)
+            edges = np.logspace(np.log10(31), np.log10(16000), nbins + 1)
+            fmask = (freqs >= edges[0]) & (freqs < edges[-1])
+            idx = np.clip(np.digitize(freqs[fmask], edges) - 1, 0, nbins - 1)
+            sums = np.bincount(idx, weights=mag[fmask], minlength=nbins)
+            counts = np.bincount(idx, minlength=nbins)
+            amp = np.where(counts > 0, sums / np.maximum(counts, 1), 0.0) * (2.0 / (n * 32768.0))
+            db = 20.0 * np.log10(amp + 1e-9)
+            cur = np.clip((db + 70.0) / 70.0, 0.0, 1.0)  # -70dB..0dB → 0..1
+            if self._spec_smooth is None or len(self._spec_smooth) != nbins:
+                self._spec_smooth = cur
+            else:
+                self._spec_smooth = 0.5 * self._spec_smooth + 0.5 * cur
+            return [round(float(x), 3) for x in self._spec_smooth]
+        except Exception as e:
+            log.debug("[SPEC] failed: %s", e)
+            return None
+
     def get_effects_info(self) -> dict:
         return {
             "speed": self._speed,
@@ -237,8 +506,16 @@ class BloodMixerSource(discord.AudioSource):
     def _ffmpeg_cmd(self, stream_url: str, *, pipe_input: bool = False) -> list[str]:
         cmd = ["ffmpeg"]
         if not pipe_input:
+            # Keep network streams (e.g. YouTube googlevideo) alive through
+            # transient stalls/HTTP errors instead of EOF-ing early. An early EOF
+            # is indistinguishable from a clean end downstream and cuts the song
+            # off mid-track. -rw_timeout (µs) bounds a hung read so reconnect can
+            # kick in rather than the read blocking forever. (ffmpeg 4.3+.)
             cmd += ["-reconnect", "1", "-reconnect_streamed", "1",
-                    "-reconnect_delay_max", "5"]
+                    "-reconnect_on_network_error", "1",
+                    "-reconnect_on_http_error", "4xx,5xx",
+                    "-reconnect_delay_max", "10",
+                    "-rw_timeout", "15000000"]
         cmd += ["-i", "pipe:0" if pipe_input else stream_url]
 
         af = self._current_filter_chain()
@@ -401,6 +678,7 @@ class BloodMixerSource(discord.AudioSource):
         def _reader():
             proc = prebuf_proc
             chunk_counter = 0
+            reader_t0 = time.monotonic()
             try:
                 if prebuf_frames:
                     for chunk in prebuf_frames:
@@ -423,7 +701,12 @@ class BloodMixerSource(discord.AudioSource):
                     chunk = proc.stdout.read(FRAME_SIZE)
                     if not chunk:
                         if not stop.is_set():
-                            log.info("Music stream ended (FFmpeg returned empty, chunks=%d)", chunk_counter)
+                            # chunks * 20ms = seconds of audio actually decoded.
+                            # If this is far below the track length, the stream
+                            # died early (stall/expired URL) rather than ending.
+                            log.info("Music stream ended (FFmpeg returned empty after %d chunks ≈ %.1fs audio, %.1fs wall)",
+                                     chunk_counter, chunk_counter * (FRAME_SIZE / (48000 * 2 * 2)),
+                                     time.monotonic() - reader_t0)
                         break
                     if len(chunk) < FRAME_SIZE:
                         chunk += b'\x00' * (FRAME_SIZE - len(chunk))
@@ -695,23 +978,47 @@ class BloodMixerSource(discord.AudioSource):
             music = _scale_pcm(fadeout, self._fadeout_vol)
             mvol = 1.0
 
-        # 2. No audio at all
+        # Live EQ on the music frame, with the music volume folded into the SAME
+        # float pass and clipped ONCE — so a boosted band keeps the headroom that the
+        # volume/duck attenuation would otherwise have given it (no early full-scale
+        # clipping). TTS/SFX are never EQ'd. Passthrough (None) → normal scaling below.
+        if music is not None and self._eq.enabled:
+            eqd = self._eq.process_scaled(music, mvol)
+            if eqd is not None:
+                music = eqd
+                mvol = 1.0  # volume already applied inside the EQ pass
+
+        # Overlapping join sounds — mixed in on top of everything, no ducking
+        sfx = self.sfx.mix_frame()
+
+        # 2. No music/TTS — emit SFX alone (or silence)
         if music is None and tts is None:
-            return SILENCE
+            return sfx if sfx is not None else SILENCE
 
         # 3. Mix music + TTS
         if music and tts:
-            return _mix_two(music, mvol, tts, 1.0)
+            base = _mix_two(music, mvol, tts, 1.0)
         elif music:
             if self._read_call_count <= 5:
                 is_silent = all(b == 0 for b in music[:100])
                 log.info("[AUDIO] Music read #%d: vol=%.3f, ducking=%s, pre_fade=%s, silent=%s",
                          self._read_call_count, mvol, ducking, pre_fading, is_silent)
-            if mvol >= 0.99:
-                return music
-            return _scale_pcm(music, mvol)
+            base = music if mvol >= 0.99 else _scale_pcm(music, mvol)
         else:
-            return tts
+            base = tts
+
+        # 4. Overlay any active join sounds
+        out = _mix_two(base, 1.0, sfx, 1.0) if sfx is not None else base
+
+        # Capture the final output for the spectrum visualizer (cheap; FFT runs off-thread)
+        if self._spec_on and out is not None and len(out) >= FRAME_SIZE:
+            _np = self._eq._np
+            if _np is not None:
+                try:
+                    self._spec_frames.append(_np.frombuffer(out, dtype=_np.int16)[0::2].copy())
+                except Exception:
+                    pass
+        return out
 
     # ── Cleanup ��─────────────────────────────��───────────────────────────────
 

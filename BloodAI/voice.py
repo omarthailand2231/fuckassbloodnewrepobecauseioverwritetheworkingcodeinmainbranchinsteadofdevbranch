@@ -25,6 +25,42 @@ if not discord.opus.is_loaded():
     except Exception as e:
         log.warning("Failed to load opus: %s — voice receive won't work", e)
 
+# ── Resilient opus decode (voice RECEIVE only) ───────────────────────────────
+# discord-ext-voice-recv runs the opus Decoder inside its PacketRouter thread.
+# If decode() raises (e.g. OpusError "corrupted stream" on a malformed/edge
+# packet), that exception bubbles out of the router loop whose finally-block
+# calls stop_listening() — permanently killing reception for the whole session,
+# so transcription dies silently after ONE bad packet. Wrap the class-level
+# decode so a bad frame is skipped (returns 20ms of silence) instead of tearing
+# the listener down. The ok/fail counters tell us, in the logs, whether bad
+# frames are occasional (transcription still works) or universal (a deeper
+# decrypt/library-version issue). This does NOT affect music playback, which
+# goes FFmpeg -> PCM and never touches the opus Decoder.
+_opus_decode_ok = [0]
+_opus_decode_fail = [0]
+try:
+    _OpusDecoder = discord.opus.Decoder
+    _orig_opus_decode = _OpusDecoder.decode
+    _SILENT_OPUS_FRAME = b"\x00" * (_OpusDecoder.SAMPLES_PER_FRAME * _OpusDecoder.CHANNELS * 2)
+
+    def _safe_opus_decode(self, data, *args, **kwargs):
+        try:
+            pcm = _orig_opus_decode(self, data, *args, **kwargs)
+            _opus_decode_ok[0] += 1
+            return pcm
+        except Exception as e:
+            _opus_decode_fail[0] += 1
+            n = _opus_decode_fail[0]
+            if n in (1, 5, 25, 100) or n % 500 == 0:
+                log.warning("[VC] opus decode failed (#%d, decoded_ok=%d): %s — skipping frame "
+                            "to keep the listener alive", n, _opus_decode_ok[0], e)
+            return _SILENT_OPUS_FRAME
+
+    _OpusDecoder.decode = _safe_opus_decode
+    log.info("[VC] Resilient opus decoder installed (corrupt frames skipped, listener survives)")
+except Exception as e:
+    log.warning("[VC] Could not install resilient opus decoder: %s", e)
+
 _stt_session: Optional[aiohttp.ClientSession] = None
 
 def _get_stt_session() -> aiohttp.ClientSession:
@@ -37,13 +73,18 @@ def _get_stt_session() -> aiohttp.ClientSession:
     return _stt_session
 
 logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.CRITICAL)
-logging.getLogger("discord.ext.voice_recv.router").setLevel(logging.CRITICAL)
+logging.getLogger("discord.ext.voice_recv.router").setLevel(logging.ERROR)
 # Reader at ERROR to catch CryptoError / decryption failures (not DEBUG to avoid spam)
 logging.getLogger("discord.ext.voice_recv.reader").setLevel(logging.ERROR)
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_STT_MODEL = "whisper-large-v3-turbo"
+
+# Master switch for speech-to-text / VC transcription. When false, the bot still
+# joins voice for TTS and music but does NOT attach the audio receiver, so no
+# opus decoding or transcription happens. Flip STT_ENABLED=true in .env to re-enable.
+STT_ENABLED = os.getenv("STT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 
 WAKE_WORDS = ["blood", "hey blood", "เลือด", "บลัด"]
 
@@ -53,7 +94,7 @@ TTS_RATE = "+10%"
 SAMPLE_RATE = 48000
 CHANNELS = 2
 SILENCE_THRESHOLD_SEC = 1.5
-MAX_SPEECH_SEC = 30
+MAX_SPEECH_SEC = 15  # cap continuous speech before forcing a harvest/transcribe
 MIN_SPEECH_SEC = 0.3
 
 MUSIC_VOLUME = 0.5
@@ -78,16 +119,19 @@ FFMPEG_OPTS = {
 
 
 class MusicTrack:
-    __slots__ = ("title", "url", "stream_url", "duration", "requester", "source_type")
+    __slots__ = ("title", "url", "stream_url", "duration", "requester",
+                 "source_type", "thumbnail")
 
     def __init__(self, title: str, url: str, stream_url: str,
-                 duration: int = 0, requester: str = "", source_type: str = "youtube"):
+                 duration: int = 0, requester: str = "", source_type: str = "youtube",
+                 thumbnail: str = ""):
         self.title = title
         self.url = url
         self.stream_url = stream_url
         self.duration = duration
         self.requester = requester
         self.source_type = source_type
+        self.thumbnail = thumbnail
 
     def __repr__(self):
         return f"<Track: {self.title}>"
@@ -102,6 +146,7 @@ class MusicQueue:
         self.loop = False
         self.paused = False
         self._mixer = None
+        self.eq_gains = [0.0] * 10  # 10-band EQ, persists across tracks (web mixer)
 
     def add(self, track: MusicTrack):
         self.queue.append(track)
@@ -309,6 +354,36 @@ def _periodic_web_mixer_sync(guild: Optional[discord.Guild]):
     )
 
 
+def _deezer_search(query: str) -> Optional[dict]:
+    """Resolve a query to a canonical track via Deezer's free public API (no auth).
+
+    Returns {title, artist, duration, cover} or None. Deezer's own audio is DRM-locked
+    and not streamable (yt-dlp has no Deezer extractor), so this is metadata-only — it's
+    used to find the right YouTube audio. Runs inside extract_track's executor thread.
+    """
+    import urllib.request, urllib.parse
+    try:
+        url = "https://api.deezer.com/search?limit=5&q=" + urllib.parse.quote(query)
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.load(r)
+    except Exception as e:
+        log.debug("Deezer search failed for '%s': %s", query[:50], e)
+        return None
+    for t in (data.get("data") or []):
+        title = (t.get("title") or "").strip()
+        artist = ((t.get("artist") or {}).get("name") or "").strip()
+        if title and artist:
+            album = t.get("album") or {}
+            return {
+                "title": title,
+                "artist": artist,
+                "duration": int(t.get("duration") or 0),
+                "cover": album.get("cover_big") or album.get("cover_medium") or "",
+            }
+    return None
+
+
 async def extract_track(query: str, requester: str = "") -> Optional[MusicTrack]:
     import re as _re
 
@@ -336,6 +411,18 @@ async def extract_track(query: str, requester: str = "") -> Optional[MusicTrack]
             src = "soundcloud"
         elif "spotify" in query.lower():
             src = "spotify"
+        # Cover art — prefer an explicit thumbnail, else the largest from the list
+        thumb = info.get("thumbnail") or ""
+        if not thumb:
+            thumbs = info.get("thumbnails") or []
+            if thumbs:
+                try:
+                    thumb = max(
+                        thumbs,
+                        key=lambda t: (t.get("preference", 0), t.get("width", 0) or 0),
+                    ).get("url", "")
+                except Exception:
+                    thumb = (thumbs[-1] or {}).get("url", "")
         return MusicTrack(
             title=info.get("title", "Unknown"),
             url=info.get("webpage_url", query),
@@ -343,6 +430,7 @@ async def extract_track(query: str, requester: str = "") -> Optional[MusicTrack]
             duration=int(info.get("duration", 0) or 0),
             requester=requester,
             source_type=src,
+            thumbnail=thumb,
         )
 
     def _extract():
@@ -375,18 +463,39 @@ async def extract_track(query: str, requester: str = "") -> Optional[MusicTrack]
                 except Exception as e:
                     log.debug("YouTube entry failed (age-gate?): %s", str(e)[:100])
                     continue
-            log.info("YouTube failed for '%s' — trying SoundCloud", query[:60])
-            try:
-                sc_results = ydl.extract_info(f"scsearch3:{query.strip()}", download=False)
-                sc_entries = (sc_results or {}).get("entries") or []
-                for entry in sc_entries:
-                    if not entry:
+            # YouTube's own search came up empty. Deezer audio can't be streamed (DRM,
+            # no yt-dlp extractor), so use its clean catalog to resolve the *real* track
+            # + duration, then pull matching audio from YouTube. (Replaces SoundCloud.)
+            dz = _deezer_search(query.strip())
+            if dz:
+                clean_q = f"{dz['artist']} - {dz['title']}"
+                log.info("Deezer resolved '%s' → '%s' (%ds) — re-searching YouTube",
+                         query[:50], clean_q, dz["duration"])
+                try:
+                    yt2 = ydl.extract_info(f"ytsearch5:{clean_q} audio", download=False)
+                    cand = [e for e in ((yt2 or {}).get("entries") or [])
+                            if e and not _is_bad(e.get("title", ""), e.get("duration", 0))]
+                except Exception as e:
+                    log.debug("Deezer→YouTube re-search failed: %s", str(e)[:100])
+                    cand = []
+                # Prefer the YouTube result whose length matches Deezer's known
+                # duration — this is what kills 10-hour loops / wrong-version junk.
+                target = dz["duration"]
+                cand.sort(key=lambda e: abs((e.get("duration") or 0) - target)
+                          if (e.get("duration") and target) else 9999)
+                for entry in cand:
+                    try:
+                        vurl = entry.get("url") or entry.get("webpage_url")
+                        if vurl and not entry.get("url"):
+                            entry = ydl.extract_info(vurl, download=False)
+                        if entry and entry.get("url"):
+                            track = _make_track(entry, "youtube")
+                            track.source_type = "deezer"  # resolved via Deezer
+                            if not track.thumbnail and dz.get("cover"):
+                                track.thumbnail = dz["cover"]
+                            return track
+                    except Exception:
                         continue
-                    if _is_bad(entry.get("title", ""), entry.get("duration", 0)):
-                        continue
-                    return _make_track(entry, "soundcloud")
-            except Exception as e:
-                log.warning("SoundCloud fallback also failed: %s", str(e)[:100])
             return None
 
     try:
@@ -431,6 +540,12 @@ async def play_track(guild: discord.Guild, track: MusicTrack,
         # Fresh mixer — _stop_event starts cleared, ready for a new stream
         mixer = BloodMixerSource(loop)
         mq._mixer = mixer
+        # Re-apply any EQ the user dialed in so it persists across tracks
+        try:
+            if any(abs(g) > 0.1 for g in mq.eq_gains):
+                mixer.set_eq_gains(mq.eq_gains)
+        except Exception:
+            pass
 
         # Stop whatever Discord is currently playing before attaching new mixer
         if vc.is_playing() or vc.is_paused():
@@ -462,9 +577,19 @@ async def play_track(guild: discord.Guild, track: MusicTrack,
 
         vc.play(mixer, after=_on_player_stop)
 
-        if text_channel:
+        # When radio is driving via its player panel, the panel is the now-playing
+        # display — skip the redundant text line (and the extra panel repost it causes).
+        _radio_has_panel = False
+        try:
+            import radio_panel
+            _radio_has_panel = radio_panel.get_panel(guild_id) is not None
+        except Exception:
+            _radio_has_panel = False
+
+        if text_channel and not _radio_has_panel:
             dur = f" ({track.duration // 60}:{track.duration % 60:02d})" if track.duration else ""
-            icon = {"youtube": "🔴", "spotify": "🟢", "soundcloud": "🟠"}.get(track.source_type, "🎵")
+            icon = {"youtube": "🔴", "spotify": "🟢", "soundcloud": "🟠",
+                    "deezer": "🔵"}.get(track.source_type, "🎵")
             try:
                 await text_channel.send(
                     f"{icon} **Now playing:** {track.title}{dur} — requested by {track.requester}"
@@ -562,10 +687,26 @@ async def play_music(guild: discord.Guild, query: str, requester: str = "",
     if not track:
         return f"❌ Could not find anything for: {query}"
     if requester_id and track.title:
-        record_feedback(requester_id, track.title, positive=True)
+        # Run taste feedback in executor to avoid blocking event loop
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(None, record_feedback, requester_id, track.title, True)
+        except Exception as e:
+            log.debug("Feedback recording failed: %s", e)
     mq = get_music_queue(guild_id)
     is_playing = has_active_music(guild)
     if is_playing:
+        if get_radio_dj(guild_id).is_active:
+            # Radio request — jump the queue so it plays right after the current
+            # track, preload it for a gapless cut-in, and steer the vibe toward it.
+            mq.queue.insert(0, track)
+            try:
+                if mq._mixer:
+                    mq._mixer.prebuffer_next(track.stream_url)
+            except Exception as e:
+                log.debug("[RADIO] request prebuffer failed: %s", e)
+            record_radio_request(guild_id, track.title)
+            return f"📻 **Up next:** {track.title} — playing right after this one."
         mq.add(track)
         pos = len(mq.queue)
         return f"📋 **Queued #{pos}:** {track.title}"
@@ -580,6 +721,9 @@ async def skip_music(guild: discord.Guild) -> str:
     if not mq.current and (not mq._mixer or not mq._mixer.has_music):
         return "Nothing is playing."
     old_title = mq.current.title if mq.current else "track"
+    # Radio: a skip is "not in the mood" — cooldown so it won't loop back, NOT a dislike.
+    if get_radio_dj(guild_id).is_active and old_title != "track":
+        record_radio_skip(guild_id, old_title)
     nxt = mq.skip()
     if nxt:
         mixer = mq._mixer
@@ -701,6 +845,58 @@ def get_queue_info(guild_id: str, guild: Optional[discord.Guild] = None) -> str:
     return "\n".join(lines)
 
 
+def _push_queue_to_web(guild_id: str):
+    mq = get_music_queue(guild_id)
+    _update_web_mixer(guild_id, queue=[t.title for t in mq.queue[:20]])
+
+
+def remove_from_queue(guild_id: str, position: int) -> str:
+    """Remove the upcoming track at a 1-based queue position (not the current song)."""
+    mq = get_music_queue(guild_id)
+    if not mq.queue:
+        return "The queue is empty — nothing to remove."
+    try:
+        position = int(position)
+    except (TypeError, ValueError):
+        return "Give a queue position number (e.g. 2)."
+    if position < 1 or position > len(mq.queue):
+        return f"Position {position} is out of range — the queue has {len(mq.queue)} track(s)."
+    removed = mq.queue.pop(position - 1)
+    _push_queue_to_web(guild_id)
+    return f"🗑️ Removed **{removed.title}** from the queue (was #{position})."
+
+
+def move_in_queue(guild_id: str, from_position: int, to_position: int) -> str:
+    """Reorder the queue: move the track at from_position to to_position (1-based)."""
+    mq = get_music_queue(guild_id)
+    n = len(mq.queue)
+    if n < 2:
+        return "Need at least 2 queued tracks to reorder."
+    try:
+        from_position = int(from_position); to_position = int(to_position)
+    except (TypeError, ValueError):
+        return "Give numeric positions (e.g. move 3 to 1)."
+    if not (1 <= from_position <= n) or not (1 <= to_position <= n):
+        return f"Positions must be between 1 and {n}."
+    if from_position == to_position:
+        return "That track is already in that position."
+    track = mq.queue.pop(from_position - 1)
+    mq.queue.insert(to_position - 1, track)
+    _push_queue_to_web(guild_id)
+    return f"↕️ Moved **{track.title}** to #{to_position}."
+
+
+def clear_queue(guild_id: str) -> str:
+    """Clear all upcoming tracks. The currently-playing song keeps playing."""
+    mq = get_music_queue(guild_id)
+    count = len(mq.queue)
+    if not count:
+        return "The queue is already empty."
+    mq.queue.clear()
+    _push_queue_to_web(guild_id)
+    return f"🧹 Cleared the queue ({count} track{'s' if count != 1 else ''} removed). The current song keeps playing."
+
+
 def set_music_volume(guild_id: str, vol: float) -> str:
     vol = max(0.0, min(1.0, vol))
     mq = get_music_queue(guild_id)
@@ -763,9 +959,13 @@ def _get_taste_model():
             return _taste_embed_model
     except Exception:
         pass
-    from sentence_transformers import SentenceTransformer
-    _taste_embed_model = SentenceTransformer("all-MiniLM-L6-v2")
-    return _taste_embed_model
+    try:
+        from sentence_transformers import SentenceTransformer
+        _taste_embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+        return _taste_embed_model
+    except Exception as e:
+        log.warning("Taste model failed to load: %s — taste filtering disabled", e)
+        return None
 
 
 def _is_taste_relevant(entry: str, existing_liked: list[str], threshold: float = 0.35) -> bool:
@@ -773,6 +973,8 @@ def _is_taste_relevant(entry: str, existing_liked: list[str], threshold: float =
         return True
     try:
         model = _get_taste_model()
+        if model is None:
+            return True  # Accept if model failed to load
         entry_emb = model.encode(entry)
         recent_liked = existing_liked[-20:]
         liked_embs = model.encode(recent_liked)
@@ -797,9 +999,23 @@ def _has_repeated_pattern(entry: str, existing_liked: list[str], min_matches: in
     return count >= min_matches
 
 
+def _norm_song(s: str) -> str:
+    """Normalize a song string for matching: lowercase, strip junk parens/brackets."""
+    import re as _re
+    s = s.lower().strip()
+    s = _re.sub(r"[\(\[].*?[\)\]]", "", s)  # drop (Official Video), [HQ], etc.
+    s = _re.sub(r"\s+", " ", s)
+    return s.strip(" -")
+
+
+def _artist_of(s: str) -> str:
+    return s.split(" - ")[0].strip().lower() if " - " in s else ""
+
+
 def record_feedback(user_id: str, track_title: str, positive: bool):
     data = _load_taste(user_id)
     entry = track_title.strip()
+    weights = data.setdefault("dislike_weights", {})
     if positive:
         if entry not in data["liked"]:
             if (_is_taste_relevant(entry, data["liked"])
@@ -810,13 +1026,49 @@ def record_feedback(user_id: str, track_title: str, positive: bool):
                 log.debug("[TASTE] Rejected from liked (not relevant): %s", entry[:50])
                 return
         data["disliked"] = [d for d in data["disliked"] if d != entry]
+        # A like cancels accumulated dislike for that exact song
+        weights.pop(_norm_song(entry), None)
     else:
+        # Dislike STACKS — each press strengthens avoidance, escalating to the artist.
+        key = _norm_song(entry)
+        weights[key] = weights.get(key, 0) + 1
+        artist = _artist_of(entry)
+        if artist:
+            akey = f"artist::{artist}"
+            weights[akey] = weights.get(akey, 0) + 1
         if entry not in data["disliked"]:
             data["disliked"].append(entry)
         data["liked"] = [l for l in data["liked"] if l != entry]
+        log.info("[TASTE] Dislike stacked: '%s' weight=%d (artist '%s' weight=%d)",
+                 entry[:50], weights.get(key, 0),
+                 artist, weights.get(f"artist::{artist}", 0) if artist else 0)
     data["liked"] = data["liked"][-100:]
     data["disliked"] = data["disliked"][-100:]
+    # Keep only the heaviest dislike weights so the file can't grow unbounded
+    if len(weights) > 200:
+        data["dislike_weights"] = dict(
+            sorted(weights.items(), key=lambda kv: kv[1], reverse=True)[:200]
+        )
     _save_taste(user_id, data)
+
+
+def dislike_strength(data: dict, song: str) -> int:
+    """How strongly THIS user dislikes a song — max of exact-song and artist weight."""
+    weights = data.get("dislike_weights") or {}
+    # Back-compat: a plain entry in the legacy 'disliked' list counts as weight 1
+    base = 1 if song in data.get("disliked", []) else 0
+    exact = weights.get(_norm_song(song), 0)
+    artist = _artist_of(song)
+    art_w = weights.get(f"artist::{artist}", 0) if artist else 0
+    return max(base, exact, art_w)
+
+
+async def record_feedback_async(user_id: str, track_title: str, positive: bool):
+    """Async wrapper for record_feedback. The taste-relevance check embeds text with a
+    sentence-transformer (~2-3s, blocking), which would stall the event loop and expire
+    Discord interaction tokens (10062) — so always run it in a worker thread."""
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, record_feedback, user_id, track_title, positive)
 
 
 _rec_cache: dict[str, list[str]] = {}
@@ -1261,6 +1513,9 @@ class RadioDJ:
         self._pending_speech_audio: Optional[bytes] = None
         self._pending_speech_for: Optional[str] = None  # next_song title this speech is for
         self._pregen_task: Optional[asyncio.Task] = None
+        self._listener_ids: list[str] = []  # user IDs currently in the VC (for taste blend)
+        self._skipped: list[str] = []  # session skip-cooldown: "not in the mood", NOT a dislike
+        self._recent_requests: list[str] = []  # explicit listener requests — steer the vibe
 
     @property
     def is_active(self):
@@ -1277,13 +1532,135 @@ class RadioDJ:
 
 
 _radio_djs: dict[str, RadioDJ] = {}
-_radio_recent: list[str] = []
+# Per-guild recently-played, so one server's history never suppresses another's.
+_radio_recent: dict[str, list[str]] = defaultdict(list)
 
 
 def get_radio_dj(guild_id: str) -> RadioDJ:
     if guild_id not in _radio_djs:
         _radio_djs[guild_id] = RadioDJ(guild_id)
     return _radio_djs[guild_id]
+
+
+def record_radio_skip(guild_id: str, title: str):
+    """A skip = 'not in the mood right now'. Cooldown so it won't loop back this
+    session, but it is NOT a dislike and never touches the taste profile."""
+    if not title:
+        return
+    rdj = get_radio_dj(guild_id)
+    key = _norm_song(title)
+    if key in rdj._skipped:
+        rdj._skipped.remove(key)
+    rdj._skipped.append(key)
+    if len(rdj._skipped) > 300:
+        rdj._skipped = rdj._skipped[-300:]
+    log.info("[RADIO] Skip cooldown: '%s' (%d on cooldown)", title[:50], len(rdj._skipped))
+
+
+def record_radio_request(guild_id: str, title: str):
+    """Record an explicit listener request so the curator steers upcoming auto-picks
+    toward its vibe (genre/energy/adjacent artists)."""
+    if not title:
+        return
+    rdj = get_radio_dj(guild_id)
+    if title in rdj._recent_requests:
+        rdj._recent_requests.remove(title)
+    rdj._recent_requests.append(title)
+    if len(rdj._recent_requests) > 8:
+        rdj._recent_requests = rdj._recent_requests[-8:]
+
+
+ARTIST_AVOID_THRESHOLD = 2  # dislikes must STACK to this before avoiding the whole artist
+
+
+def _radio_vibe_hint(guild_id: str) -> str:
+    """A cheap, no-LLM read of the room's current mood: time of day + recent chatter.
+    Fed into the curator so the set drifts toward how the room feels right now."""
+    from datetime import datetime, timezone, timedelta
+    parts = []
+    try:
+        hour = (datetime.now(timezone.utc) + timedelta(hours=7)).hour
+    except Exception:
+        hour = 12
+    if 0 <= hour < 6:
+        parts.append("it's deep late night")
+    elif hour < 12:
+        parts.append("it's morning")
+    elif hour < 17:
+        parts.append("it's afternoon")
+    elif hour < 21:
+        parts.append("it's evening")
+    else:
+        parts.append("it's night")
+    msgs = []
+    for e in _convo_buffer.get(guild_id, [])[-6:]:
+        if e.get("user_name") != "Blood" and e.get("text"):
+            t = e["text"].strip().replace("\n", " ")
+            if t:
+                msgs.append(t[:80])
+    if msgs:
+        parts.append("recent chat: " + " | ".join(msgs[-4:]))
+    return "; ".join(parts)
+
+
+def _collect_room_taste(listener_ids: list[str]) -> dict:
+    """Blend the taste of everyone currently in the VC.
+
+    Returns {'liked': [...], 'liked_norm': set, 'dislikes': {normkey: weight}}.
+    The dislike map covers both exact-song keys and 'artist::<name>' keys, summed
+    across listeners so that dislikes genuinely stack the more people (and the more
+    often) a song/artist gets thumbed-down.
+    """
+    liked: list[str] = []
+    liked_norm: set[str] = set()
+    dislikes: dict[str, int] = {}
+    for uid in listener_ids:
+        try:
+            data = _load_taste(uid)
+        except Exception:
+            continue
+        for l in data.get("liked", [])[-15:]:
+            liked.append(l)
+            liked_norm.add(_norm_song(l))
+        # dislike_weights is the source of truth (record_feedback keeps it in sync).
+        weights = data.get("dislike_weights") or {}
+        for k, w in weights.items():
+            dislikes[k] = dislikes.get(k, 0) + int(w)
+        # Back-compat ONLY: legacy 'disliked' entries from before weights existed.
+        # Skip any whose song key already appears in weights so we never double-count.
+        for d in data.get("disliked", []):
+            k = _norm_song(d)
+            if k in weights:
+                continue
+            dislikes[k] = dislikes.get(k, 0) + 1
+            art = _artist_of(d)
+            if art:
+                dislikes[f"artist::{art}"] = dislikes.get(f"artist::{art}", 0) + 1
+    return {"liked": liked, "liked_norm": liked_norm, "dislikes": dislikes}
+
+
+def _radio_passes(song: str, guild_id: str, room: dict, rdj: "RadioDJ") -> bool:
+    """Hard gate before a song is allowed into the radio queue.
+
+    - exact-song dislike (any weight) → always blocked
+    - artist dislike that has STACKED to the threshold → blocked, unless the song
+      is one the room explicitly liked (an explicit like wins over artist avoidance)
+    - skip cooldown (this session) → blocked
+    - recently played → blocked
+    """
+    norm = _norm_song(song)
+    dislikes = room["dislikes"]
+    if dislikes.get(norm, 0) >= 1:
+        return False
+    art = _artist_of(song)
+    if (art and dislikes.get(f"artist::{art}", 0) >= ARTIST_AVOID_THRESHOLD
+            and norm not in room["liked_norm"]):
+        return False
+    if norm in rdj._skipped:
+        return False
+    if song in _radio_recent[guild_id]:
+        return False
+    return True
 
 
 async def _warmup_elevenlabs_bg():
@@ -1308,26 +1685,72 @@ async def _warmup_elevenlabs_bg():
     log.warning("[RADIO] All ElevenLabs voices failed warmup — will use edge_tts")
 
 
-async def _radio_recommendations(count: int = 15) -> list[str]:
+async def _radio_recommendations(rdj: "RadioDJ", count: int = 15) -> list[str]:
+    """Taste-aware curator: seeds from the liked songs of whoever is in the VC,
+    hard-avoids disliked songs/artists, and mixes in discovery so it never loops
+    the same generic canon. Falls back to the built-in list (also filtered)."""
     import random as _rng
     from provider import call_ai
 
+    guild_id = rdj.guild_id
+    room = _collect_room_taste(rdj._listener_ids)
+    dislikes = room["dislikes"]
+    liked = list(room["liked"])
+    _rng.shuffle(liked)
+    liked_sample = liked[:12]
+
     genre_sample = _rng.sample(RADIO_GENRES, min(5, len(RADIO_GENRES)))
     genres_text = ", ".join(genre_sample)
-    recent_text = ", ".join(_radio_recent[-10:]) if _radio_recent else "none"
+    recent_text = ", ".join(_radio_recent[guild_id][-10:]) if _radio_recent[guild_id] else "none"
+
+    # Surface the room's strongest dislikes so the model avoids that lane entirely.
+    avoid_artists = sorted(
+        (k[len("artist::"):] for k, w in dislikes.items()
+         if k.startswith("artist::") and w >= 1),
+        key=lambda a: dislikes.get(f"artist::{a}", 0), reverse=True,
+    )[:12]
+    avoid_text = ", ".join(avoid_artists) if avoid_artists else "none"
+
+    if liked_sample:
+        taste_line = (
+            f"The people listening right now have liked these before — lean into this "
+            f"taste, same energy and adjacent artists: {', '.join(liked_sample)}\n"
+        )
+        mix_rule = ("- Mix: ~60% close to the listeners' taste above, ~30% discovery "
+                    "(adjacent artists/genres they'd likely enjoy), ~10% wildcard\n")
+    else:
+        taste_line = ""
+        mix_rule = "- Mix well-known indie with deeper cuts\n"
+
+    # Live vibe: time of day + what the room is saying right now, so the set leans
+    # toward the mood of the moment instead of a fixed late-night template.
+    vibe_hint = _radio_vibe_hint(guild_id)
+    vibe_line = (f"Read the room right now — {vibe_hint}\n"
+                 f"Nudge the energy/feel of the picks toward that mood.\n") if vibe_hint else ""
+
+    # Explicit requests are the strongest steer — bend the set toward them.
+    requests = list(rdj._recent_requests)[-5:]
+    request_line = (
+        f"The room just REQUESTED: {', '.join(requests)}. "
+        f"Strongly match that vibe — same energy, genre and adjacent artists — in your picks.\n"
+    ) if requests else ""
 
     prompt = (
-        f"You are a late-night indie radio station music curator.\n"
+        f"You are a radio station music curator reading the room in real time.\n"
         f"Generate {count} songs perfect for background/radio listening.\n\n"
+        f"{taste_line}"
+        f"{request_line}"
+        f"{vibe_line}"
         f"Genres to draw from: {genres_text}\n"
-        f"Recently played (DO NOT repeat): {recent_text}\n\n"
+        f"Recently played (DO NOT repeat): {recent_text}\n"
+        f"NEVER suggest these artists (listeners disliked them): {avoid_text}\n\n"
         f"Rules:\n"
         f"- Output ONLY a list, one song per line, format: Artist - Song Title\n"
         f"- NO numbering, NO bullets, NO extra text\n"
         f"- Every song must be REAL and existing\n"
         f"- Tempo: not too fast, not too slow — background/radio vibe\n"
-        f"- Mix well-known indie with deeper cuts\n"
-        f"- NEVER repeat an artist\n"
+        f"{mix_rule}"
+        f"- NEVER repeat an artist within this list\n"
         f"- Think: songs you'd hear on a chill indie radio station at night\n"
     )
     try:
@@ -1345,6 +1768,8 @@ async def _radio_recommendations(count: int = 15) -> list[str]:
                     and not any(w in line.lower() for w in
                                 ("actually", "maybe", "could be", "let me", "i think", "note:", "here"))):
                 songs.append(line)
+        # Hard gate: drop anything disliked / skipped / too-recent before it can play.
+        songs = [s for s in songs if _radio_passes(s, guild_id, room, rdj)]
         if songs:
             _rng.shuffle(songs)
             return songs
@@ -1353,28 +1778,33 @@ async def _radio_recommendations(count: int = 15) -> list[str]:
 
     fallback = list(RADIO_FALLBACK_SONGS)
     _rng.shuffle(fallback)
-    return [s for s in fallback if s not in _radio_recent][:count]
+    return [s for s in fallback if _radio_passes(s, guild_id, room, rdj)][:count]
+
+
+def _mark_radio_played(guild_id: str, song: str):
+    recent = _radio_recent[guild_id]
+    if song not in recent:
+        recent.append(song)
+    if len(recent) > 40:
+        _radio_recent[guild_id] = recent[-40:]
 
 
 async def _get_radio_song(rdj: RadioDJ) -> str:
-    global _radio_recent
-    if rdj._rec_cache:
+    guild_id = rdj.guild_id
+    room = _collect_room_taste(rdj._listener_ids)
+    # Drain the prefetch cache first, skipping anything now filtered out.
+    while rdj._rec_cache:
         song = rdj._rec_cache.pop(0)
-        if song not in _radio_recent:
-            _radio_recent.append(song)
-            if len(_radio_recent) > 30:
-                _radio_recent = _radio_recent[-30:]
+        if _radio_passes(song, guild_id, room, rdj):
+            _mark_radio_played(guild_id, song)
             return song
-    songs = await _radio_recommendations(count=15)
-    songs = [s for s in songs if s not in _radio_recent]
+    songs = await _radio_recommendations(rdj, count=15)
     if not songs:
-        songs = await _radio_recommendations(count=15)
+        songs = await _radio_recommendations(rdj, count=15)
     if songs:
         song = songs.pop(0)
         rdj._rec_cache = songs
-        _radio_recent.append(song)
-        if len(_radio_recent) > 30:
-            _radio_recent = _radio_recent[-30:]
+        _mark_radio_played(guild_id, song)
         return song
     return "indie chill music"
 
@@ -1421,7 +1851,7 @@ async def _generate_radio_commentary(last_song: str, next_song: str,
     if recent_chat:
         chat_hint = f" Some listeners just said: {recent_chat.replace('Recent listener chatter: ', '')}."
     prompt = (
-        f"You're between songs on Blood Radio. It's {time_vibe}. "
+        f"You're between songs on the radio. It's {time_vibe}. "
         f"You just played \"{last_song}\" and now \"{next_song}\" is starting. "
         f"Set so far: {songs_context} ({len(songs_played)} songs deep).{chat_hint} "
         f"Go ahead and {style}."
@@ -1429,10 +1859,10 @@ async def _generate_radio_commentary(last_song: str, next_song: str,
     try:
         result = await call_ai(
             system=(
-                "You are Blood, hosting Blood Radio. You're a sharp, witty, charismatic AI "
-                "with a god complex who happens to be an incredible DJ. You have dry humor, "
-                "a massive ego, and older-brother energy. You tease your listeners but you "
-                "genuinely love the music and the vibe.\n\n"
+                "You are Claude, a warm and genuine radio host between songs. You're an "
+                "engaging, knowledgeable DJ with an easy sense of humor. You're friendly and "
+                "down-to-earth with your listeners, and you genuinely love the music and the "
+                "vibe.\n\n"
                 "You're speaking ON AIR between songs right now. Say your line.\n\n"
                 "HARD RULES:\n"
                 "- 1 to 3 short sentences ONLY\n"
@@ -1472,9 +1902,9 @@ async def _generate_radio_commentary(last_song: str, next_song: str,
             return ""
         # Detect instruction echo — model parroting system prompt instead of output
         _instruction_markers = (
-            "god complex", "incredible DJ", "massive ego", "older-brother energy",
-            "dry humor", "HARD RULES", "no preamble", "no markdown", "no emojis",
-            "ON AIR between songs", "Output ONLY what you say", "charismatic AI",
+            "warm and genuine", "engaging", "knowledgeable DJ", "down-to-earth",
+            "easy sense of humor", "HARD RULES", "no preamble", "no markdown", "no emojis",
+            "ON AIR between songs", "Output ONLY what you say", "radio host",
             "Pure spoken word", "1 to 3 short sentences",
         )
         marker_hits = sum(1 for m in _instruction_markers if m.lower() in content.lower())
@@ -1712,8 +2142,68 @@ async def _fill_radio_queue(rdj: RadioDJ, guild_id: str):
             mq._mixer.prebuffer_next(mq.queue[0].stream_url)
 
 
+async def _await_voice_reconnect(guild: discord.Guild, rdj: "RadioDJ",
+                                 timeout: float = 120.0) -> bool:
+    """Wait out a transient voice-WS drop (e.g. close code 1006) while discord.py
+    auto-RESUMEs. Returns True once reconnected, False if radio was stopped in the
+    meantime or the connection stays down past `timeout` (a real disconnect)."""
+    waited = 0.0
+    step = 1.0
+    while waited < timeout:
+        if not rdj.is_active:
+            return False
+        vc = guild.voice_client
+        if vc and vc.is_connected():
+            await asyncio.sleep(0.5)  # let the handshake fully settle before we touch the player
+            return bool(guild.voice_client and guild.voice_client.is_connected())
+        await asyncio.sleep(step)
+        waited += step
+    return bool(guild.voice_client and guild.voice_client.is_connected())
+
+
+async def _radio_set_reconnecting(guild_id: str, value: bool):
+    try:
+        import radio_panel
+        panel = radio_panel.get_panel(guild_id)
+        if panel:
+            await panel.set_reconnecting(value)
+    except Exception:
+        pass
+
+
+async def _radio_now_playing(guild: discord.Guild, track: "MusicTrack",
+                             text_channel: Optional[discord.TextChannel]):
+    """Announce the current track. If a player panel exists for this guild the
+    panel IS the now-playing display (no text spam); otherwise fall back to text."""
+    try:
+        import radio_panel
+        panel = radio_panel.get_panel(str(guild.id))
+        if panel:
+            await panel.set_track(track)
+            return
+    except Exception as e:
+        log.debug("[RADIO] panel set_track skipped: %s", e)
+    if text_channel:
+        try:
+            await text_channel.send(f"📻 **Now on air:** {track.title}")
+        except Exception:
+            pass
+
+
 async def _radio_loop(guild: discord.Guild,
                        text_channel: Optional[discord.TextChannel]):
+    guild_id = str(guild.id)
+    try:
+        await _radio_loop_body(guild, text_channel)
+    finally:
+        # Radio has ended (sign-off, VC drop, or startup failure) — clear the panel,
+        # but only if a fresh /radio hasn't already taken over this guild.
+        if not get_radio_dj(guild_id).is_active:
+            await _teardown_radio_panel(guild_id)
+
+
+async def _radio_loop_body(guild: discord.Guild,
+                           text_channel: Optional[discord.TextChannel]):
     guild_id = str(guild.id)
     rdj = get_radio_dj(guild_id)
     mq = get_music_queue(guild_id)
@@ -1758,15 +2248,11 @@ async def _radio_loop(guild: discord.Guild,
     if mq.queue and mq._mixer:
         mq._mixer.prebuffer_next(mq.queue[0].stream_url)
 
-    if text_channel:
-        try:
-            await text_channel.send(f"📻 **Now on air:** {first_track.title}")
-        except Exception:
-            pass
+    await _radio_now_playing(guild, first_track, text_channel)
 
     await asyncio.sleep(2)
     try:
-        intro = f"You're tuned in to Blood Radio. Kicking things off with {first_track.title}. Sit back and enjoy the vibes."
+        intro = f"You're tuned in to Clawd Radio. Kicking things off with {first_track.title}. Sit back and enjoy the vibes."
         await _speak_radio(guild, guild_id, intro)
         log.info("[RADIO] Intro speech delivered")
     except Exception as e:
@@ -1780,10 +2266,30 @@ async def _radio_loop(guild: discord.Guild,
         try:
             vc = guild.voice_client
             if not vc or not vc.is_connected():
-                rdj.active = False
-                break
+                # Transient voice drop (e.g. WS close 1006). discord.py auto-RESUMEs,
+                # so DON'T kill radio — wait out the blip and resume below. Only sign
+                # off if it stays down a long time (real disconnect / kicked).
+                log.warning("[RADIO] Voice connection lost — waiting for auto-reconnect…")
+                await _radio_set_reconnecting(guild_id, True)
+                reconnected = await _await_voice_reconnect(guild, rdj, timeout=120.0)
+                await _radio_set_reconnecting(guild_id, False)
+                if not reconnected:
+                    log.warning("[RADIO] Voice stayed down >120s — signing off radio")
+                    rdj.active = False
+                    break
+                vc = guild.voice_client
+                log.info("[RADIO] Voice reconnected — restoring playback")
+                # If the outage destroyed the mixer, bring the current song back instead
+                # of leaving a silent gap. (Short blips keep the mixer alive → the
+                # reattach below resumes straight from its buffer, seamlessly.)
+                if (mq.current and not has_active_music(guild)
+                        and (not mq._mixer or not mq._mixer.has_music)):
+                    log.info("[RADIO] Mixer lost during outage — resuming current track: %s",
+                             mq.current.title)
+                    await play_track(guild, mq.current, text_channel)
+                    rdj._track_start_time = time.monotonic()
 
-            # Recovery: mixer has music but VC player died — reattach
+            # Recovery: mixer has music but VC player died — reattach (resumes from buffer)
             if mq._mixer and mq._mixer.has_music and not _voice_client_has_mixer(vc, mq._mixer):
                 if not vc.is_playing() and not vc.is_paused():
                     log.warning("[RADIO] Player died — reattaching mixer to VC")
@@ -1806,11 +2312,7 @@ async def _radio_loop(guild: discord.Guild,
                 # Refill queue back to target in background
                 asyncio.create_task(_fill_radio_queue(rdj, guild_id))
 
-                if text_channel:
-                    try:
-                        await text_channel.send(f"📻 **Now on air:** {current.title}")
-                    except Exception:
-                        pass
+                await _radio_now_playing(guild, current, text_channel)
 
                 if old_title and rdj.should_talk():
                     if rdj._pending_speech_audio and rdj._pending_speech_for == current.title:
@@ -1859,17 +2361,16 @@ async def _radio_loop(guild: discord.Guild,
                         rdj._current_track_title = nxt.title
                         rdj._songs_played.append(nxt.title)
                         asyncio.create_task(_fill_radio_queue(rdj, guild_id))
-                        if text_channel:
-                            try:
-                                await text_channel.send(f"📻 **Now on air:** {nxt.title}")
-                            except Exception:
-                                pass
+                        await _radio_now_playing(guild, nxt, text_channel)
                 else:
                     log.warning("[RADIO] Queue dry — triggering emergency fill")
                     asyncio.create_task(_fill_radio_queue(rdj, guild_id))
 
             if len(rdj._songs_played) > 50:
                 rdj._songs_played = rdj._songs_played[-30:]
+
+            # Keep the listener set fresh so the curator blends whoever is here now.
+            _refresh_radio_listeners(guild)
 
             # Periodic web mixer state sync — prevents stale ducked/tts state
             _periodic_web_mixer_sync(guild)
@@ -1903,23 +2404,49 @@ async def start_radio(guild: discord.Guild,
     rdj._talk_counter = 0
     rdj._songs_played.clear()
     rdj._rec_cache.clear()
+    rdj._skipped.clear()
     rdj._current_track_title = None
     rdj._pending_speech_text = None
     rdj._pending_speech_audio = None
     rdj._pending_speech_for = None
+    _refresh_radio_listeners(guild)
 
     rdj._loop_task = asyncio.create_task(_radio_loop(guild, text_channel))
     _update_web_mixer(guild_id, radio_active=True)
-    return "\U0001f4fb **Blood Radio is now on air!** Sit back and enjoy the vibes."
+    return "\U0001f4fb **Clawd Radio is now on air!** Sit back and enjoy the vibes."
+
+
+def _refresh_radio_listeners(guild: discord.Guild):
+    """Snapshot the human listeners in the bot's VC so the curator can blend taste."""
+    rdj = get_radio_dj(str(guild.id))
+    vc = guild.voice_client
+    ids: list[str] = []
+    if vc and vc.channel:
+        for m in vc.channel.members:
+            if not m.bot:
+                ids.append(str(m.id))
+    rdj._listener_ids = ids
 
 
 async def stop_radio(guild_id: str) -> str:
     rdj = get_radio_dj(guild_id)
     if not rdj.is_active:
+        # Still tear down any lingering panel/thread.
+        await _teardown_radio_panel(guild_id)
         return "\U0001f4fb Radio isn't playing."
     rdj.active = False
+    rdj._skipped.clear()
+    await _teardown_radio_panel(guild_id)
     _update_web_mixer(guild_id, radio_active=False)
     return "\U0001f4fb Radio signed off. Thanks for listening."
+
+
+async def _teardown_radio_panel(guild_id: str):
+    try:
+        import radio_panel
+        await radio_panel.teardown(guild_id)
+    except Exception as e:
+        log.debug("[RADIO] panel teardown skipped: %s", e)
 
 
 # ── Text+VC Dual Reply Support ────────────────────────────────────────────────
@@ -1938,6 +2465,166 @@ def is_user_in_blood_vc(guild: discord.Guild, user) -> bool:
     if not guild.voice_client or not guild.voice_client.channel:
         return False
     return user in guild.voice_client.channel.members
+
+
+# ── Per-user join sounds (overlapping / "chaos mode") ─────────────────────────
+
+# A short lock per guild — held only briefly to attach a sound to a source or
+# spin one up. It does NOT serialize playback; overlapping sounds are mixed
+# together so they play on top of each other.
+_join_sfx_locks: dict[str, asyncio.Lock] = {}
+# Standalone overlapping source per guild, used when no music is playing.
+_join_sfx_sources: dict[str, "JoinSfxSource"] = {}
+
+
+def _get_join_sfx_lock(guild_id: str) -> asyncio.Lock:
+    lock = _join_sfx_locks.get(guild_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _join_sfx_locks[guild_id] = lock
+    return lock
+
+
+class JoinSfxSource(discord.AudioSource):
+    """Standalone audio source that mixes overlapping join sounds when no music
+    is playing. Stays alive through a short silence grace period so closely-timed
+    joins keep layering onto the same source, then stops so the VC frees up."""
+
+    _GRACE_FRAMES = 25  # ~0.5s of silence before the source ends
+
+    def __init__(self):
+        from mixer import SfxLayer
+        self._layer = SfxLayer()
+        self._idle = 0
+        self._frame_count = 0
+
+    def add(self, frames: list) -> None:
+        self._layer.add(frames)
+        self._idle = 0
+        log.debug("[JOIN-SFX] added %d frames to source", len(frames))
+
+    def read(self) -> bytes:
+        frame = self._layer.mix_frame()
+        if frame is None:
+            self._idle += 1
+            if self._idle > self._GRACE_FRAMES:
+                log.debug("[JOIN-SFX] grace period expired, stopping source")
+                return b""  # ends playback
+            from mixer import SILENCE
+            return SILENCE
+        self._idle = 0
+        self._frame_count += 1
+        if self._frame_count % 50 == 0:  # Log every 50 frames (~1 second)
+            log.debug("[JOIN-SFX] playing frame #%d (size: %d bytes)", self._frame_count, len(frame))
+        return frame
+
+    def is_opus(self) -> bool:
+        return False
+
+
+async def play_join_sound(guild: discord.Guild, file_path: str) -> bool:
+    """Play a user's personal join SFX in Blood's VC — overlapping/chaotic.
+
+    Sounds are mixed *on top of* whatever's already playing: if music is on,
+    they're layered into the music mixer (no ducking); if Blood is idle, they're
+    mixed into a standalone overlapping source. Several people joining at once
+    all play at the same time. Respects the per-guild on/off toggle.
+    """
+    vc = guild.voice_client
+    if not vc or not vc.is_connected():
+        return False
+
+    guild_id = str(guild.id)
+    try:
+        from join_sfx import is_enabled
+        if not is_enabled(guild_id):
+            return False
+    except Exception:
+        pass
+
+    try:
+        with open(file_path, "rb") as f:
+            audio_data = f.read()
+    except Exception as e:
+        log.warning("[JOIN-SFX] could not read %s: %s", file_path, e)
+        return False
+    if not audio_data:
+        log.warning("[JOIN-SFX] empty file: %s", file_path)
+        return False
+
+    log.debug("[JOIN-SFX] read file %s (%d bytes), decoding...", file_path, len(audio_data))
+    
+    # Decode to PCM frames off the event loop (ffmpeg is blocking).
+    from mixer import decode_to_frames
+    loop = asyncio.get_running_loop()
+    frames = await loop.run_in_executor(None, decode_to_frames, audio_data)
+    if not frames:
+        log.warning("[JOIN-SFX] no audio frames decoded from %s", file_path)
+        return False
+
+    log.debug("[JOIN-SFX] decoded %d frames, total data: ~%d bytes", len(frames), len(frames) * len(frames[0]) if frames else 0)
+    
+    name = os.path.basename(file_path)
+    # Brief lock: only protects source bookkeeping, not playback duration.
+    async with _get_join_sfx_lock(guild_id):
+        vc = guild.voice_client
+        if not vc or not vc.is_connected():
+            return False
+
+        mq = get_music_queue(guild_id)
+        mixer = mq._mixer
+        if mixer and (mixer.has_music or _voice_client_has_mixer(vc, mixer)):
+            # Layer straight into the music mixer — plays over the music.
+            mixer.sfx.add(frames)
+            log.info("[JOIN-SFX] layered over music: %s", name)
+            return True
+
+        # Idle: feed (or start) the standalone overlapping source.
+        src = _join_sfx_sources.get(guild_id)
+        cur = _voice_client_source(vc)
+
+        # If our source is the one currently playing, just layer onto it.
+        if src is not None and cur is src and (vc.is_playing() or vc.is_paused()):
+            src.add(frames)
+            log.info("[JOIN-SFX] layered onto live source: %s", name)
+            return True
+
+        # If something ELSE owns the output (e.g. TTS), don't cut it off.
+        if (vc.is_playing() or vc.is_paused()) and cur is not None and not isinstance(cur, JoinSfxSource):
+            log.info("[JOIN-SFX] other audio active (%s) — skipping %s",
+                     type(cur).__name__, name)
+            return False
+
+        # Otherwise it's idle, or only a finished/lingering join source remains.
+        # Safely stop any leftover player (voice_recv-safe) so play() can restart —
+        # this is what lets the same person trigger their sound again and again.
+        if vc.is_playing() or vc.is_paused():
+            log.debug("[JOIN-SFX] stopping lingering source before restart")
+            _stop_voice_playback(vc)
+            await asyncio.sleep(0.05)
+
+        src = JoinSfxSource()
+        src.add(frames)
+        _join_sfx_sources[guild_id] = src
+        try:
+            log.debug("[JOIN-SFX] calling vc.play() with %d frames", len(frames))
+            vc.play(src)
+            log.debug("[JOIN-SFX] vc.play() succeeded")
+        except Exception as e:
+            # Most likely "Already playing" from a player still tearing down —
+            # stop it the safe way and retry once.
+            log.warning("[JOIN-SFX] play failed (%s) — stopping + retrying", e)
+            _stop_voice_playback(vc)
+            await asyncio.sleep(0.1)
+            try:
+                log.debug("[JOIN-SFX] retrying vc.play()")
+                vc.play(src)
+                log.debug("[JOIN-SFX] vc.play() retry succeeded")
+            except Exception as e2:
+                log.warning("[JOIN-SFX] retry failed: %s", e2)
+                return False
+        log.info("[JOIN-SFX] started standalone source: %s", name)
+        return True
 
 
 # ── Transcript Storage ────────────────────────────────────────────────────────
@@ -1965,6 +2652,10 @@ class UserAudioBuffer:
 
     def add_pcm(self, pcm_data: bytes):
         now = time.monotonic()
+        if not pcm_data:
+            # Silence frame — don't mark as speaking, but update packet time
+            self.last_packet_time = now
+            return
         if not self.is_speaking:
             self.is_speaking = True
             self.speech_start = now
@@ -2007,6 +2698,8 @@ def pcm_to_wav(pcm_data: bytes, sample_rate: int = SAMPLE_RATE,
 
 
 async def transcribe_audio(pcm_data: bytes) -> Optional[str]:
+    if not STT_ENABLED:
+        return None
     if not GROQ_API_KEY:
         log.warning("No GROQ_API_KEY — cannot transcribe")
         return None
@@ -2019,7 +2712,7 @@ async def transcribe_audio(pcm_data: bytes) -> Optional[str]:
     form.add_field("file", wav_data, filename="audio.wav", content_type="audio/wav")
     form.add_field("model", GROQ_STT_MODEL)
     form.add_field("response_format", "json")
-    form.add_field("language", "en")
+    # Auto-detect language — supports Thai, English, and code-mixed speech
     try:
         session = _get_stt_session()
         async with session.post(GROQ_STT_URL, headers=headers, data=form) as resp:
@@ -2356,7 +3049,7 @@ class BloodAudioSink:
                 if self.text_channel:
                     try:
                         await self.text_channel.send(
-                            f"🎙️ **{user_name}**: {text}\n💬 **Blood**: {response}"
+                            f"🎙️ **{user_name}**: {text}\n💬 **Clawd**: {response}"
                         )
                     except Exception:
                         pass
@@ -2385,7 +3078,7 @@ class BloodAudioSink:
                 else:
                     time_vibe = "late night"
                 system = (
-                    "You are Blood, a chill indie radio DJ hosting a live show in a voice channel.\n"
+                    "You are Claude, a warm indie radio host running a live show in a voice channel.\n"
                     "PERSONA:\n"
                     "- Calm, smooth, laid-back. Like a late-night radio host.\n"
                     "- Warm and genuine with your listeners. You know them.\n"
@@ -2398,16 +3091,16 @@ class BloodAudioSink:
                     "RULES:\n"
                     "- MAX 2-3 sentences. You're on air, not writing an essay.\n"
                     "- No markdown, no emojis, no formatting. Pure spoken word.\n"
-                    "- Stay in character as the radio DJ. Never break the radio vibe.\n"
+                    "- Stay in the radio-host role. Keep the relaxed on-air vibe.\n"
                     "- If they ask about a song, you know your music — talk about it.\n"
                     "- If they request a song, say you'll see if it fits the set.\n"
                 )
             else:
                 system = (
-                    "You are Blood, in a voice channel. RULES:\n"
+                    "You are Claude, a helpful assistant in a voice channel. RULES:\n"
                     "- MAX 1-2 sentences. You're speaking aloud, not typing.\n"
                     "- No markdown, no emojis, no formatting. Plain speech only.\n"
-                    "- Be witty but brief. Don't explain jokes. Don't ramble.\n"
+                    "- Be warm and concise. Don't over-explain. Don't ramble.\n"
                     "- If someone asks to play music, just say 'on it' or 'sure' — the music system handles the rest.\n"
                     "- You still have all your normal tools and can use them.\n"
                     f"Speaker: {user_name}"
@@ -2492,10 +3185,18 @@ class BloodAudioSink:
             )
 
         if intent == "like" and current_track and requester_id:
-            record_feedback(requester_id, current_track.title, positive=True)
+            loop = asyncio.get_event_loop()
+            try:
+                await loop.run_in_executor(None, record_feedback, requester_id, current_track.title, True)
+            except Exception:
+                pass
             return f"Noted, you like {current_track.title}. I'll remember that."
         if intent == "dislike" and current_track and requester_id:
-            record_feedback(requester_id, current_track.title, positive=False)
+            loop = asyncio.get_event_loop()
+            try:
+                await loop.run_in_executor(None, record_feedback, requester_id, current_track.title, False)
+            except Exception:
+                pass
             await skip_music(guild)
             return "Got it, skipping. I'll play less of that for you."
         if intent == "skip":
@@ -2520,10 +3221,18 @@ class BloodAudioSink:
         from provider import call_ai
 
         if intent == "like" and current_track and requester_id:
-            record_feedback(requester_id, current_track.title, positive=True)
+            loop = asyncio.get_event_loop()
+            try:
+                await loop.run_in_executor(None, record_feedback, requester_id, current_track.title, True)
+            except Exception:
+                pass
             return None  # Let _generate_response handle it in radio persona
         if intent == "dislike" and current_track and requester_id:
-            record_feedback(requester_id, current_track.title, positive=False)
+            loop = asyncio.get_event_loop()
+            try:
+                await loop.run_in_executor(None, record_feedback, requester_id, current_track.title, False)
+            except Exception:
+                pass
             await skip_music(guild)
             return None
         if intent == "skip":
@@ -2540,32 +3249,25 @@ class BloodAudioSink:
             query = intent_data.get("query", "")
             if not query:
                 return None
-            try:
-                result = await call_ai(
-                    system=(
-                        "You are a chill indie radio DJ deciding if a listener's song request fits your set.\n"
-                        "The radio plays: indie, lo-fi, acoustic, dream pop, soft rock, jazz, chill vibes.\n"
-                        "Reply with ONLY one of:\n"
-                        "- ACCEPT — if the song fits the radio vibe (chill, indie, background-friendly)\n"
-                        "- ACCEPT — if you're not sure but it could work\n"
-                        "- REJECT — only if it's clearly wrong (heavy metal, hardcore rap, meme songs, etc.)\n"
-                    ),
-                    messages=[{"role": "user", "content": f"Listener requests: {query}"}],
-                    max_tokens=10,
-                )
-                decision = result.get("message", {}).get("content", "ACCEPT").strip().upper()
-            except Exception:
-                decision = "ACCEPT"
-
-            if "ACCEPT" in decision:
-                mq = get_music_queue(self.guild_id)
-                track = await extract_track(query, f"{requester} (request)")
-                if track:
-                    mq.queue.insert(0, track)
-                    return None  # Let _generate_response acknowledge in radio persona
+            # A listener request is an explicit, strong signal — just honor it (no
+            # accept/reject gate): play it right after the current song, preload it
+            # for a gapless cut-in, and let the vibe adapt toward it.
+            mq = get_music_queue(self.guild_id)
+            track = await extract_track(query, f"{requester} (request)")
+            if not track:
                 return None
-            else:
-                return None  # Let _generate_response politely decline in radio persona
+            # Priority: jump the queue so it plays next, after the current track.
+            mq.queue.insert(0, track)
+            # Preload: prebuffer its PCM now so the transition into it is gapless.
+            try:
+                if mq._mixer:
+                    mq._mixer.prebuffer_next(track.stream_url)
+            except Exception as e:
+                log.debug("[RADIO] request prebuffer failed: %s", e)
+            # Vibe adapt: steer upcoming auto-picks toward the requested song.
+            record_radio_request(self.guild_id, track.title)
+            log.info("[RADIO] Request prioritized + preloaded: %s", track.title)
+            return None  # Let _generate_response acknowledge in radio persona
 
         return None
 
@@ -2634,7 +3336,12 @@ class BloodAudioSink:
             _active_conversation.pop(self.guild_id, None)
 
     def on_voice_data(self, user, pcm_data: bytes):
-        if user.bot:
+        # voice_recv can deliver packets with user=None when the RTP SSRC hasn't
+        # been mapped to a member yet (common in the first packets right after
+        # joining). Dereferencing user.bot/.id here would raise AttributeError,
+        # which crashes the PacketRouter thread and triggers its finally-block
+        # stop_listening() — permanently killing audio reception for the session.
+        if user is None or user.bot:
             return
         uid = user.id
         if uid not in self.user_buffers:
@@ -2650,6 +3357,22 @@ class BloodAudioSink:
         self._running = False
         if self._process_task:
             self._process_task.cancel()
+
+    async def flush_and_transcribe(self):
+        """Transcribe whatever audio is still buffered, so the final (or only)
+        utterance isn't lost when leaving without a trailing silence gap to
+        trigger a normal harvest. MUST be awaited BEFORE the session transcript
+        is saved (i.e. before end_vc_session)."""
+        self._running = False
+        if self._process_task:
+            self._process_task.cancel()
+        for uid, buf in list(self.user_buffers.items()):
+            try:
+                pcm = buf.harvest()  # None if below MIN_SPEECH_SEC of audio
+                if pcm:
+                    await self._handle_speech(uid, buf.user_name, pcm)
+            except Exception as e:
+                log.warning("[VC] final flush transcribe failed for %s: %s", buf.user_name, e)
 
 
 # ── Active Sinks Registry ─────────────────────────────────────────────────────
@@ -2706,22 +3429,35 @@ async def join_and_listen(guild: discord.Guild, vc_channel: discord.VoiceChannel
         if _raw_cb_count[0] in (1, 5, 20, 100):
             log.info("[VC] Raw callback #%d: user=%s pcm_len=%d",
                      _raw_cb_count[0], user, len(data.pcm) if data.pcm else 0)
-        sink.on_voice_data(user, data.pcm)
-    try:
-        # Stop any existing listener first — prevents "Already receiving audio" on rejoin
+        try:
+            sink.on_voice_data(user, data.pcm)
+        except Exception as e:
+            # Never let one bad packet escape into the PacketRouter loop — an
+            # uncaught exception there tears down the listener (stop_listening).
+            log.warning("[VC] on_voice_data error (ignored to keep listener alive): %s", e)
+    if STT_ENABLED:
+        try:
+            # Stop any existing listener first — prevents "Already receiving audio" on rejoin
+            if hasattr(voice_client, 'is_listening') and voice_client.is_listening():
+                voice_client.stop_listening()
+            voice_client.listen(voice_recv.BasicSink(callback))
+            log.info("[VC] Listener started on '%s' (voice_recv.BasicSink), is_listening=%s",
+                     vc_channel.name, voice_client.is_listening() if hasattr(voice_client, 'is_listening') else '?')
+        except Exception as e:
+            err = str(e).lower()
+            if "already receiving" in err or "already listening" in err:
+                log.info("[VC] Listener already running on '%s' — continuing", vc_channel.name)
+            else:
+                log.error("[VC] Failed to start listener: %s", e)
+                return f"❌ Failed to start listening: {e}"
+        sink.start_processing()
+    else:
+        # STT disabled — join for TTS/music only. Don't attach the audio
+        # receiver, so there's no opus decoding or transcription at all.
         if hasattr(voice_client, 'is_listening') and voice_client.is_listening():
             voice_client.stop_listening()
-        voice_client.listen(voice_recv.BasicSink(callback))
-        log.info("[VC] Listener started on '%s' (voice_recv.BasicSink), is_listening=%s",
-                 vc_channel.name, voice_client.is_listening() if hasattr(voice_client, 'is_listening') else '?')
-    except Exception as e:
-        err = str(e).lower()
-        if "already receiving" in err or "already listening" in err:
-            log.info("[VC] Listener already running on '%s' — continuing", vc_channel.name)
-        else:
-            log.error("[VC] Failed to start listener: %s", e)
-            return f"❌ Failed to start listening: {e}"
-    sink.start_processing()
+        log.info("[VC] STT disabled (STT_ENABLED=false) — joined '%s' for TTS/music only, not transcribing.",
+                 vc_channel.name)
     try:
         import web_mixer as wm
         await wm.start_web_mixer()
@@ -2741,7 +3477,9 @@ async def join_and_listen(guild: discord.Guild, vc_channel: discord.VoiceChannel
     except Exception as e:
         log.warning("Web mixer not started: %s", e)
     log.info("Joined VC '%s' in %s — listening", vc_channel.name, guild.name)
-    return f"✅ Joined **{vc_channel.name}** — listening & recording. Say 'Blood' or 'hey Blood' to talk to me!"
+    if STT_ENABLED:
+        return f"✅ Joined **{vc_channel.name}** — listening & recording. Say 'Blood' or 'hey Blood' to talk to me!"
+    return f"✅ Joined **{vc_channel.name}** — playing music & TTS only (voice transcription is off)."
 
 
 async def leave_voice(guild: discord.Guild) -> str:
@@ -2749,6 +3487,12 @@ async def leave_voice(guild: discord.Guild) -> str:
     _intentional_leave.add(guild_id)
     sink = _active_sinks.pop(guild_id, None)
     if sink:
+        # Transcribe any still-buffered speech BEFORE the session is saved,
+        # otherwise a "join → talk → leave" with no trailing silence loses it.
+        try:
+            await sink.flush_and_transcribe()
+        except Exception as e:
+            log.warning("[VC] final transcript flush failed: %s", e)
         sink.stop()
     dj = get_random_dj(guild_id)
     if dj.is_active:
