@@ -81,12 +81,86 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_STT_MODEL = "whisper-large-v3-turbo"
 
+# ── Groq Orpheus TTS (the voice for EVERYTHING the bot says) ──────────────────
+# OpenAI-compatible speech endpoint. Orpheus renders bracketed vocal directions
+# like [cheerful]/[excited] and treats CAPS / !!! / elongated letters as emphasis,
+# so it can "sway" and emote instead of reading flat. A dedicated TTS key is used
+# if set, otherwise it falls back to the shared GROQ_API_KEY.
+GROQ_TTS_API_KEY = os.getenv("GROQ_TTS_API_KEY") or GROQ_API_KEY
+GROQ_TTS_URL = "https://api.groq.com/openai/v1/audio/speech"
+GROQ_TTS_MODEL = os.getenv("GROQ_TTS_MODEL", "canopylabs/orpheus-v1-english")
+GROQ_TTS_VOICE = os.getenv("GROQ_TTS_VOICE", "troy")  # one of: autumn diana hannah austin daniel troy
+GROQ_TTS_FORMAT = os.getenv("GROQ_TTS_FORMAT", "wav")
+# Default vocal direction prepended to every line so the delivery has emotion/sway.
+# A line that already starts with its own [direction] is left untouched. Set blank
+# to disable. ffmpeg -i pipe:0 decodes the wav transparently downstream.
+GROQ_TTS_STYLE = os.getenv("GROQ_TTS_STYLE", "cheerful")
+
+# STT engine: "local" = on-device mlx-whisper (Apple Silicon, default, see
+# stt_local.py), "groq" = Groq Whisper API (needs GROQ_API_KEY + network).
+STT_ENGINE = os.getenv("STT_ENGINE", "local").lower()
+
 # Master switch for speech-to-text / VC transcription. When false, the bot still
 # joins voice for TTS and music but does NOT attach the audio receiver, so no
-# opus decoding or transcription happens. Flip STT_ENABLED=true in .env to re-enable.
-STT_ENABLED = os.getenv("STT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+# opus decoding or transcription happens. Runtime-mutable via the /stt command;
+# the chosen state is persisted to data/stt_state.json so it survives restarts
+# (the STT_ENABLED env var only supplies the first-run default).
+_STT_STATE_FILE = os.path.join(os.path.dirname(__file__), "data", "stt_state.json")
 
-WAKE_WORDS = ["blood", "hey blood", "เลือด", "บลัด"]
+
+def _stt_env_default() -> bool:
+    return os.getenv("STT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+
+
+def _load_stt_enabled() -> bool:
+    try:
+        import json as _json
+        with open(_STT_STATE_FILE) as f:
+            return bool(_json.load(f).get("enabled"))
+    except Exception:
+        return _stt_env_default()
+
+
+STT_ENABLED = _load_stt_enabled()
+
+
+def set_stt_enabled_flag(value: bool):
+    """Update the process-wide STT flag and persist it to disk."""
+    global STT_ENABLED
+    STT_ENABLED = bool(value)
+    try:
+        import json as _json
+        os.makedirs(os.path.dirname(_STT_STATE_FILE), exist_ok=True)
+        with open(_STT_STATE_FILE, "w") as f:
+            _json.dump({"enabled": STT_ENABLED}, f)
+    except Exception as e:
+        log.warning("[STT] could not persist state: %s", e)
+
+
+def _warm_local_stt():
+    """Preload the local mlx model so the first utterance isn't slow. Cheap no-op
+    once loaded; intended to be run in an executor."""
+    if STT_ENGINE != "local":
+        return
+    try:
+        import stt_local
+        stt_local.warm_up()
+    except Exception as e:
+        log.warning("[STT] warm-up failed: %s", e)
+
+# The bot answers to "Claude" / "hey Claude" and the spellings Whisper most
+# often emits for it, including Thai transliterations. Matching is fuzzy
+# (see contains_wake_word) so near-misses like "clode" / "cluade" still trigger.
+WAKE_WORDS = [
+    "claude", "hey claude", "ok claude", "okay claude", "hi claude", "yo claude",
+    "clawd", "claud", "cloud", "clode", "klaud", "klode", "cloude", "clawde",
+    "claudia", "claudio",
+    "คลอด", "โคลด", "คล็อด", "คลาวด์", "เคลาด์", "คลอดด์",
+]
+# Spoken words are fuzzy-matched against these (catches odd STT variants without
+# firing on common words like "could" / "closed").
+_WAKE_FUZZY_TARGETS = ("claude", "clawd", "คลอด", "โคลด")
+_WAKE_FUZZY_RATIO = 0.82
 
 TTS_VOICE = "en-US-GuyNeural"
 TTS_RATE = "+10%"
@@ -739,6 +813,103 @@ async def _handle_player_stop(guild: discord.Guild, expected_track: MusicTrack,
     if mixer and not mixer.has_music:
         mq._mixer = None
     _sync_web_mixer_music(guild)
+
+
+# ── Voice health watchdog (manual /play) ─────────────────────────────────────
+# The mixer's read() never returns empty, so discord.py's AudioPlayer never
+# self-stops: vc.is_playing() (and therefore the web UI) stays "playing" even
+# after the voice session has silently died and Discord hears nothing. Radio
+# recovers itself in _radio_loop; manual playback had no equivalent. This
+# watchdog — driven by voice_watchdog_loop in bot.py — reattaches a dead player
+# and forces a clean rejoin if the voice WS stays down. NOTE: it deliberately
+# does NOT handle the rarer "still connected, player running, but Discord muted
+# us" black-hole, which would need a session bounce (risking audible gaps).
+_player_dead_strikes: dict[str, int] = {}
+_voice_down_strikes: dict[str, int] = {}
+_REATTACH_AFTER_STRIKES = 2   # consecutive "should play but idle" ticks before reattaching
+_REJOIN_AFTER_STRIKES = 6     # consecutive WS-down ticks before forcing a rejoin (let discord.py RESUME first)
+
+
+async def voice_health_check(guild: discord.Guild, bot_instance) -> None:
+    """One watchdog pass for a single guild's manual-play voice session."""
+    guild_id = str(guild.id)
+
+    # Radio drives its own recovery in _radio_loop — don't double-drive it.
+    if get_radio_dj(guild_id).is_active:
+        _player_dead_strikes.pop(guild_id, None)
+        _voice_down_strikes.pop(guild_id, None)
+        return
+
+    mq = get_music_queue(guild_id)
+    mixer = mq._mixer
+    # Only watch when a track should actively be playing. has_music is True only
+    # while the FFmpeg reader thread is alive and producing frames.
+    if not (mq.current and mixer and mixer.has_music):
+        _player_dead_strikes.pop(guild_id, None)
+        _voice_down_strikes.pop(guild_id, None)
+        return
+
+    vc = guild.voice_client
+
+    # ── Voice WS is up ───────────────────────────────────────────────────────
+    if vc and vc.is_connected():
+        _voice_down_strikes.pop(guild_id, None)
+        # Healthy: the player is driving our mixer, or something transient
+        # (TTS / join-sfx) is briefly playing instead — leave it alone.
+        if _voice_client_has_mixer(vc, mixer) or vc.is_playing() or vc.is_paused():
+            _player_dead_strikes.pop(guild_id, None)
+            return
+        # Player is idle while the mixer is still producing audio. Require a
+        # couple of consecutive observations so we never race a track start or
+        # gapless transition (those settle well within one tick).
+        strikes = _player_dead_strikes.get(guild_id, 0) + 1
+        _player_dead_strikes[guild_id] = strikes
+        if strikes < _REATTACH_AFTER_STRIKES:
+            return
+        _player_dead_strikes.pop(guild_id, None)
+        log.warning("[VOICE-WATCHDOG] Player idle but mixer live for '%s' — reattaching", mq.current.title)
+        try:
+            vc.play(mixer)  # resumes straight from the live buffer
+        except Exception as e:
+            log.warning("[VOICE-WATCHDOG] Reattach failed: %s", e)
+        return
+
+    # ── Voice WS is down ─────────────────────────────────────────────────────
+    _player_dead_strikes.pop(guild_id, None)
+    # A full kick clears guild.voice_client (→ vc is None); on_voice_state_update
+    # owns that rejoin. Here we only handle a lingering half-dead client.
+    channel = vc.channel if vc else None
+    if channel is None:
+        _voice_down_strikes.pop(guild_id, None)
+        return
+    # Give discord.py's own auto-RESUME time before we intervene.
+    strikes = _voice_down_strikes.get(guild_id, 0) + 1
+    _voice_down_strikes[guild_id] = strikes
+    if strikes < _REJOIN_AFTER_STRIKES:
+        log.warning("[VOICE-WATCHDOG] Voice down for '%s' (strike %d/%d) — waiting for auto-reconnect",
+                    guild.name, strikes, _REJOIN_AFTER_STRIKES)
+        return
+    _voice_down_strikes.pop(guild_id, None)
+    log.warning("[VOICE-WATCHDOG] Voice still down after %d strikes — forcing rejoin to '%s'",
+                strikes, channel.name)
+    try:
+        try:
+            await vc.disconnect(force=True)
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+        sink = get_active_sink(guild_id)
+        tc = sink.text_channel if sink else None
+        result = await join_and_listen(guild, channel, tc, bot_instance)
+        log.info("[VOICE-WATCHDOG] Rejoin result: %s", result[:80])
+        vc = guild.voice_client
+        if (vc and vc.is_connected() and mixer.has_music
+                and not _voice_client_has_mixer(vc, mixer)
+                and not (vc.is_playing() or vc.is_paused())):
+            vc.play(mixer)
+            log.info("[VOICE-WATCHDOG] Reattached mixer after forced rejoin")
+    except Exception as e:
+        log.warning("[VOICE-WATCHDOG] Forced rejoin failed: %s", e)
 
 
 async def play_music(guild: discord.Guild, query: str, requester: str = "",
@@ -1527,6 +1698,11 @@ async def _elevenlabs_tts_call(voice_id: str, text: str) -> Optional[bytes]:
 
 async def text_to_speech_elevenlabs(text: str) -> Optional[bytes]:
     global _elevenlabs_working_voice
+    # Everything speaks with the same Groq Orpheus (Troy) voice now — the radio DJ
+    # included. Only fall through to ElevenLabs/edge if Groq is down.
+    groq_audio = await text_to_speech_groq(text)
+    if groq_audio:
+        return groq_audio
     if not ELEVENLABS_API_KEY:
         log.info("[RADIO] No ElevenLabs API key — using edge_tts")
         return await text_to_speech(text)
@@ -2765,10 +2941,21 @@ def pcm_to_wav(pcm_data: bytes, sample_rate: int = SAMPLE_RATE,
 async def transcribe_audio(pcm_data: bytes) -> Optional[str]:
     if not STT_ENABLED:
         return None
+    loop = asyncio.get_event_loop()
+    if STT_ENGINE == "local":
+        try:
+            import stt_local
+        except Exception as e:
+            log.error("[STT] local engine unavailable (%s) — is mlx-whisper installed?", e)
+            return None
+        text = await loop.run_in_executor(
+            None, stt_local.transcribe_pcm, pcm_data, SAMPLE_RATE, CHANNELS
+        )
+        return text or None
+    # ── Groq Whisper API fallback (STT_ENGINE=groq) ──
     if not GROQ_API_KEY:
         log.warning("No GROQ_API_KEY — cannot transcribe")
         return None
-    loop = asyncio.get_event_loop()
     wav_data = await loop.run_in_executor(None, pcm_to_wav, pcm_data)
     if len(wav_data) < 1024:
         return None
@@ -2793,7 +2980,57 @@ async def transcribe_audio(pcm_data: bytes) -> Optional[str]:
         return None
 
 
+def _stylize_for_orpheus(text: str) -> str:
+    """Give a line an emotional, swaying delivery for Orpheus.
+
+    Orpheus reads a leading bracketed vocal direction ([cheerful], [excited], …)
+    as *how* to say the line, not as words. We prepend the default style unless the
+    caller already supplied their own direction, and keep any CAPS / !!! / drawn-out
+    letters the text already has (Orpheus turns those into emphasis on its own)."""
+    t = (text or "").strip()
+    if not t or not GROQ_TTS_STYLE:
+        return t
+    if t.startswith("[") and "]" in t[:40]:
+        return t  # caller already set a vocal direction — don't double it up
+    return f"[{GROQ_TTS_STYLE}] {t}"
+
+
+async def text_to_speech_groq(text: str, voice: str = GROQ_TTS_VOICE) -> Optional[bytes]:
+    """Synthesize speech with Groq's Orpheus model (Troy by default). Returns WAV
+    bytes, or None on any failure so callers can fall back to another engine."""
+    if not GROQ_TTS_API_KEY:
+        return None
+    payload = {
+        "model": GROQ_TTS_MODEL,
+        "input": _stylize_for_orpheus(text),
+        "voice": (voice or GROQ_TTS_VOICE).lower(),  # Groq voice IDs are lowercase
+        "response_format": GROQ_TTS_FORMAT,
+    }
+    headers = {
+        "Authorization": f"Bearer {GROQ_TTS_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(GROQ_TTS_URL, headers=headers, json=payload,
+                                     timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    return data if data else None
+                err = await resp.text()
+                log.warning("[TTS] Groq Orpheus %s/%s → %d: %s",
+                            GROQ_TTS_MODEL, voice, resp.status, err[:200])
+                return None
+    except Exception as e:
+        log.warning("[TTS] Groq Orpheus call failed: %s", e)
+        return None
+
+
 async def text_to_speech(text: str, voice: str = TTS_VOICE) -> Optional[bytes]:
+    # Primary engine: Groq Orpheus (Troy). edge_tts is only a fallback if Groq fails.
+    groq_audio = await text_to_speech_groq(text)
+    if groq_audio:
+        return groq_audio
     try:
         import edge_tts
         communicate = edge_tts.Communicate(text, voice, rate=TTS_RATE)
@@ -2874,8 +3111,22 @@ class FFmpegPCMAudioPipe(discord.AudioSource):
 
 
 def contains_wake_word(text: str) -> bool:
+    import difflib
+    import re as _re
     lower = text.lower()
-    return any(w in lower for w in WAKE_WORDS)
+    # Fast path: any known spelling / common mishear appears verbatim.
+    if any(w in lower for w in WAKE_WORDS):
+        return True
+    # Fuzzy path: catch STT variants the explicit list doesn't cover
+    # ("clode", "cluade", "claudd", ...) per-word, so we don't fire on
+    # unrelated long sentences.
+    for w in _re.findall(r"[a-z฀-๿]+", lower):
+        if len(w) < 4:
+            continue
+        for target in _WAKE_FUZZY_TARGETS:
+            if difflib.SequenceMatcher(None, w, target).ratio() >= _WAKE_FUZZY_RATIO:
+                return True
+    return False
 
 
 def is_relevant_to_conversation(text: str, guild_id: str) -> bool:
@@ -3023,40 +3274,48 @@ class BloodAudioSink:
         self.user_buffers: dict[int, UserAudioBuffer] = {}
         self._running = True
         self._process_task = None
-        self._stt_lock = asyncio.Lock()
-        self._last_stt_time = 0.0
+        # Harvested utterances wait here for the single STT worker. Queueing
+        # (instead of the old "drop if a transcription is already running")
+        # is what stops overlapping / back-to-back speech from being lost.
+        self._stt_queue: asyncio.Queue = asyncio.Queue(maxsize=64)
+        self._worker_task = None
         self._voice_data_count = 0
+        self._dropped = 0
+        self._diag_counter = 0
 
     def start_processing(self):
-        self._process_task = asyncio.create_task(self._process_loop())
-        self._diag_counter = 0
+        """Start (or restart) the harvest loop + STT worker. Idempotent so the
+        /stt command can re-enable a sink that was previously stopped."""
+        self._running = True
+        if self._process_task is None or self._process_task.done():
+            self._process_task = asyncio.create_task(self._process_loop())
+        if self._worker_task is None or self._worker_task.done():
+            self._worker_task = asyncio.create_task(self._stt_worker())
 
     async def _process_loop(self):
         while self._running:
             try:
                 await asyncio.sleep(1.0)
-                now = time.monotonic()
                 self._diag_counter += 1
                 if self._diag_counter % 30 == 0:
                     bufs = {uid: (b.is_speaking, len(b.buffer), f"{b.silence_duration():.1f}s")
                             for uid, b in self.user_buffers.items()}
-                    log.info("[VC DIAG] tick=%d voice_pkts=%d buffers=%s stt_locked=%s",
-                             self._diag_counter, self._voice_data_count, bufs, self._stt_lock.locked())
+                    log.info("[VC DIAG] tick=%d voice_pkts=%d buffers=%s qsize=%d dropped=%d",
+                             self._diag_counter, self._voice_data_count, bufs,
+                             self._stt_queue.qsize(), self._dropped)
                 for uid, buf in list(self.user_buffers.items()):
-                    if buf.is_speaking and buf.silence_duration() > SILENCE_THRESHOLD_SEC:
+                    # Harvest when the speaker has gone quiet for a beat, OR has
+                    # been talking long enough that we should cut a segment. Each
+                    # harvested utterance is QUEUED, never dropped — concurrency
+                    # is handled by the worker, not by skipping audio here.
+                    ready = buf.is_speaking and (
+                        buf.silence_duration() > SILENCE_THRESHOLD_SEC
+                        or buf.speech_duration() > MAX_SPEECH_SEC
+                    )
+                    if ready:
                         pcm = buf.harvest()
                         if pcm and len(pcm) >= int(MIN_STT_BYTES):
-                            if now - self._last_stt_time < 2.0:
-                                continue
-                            if not self._stt_lock.locked():
-                                self._last_stt_time = now
-                                asyncio.create_task(self._guarded_handle(uid, buf.user_name, pcm))
-                    elif buf.is_speaking and buf.speech_duration() > MAX_SPEECH_SEC:
-                        pcm = buf.harvest()
-                        if pcm and len(pcm) >= int(MIN_STT_BYTES):
-                            if not self._stt_lock.locked():
-                                self._last_stt_time = now
-                                asyncio.create_task(self._guarded_handle(uid, buf.user_name, pcm))
+                            self._enqueue(uid, buf.user_name, pcm)
                     elif not buf.is_speaking and buf.silence_duration() > 10:
                         buf.clear()
             except asyncio.CancelledError:
@@ -3064,9 +3323,39 @@ class BloodAudioSink:
             except Exception as e:
                 log.warning("Voice process loop error: %s", e)
 
-    async def _guarded_handle(self, user_id: int, user_name: str, pcm_data: bytes):
-        async with self._stt_lock:
-            await self._handle_speech(user_id, user_name, pcm_data)
+    def _enqueue(self, user_id: int, user_name: str, pcm_data: bytes):
+        try:
+            self._stt_queue.put_nowait((user_id, user_name, pcm_data))
+        except asyncio.QueueFull:
+            # Backpressure (transcription can't keep up): drop the OLDEST queued
+            # utterance so the newest speech still gets through, and log it —
+            # never silently swallow audio.
+            try:
+                self._stt_queue.get_nowait()
+                self._stt_queue.task_done()
+                self._dropped += 1
+                self._stt_queue.put_nowait((user_id, user_name, pcm_data))
+                log.warning("[VC STT] queue full — dropped oldest utterance (total=%d)",
+                            self._dropped)
+            except Exception:
+                pass
+
+    async def _stt_worker(self):
+        """Single consumer that transcribes queued utterances one at a time.
+        Serializing here keeps the one in-process mlx-whisper model safe and the
+        event loop responsive; the queue guarantees overlapping/rapid speech is
+        transcribed in order rather than discarded."""
+        while self._running or not self._stt_queue.empty():
+            try:
+                user_id, user_name, pcm_data = await self._stt_queue.get()
+            except asyncio.CancelledError:
+                break
+            try:
+                await self._handle_speech(user_id, user_name, pcm_data)
+            except Exception as e:
+                log.warning("[VC STT] worker error for %s: %s", user_name, e)
+            finally:
+                self._stt_queue.task_done()
 
     @staticmethod
     def _is_junk(text: str) -> bool:
@@ -3114,7 +3403,7 @@ class BloodAudioSink:
                 if self.text_channel:
                     try:
                         await self.text_channel.send(
-                            f"🎙️ **{user_name}**: {text}\n💬 **Clawd**: {response}"
+                            f"🎙️ **{user_name}**: {text}\n💬 **Claude**: {response}"
                         )
                     except Exception:
                         pass
@@ -3422,22 +3711,37 @@ class BloodAudioSink:
         self._running = False
         if self._process_task:
             self._process_task.cancel()
+        if self._worker_task:
+            self._worker_task.cancel()
 
     async def flush_and_transcribe(self):
-        """Transcribe whatever audio is still buffered, so the final (or only)
-        utterance isn't lost when leaving without a trailing silence gap to
+        """Transcribe whatever audio is still buffered or queued, so the final (or
+        only) utterance isn't lost when leaving without a trailing silence gap to
         trigger a normal harvest. MUST be awaited BEFORE the session transcript
         is saved (i.e. before end_vc_session)."""
         self._running = False
         if self._process_task:
             self._process_task.cancel()
-        for uid, buf in list(self.user_buffers.items()):
+        # Pull everything still queued so the worker can't also consume it, then
+        # add whatever is left sitting in user buffers (no trailing silence).
+        pending: list[tuple[int, str, bytes]] = []
+        while not self._stt_queue.empty():
             try:
-                pcm = buf.harvest()  # None if below MIN_SPEECH_SEC of audio
-                if pcm:
-                    await self._handle_speech(uid, buf.user_name, pcm)
+                pending.append(self._stt_queue.get_nowait())
+                self._stt_queue.task_done()
+            except Exception:
+                break
+        for uid, buf in list(self.user_buffers.items()):
+            pcm = buf.harvest()  # None if below MIN_SPEECH_SEC of audio
+            if pcm:
+                pending.append((uid, buf.user_name, pcm))
+        if self._worker_task:
+            self._worker_task.cancel()
+        for uid, user_name, pcm in pending:
+            try:
+                await self._handle_speech(uid, user_name, pcm)
             except Exception as e:
-                log.warning("[VC] final flush transcribe failed for %s: %s", buf.user_name, e)
+                log.warning("[VC] final flush transcribe failed for %s: %s", user_name, e)
 
 
 # ── Active Sinks Registry ─────────────────────────────────────────────────────
@@ -3448,6 +3752,83 @@ _intentional_leave: set[str] = set()
 
 def get_active_sink(guild_id: str) -> Optional[BloodAudioSink]:
     return _active_sinks.get(guild_id)
+
+
+def _attach_listener(voice_client, sink: "BloodAudioSink") -> Optional[str]:
+    """Wire the voice receiver to a sink and start its processing tasks. Shared by
+    join_and_listen and the live /stt toggle. Returns an error string on failure,
+    or None on success."""
+    import discord.ext.voice_recv as voice_recv
+    _raw_cb_count = [0]
+
+    def callback(user, data: voice_recv.VoiceData):
+        _raw_cb_count[0] += 1
+        if _raw_cb_count[0] in (1, 5, 20, 100):
+            log.info("[VC] Raw callback #%d: user=%s pcm_len=%d",
+                     _raw_cb_count[0], user, len(data.pcm) if data.pcm else 0)
+        try:
+            sink.on_voice_data(user, data.pcm)
+        except Exception as e:
+            # Never let one bad packet escape into the PacketRouter loop — an
+            # uncaught exception there tears down the listener (stop_listening).
+            log.warning("[VC] on_voice_data error (ignored to keep listener alive): %s", e)
+
+    try:
+        # Stop any existing listener first — prevents "Already receiving audio" on rejoin.
+        if hasattr(voice_client, 'is_listening') and voice_client.is_listening():
+            voice_client.stop_listening()
+        voice_client.listen(voice_recv.BasicSink(callback))
+        log.info("[VC] Listener started (voice_recv.BasicSink), is_listening=%s",
+                 voice_client.is_listening() if hasattr(voice_client, 'is_listening') else '?')
+    except Exception as e:
+        err = str(e).lower()
+        if "already receiving" in err or "already listening" in err:
+            log.info("[VC] Listener already running — continuing")
+        else:
+            log.error("[VC] Failed to start listener: %s", e)
+            return f"❌ Failed to start listening: {e}"
+    sink.start_processing()
+    # Preload the local model off-thread so the first utterance isn't slow.
+    if STT_ENGINE == "local":
+        asyncio.get_event_loop().run_in_executor(None, _warm_local_stt)
+    return None
+
+
+async def set_stt_runtime(guild: discord.Guild, enabled: bool) -> str:
+    """Turn STT on/off at runtime (persisted) and apply it to the guild's current
+    voice session — attaching or detaching the receiver live. Backs the /stt
+    command."""
+    set_stt_enabled_flag(enabled)
+    guild_id = str(guild.id)
+    vc = guild.voice_client
+    if not vc:
+        state = "on" if enabled else "off"
+        return (f"🎙️ STT **{state}** (engine: {STT_ENGINE}). "
+                f"I'm not in a voice channel — it'll take effect when I join.")
+    if enabled:
+        sink = _active_sinks.get(guild_id)
+        if sink is None:
+            ch_name = vc.channel.name if vc.channel else ""
+            sink = BloodAudioSink(guild_id, ch_name, vc.client, None)
+            _active_sinks[guild_id] = sink
+            start_vc_session(guild_id, ch_name)
+        err = _attach_listener(vc, sink)
+        if err:
+            return err
+        return f"🎙️ STT **on** — listening & transcribing now (engine: {STT_ENGINE}). Say 'Claude' to talk to me."
+    # Disable: flush the last words, then detach the receiver but stay connected.
+    if hasattr(vc, 'is_listening') and vc.is_listening():
+        try:
+            vc.stop_listening()
+        except Exception as e:
+            log.warning("[VC] stop_listening failed: %s", e)
+    sink = _active_sinks.get(guild_id)
+    if sink:
+        try:
+            await sink.flush_and_transcribe()
+        except Exception as e:
+            log.warning("[VC] flush on STT-off failed: %s", e)
+    return "🎙️ STT **off** — I'll stop transcribing but stay for music & TTS."
 
 
 async def join_and_listen(guild: discord.Guild, vc_channel: discord.VoiceChannel,
@@ -3488,40 +3869,16 @@ async def join_and_listen(guild: discord.Guild, vc_channel: discord.VoiceChannel
     sink = BloodAudioSink(guild_id, vc_channel.name, bot_instance, text_channel)
     _active_sinks[guild_id] = sink
     start_vc_session(guild_id, vc_channel.name)
-    _raw_cb_count = [0]
-    def callback(user, data: voice_recv.VoiceData):
-        _raw_cb_count[0] += 1
-        if _raw_cb_count[0] in (1, 5, 20, 100):
-            log.info("[VC] Raw callback #%d: user=%s pcm_len=%d",
-                     _raw_cb_count[0], user, len(data.pcm) if data.pcm else 0)
-        try:
-            sink.on_voice_data(user, data.pcm)
-        except Exception as e:
-            # Never let one bad packet escape into the PacketRouter loop — an
-            # uncaught exception there tears down the listener (stop_listening).
-            log.warning("[VC] on_voice_data error (ignored to keep listener alive): %s", e)
     if STT_ENABLED:
-        try:
-            # Stop any existing listener first — prevents "Already receiving audio" on rejoin
-            if hasattr(voice_client, 'is_listening') and voice_client.is_listening():
-                voice_client.stop_listening()
-            voice_client.listen(voice_recv.BasicSink(callback))
-            log.info("[VC] Listener started on '%s' (voice_recv.BasicSink), is_listening=%s",
-                     vc_channel.name, voice_client.is_listening() if hasattr(voice_client, 'is_listening') else '?')
-        except Exception as e:
-            err = str(e).lower()
-            if "already receiving" in err or "already listening" in err:
-                log.info("[VC] Listener already running on '%s' — continuing", vc_channel.name)
-            else:
-                log.error("[VC] Failed to start listener: %s", e)
-                return f"❌ Failed to start listening: {e}"
-        sink.start_processing()
+        err = _attach_listener(voice_client, sink)
+        if err:
+            return err
     else:
         # STT disabled — join for TTS/music only. Don't attach the audio
         # receiver, so there's no opus decoding or transcription at all.
         if hasattr(voice_client, 'is_listening') and voice_client.is_listening():
             voice_client.stop_listening()
-        log.info("[VC] STT disabled (STT_ENABLED=false) — joined '%s' for TTS/music only, not transcribing.",
+        log.info("[VC] STT disabled — joined '%s' for TTS/music only, not transcribing.",
                  vc_channel.name)
     try:
         import web_mixer as wm
@@ -3543,7 +3900,7 @@ async def join_and_listen(guild: discord.Guild, vc_channel: discord.VoiceChannel
         log.warning("Web mixer not started: %s", e)
     log.info("Joined VC '%s' in %s — listening", vc_channel.name, guild.name)
     if STT_ENABLED:
-        return f"✅ Joined **{vc_channel.name}** — listening & recording. Say 'Blood' or 'hey Blood' to talk to me!"
+        return f"✅ Joined **{vc_channel.name}** — listening & recording. Say 'Claude' or 'hey Claude' to talk to me!"
     return f"✅ Joined **{vc_channel.name}** — playing music & TTS only (voice transcription is off)."
 
 
