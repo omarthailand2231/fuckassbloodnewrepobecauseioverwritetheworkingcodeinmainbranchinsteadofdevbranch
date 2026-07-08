@@ -29,7 +29,7 @@ USE_GROQ_API = False
 USE_MIMO_API = os.getenv("USE_MIMO_API", "").lower() in ("1", "true", "yes", "on")
 USE_GATEWAY_API = os.getenv("USE_GATEWAY_API", "").lower() in ("1", "true", "yes", "on")
 
-# Auto reaction memes / GIFs after replies + the send_meme tool. Set MEMES_ENABLED=false to turn off.
+# Auto reaction memes / GIFs after replies. Set MEMES_ENABLED=false to turn off.
 MEMES_ENABLED = os.getenv("MEMES_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 
 CONFIG = {
@@ -69,7 +69,6 @@ CONFIG = {
         "edit_code_file":    ["user", "mod", "admin", "owner"],
         "read_url":          ["user", "mod", "admin", "owner"],
         "image_search":      ["user", "mod", "admin", "owner"],
-        "give_coins":        ["user", "mod", "admin", "owner"],
 
         # ── Music (anyone can use) ──
         "play_music":        ["user", "mod", "admin", "owner"],
@@ -88,17 +87,7 @@ CONFIG = {
         "join_voice":        ["mod", "admin", "owner"],
         "set_nickname":      ["mod", "admin", "owner"],
 
-        # ── Terminal / remote control (admin/owner only) ──
-        "run_terminal_command":  ["admin", "owner"],
-        "open_url_browser":      ["admin", "owner"],
-        "view_screen":           ["admin", "owner"],
-        "keyboard_type":         ["admin", "owner"],
-        "press_key":             ["admin", "owner"],
-        "mouse_click":           ["admin", "owner"],
-        "scroll_screen":         ["admin", "owner"],
-
         # ── AGI scaffold tools ──
-        "set_goal":              ["user", "mod", "admin", "owner"],
         "complete_goal":         ["user", "mod", "admin", "owner"],
         "list_goals":            ["user", "mod", "admin", "owner"],
         "save_skill":            ["admin", "owner"],
@@ -226,7 +215,7 @@ CONFIG = {
     "slim_tools": {
         "timeout_user", "recall_memory", "save_summary", "web_search",
         "image_search", "read_url", "unmute_user", "get_user_info", "internal_reasoning", "analyze_image",
-        "give_coins", "set_goal", "complete_goal", "list_goals", "list_skills", "read_skill",
+        "complete_goal", "list_goals", "list_skills", "read_skill",
     },
 
     # Words that trigger the full tool set
@@ -286,7 +275,7 @@ CONFIG = {
 
     # Final output leak check — blocks system-prompt leakage. Use ONLY structural
     # markers that appear in the prompt but NOT in normal replies. (Do NOT include
-    # identity phrases like "claude fable 5" — the bot legitimately says that when
+    # identity phrases like "claude fable 6" — the bot legitimately says that when
     # asked what model it is, which would get its answer replaced with "nice try.")
     "prompt_leak_patterns": [
         "the assistant is claude", "claude_behavior", "deployment — discord bot",
@@ -336,43 +325,6 @@ CONFIG = {
     "yap_leaderboard_limit":        10,
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 12. REMOTE TERMINAL
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    "terminal_allowed_tiers":       ["admin", "owner"],
-    "terminal_screenshot_interval": 1.2,        # seconds between auto-screenshots
-    "terminal_max_output_chars":    4000,       # max chars from command output
-    "terminal_command_timeout_sec": 30,         # timeout per shell command
-
-    # Chrome paths per platform (sys.platform key)
-    "terminal_chrome_paths": {
-        "win32":  r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        "darwin": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "linux":  "google-chrome",
-    },
-
-    # Blocked domains — porn / adult content filter
-    "terminal_blocked_domains": [
-        "pornhub.com", "xvideos.com", "xnxx.com", "xhamster.com",
-        "redtube.com", "youporn.com", "tube8.com", "spankbang.com",
-        "eporner.com", "ixxx.com", "hqporner.com", "porn.com",
-        "brazzers.com", "realitykings.com", "bangbros.com",
-        "naughtyamerica.com", "fakku.net", "nhentai.net",
-        "rule34.xxx", "e621.net", "gelbooru.com", "danbooru.donmai.us",
-        "hanime.tv", "hentaihaven.xxx", "porntrex.com",
-        "tnaflix.com", "drtuber.com", "sexvid.xxx", "4tube.com",
-        "motherless.com", "heavy-r.com", "efukt.com",
-        "chaturbate.com", "stripchat.com", "bongacams.com",
-        "myfreecams.com", "cam4.com", "livejasmin.com",
-        "onlyfans.com", "fansly.com", "manyvids.com",
-    ],
-
-    # Extra keyword patterns — if ANY appears in the URL it's blocked
-    "terminal_blocked_url_patterns": [
-        "porn", "xxx", "hentai", "nsfw", "xrated",
-    ],
-
-    # ═══════════════════════════════════════════════════════════════════════════
     # 13. EMOTIONAL STATE
     # ═══════════════════════════════════════════════════════════════════════════
 
@@ -401,7 +353,6 @@ CONFIG = {
 
     "dm_enabled":                   True,
     "dm_tools_enabled":             True,    # False = DMs are chat-only, True = Blood can use server tools from DMs
-    "requests_channel_id":          os.getenv("BLOODAI_REQUESTS_CHANNEL_ID"),
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 17. AGI SCAFFOLD
@@ -416,6 +367,11 @@ CONFIG = {
     "goals_enabled":                    True,
     "goals_max_per_guild":              20,     # max active goals at once
     "goals_prompt_cap":                 400,    # max chars of goals injected into system prompt
+
+    # ── Active goal-work loop (started by /set_goal) ────────────────────────────
+    "goal_loop_interval_sec":           25,      # pause between work rounds
+    "goal_loop_max_seconds":            900,     # 15 min of continuous work before auto-pausing
+    "goal_loop_tool_result_cap":        3000,    # max chars of a tool result kept in the loop's own history
 
     # ── Skills folder ──────────────────────────────────────────────────────────
     "skills_enabled":                   True,

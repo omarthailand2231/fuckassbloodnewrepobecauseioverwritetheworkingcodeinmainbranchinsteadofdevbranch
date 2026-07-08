@@ -6,8 +6,6 @@ matplotlib>=3.8.0
 openai>=1.0
 duckduckgo-search>=5.0
 tavily-python>=0.7
-pyautogui>=0.9
-playwright>=1.40
 chromadb>=1.0
 sentence-transformers>=3.0
 PyNaCl>=1.5
@@ -18,3 +16,5 @@ tiktoken>=0.7
 edge-tts>=7.0
 discord-ext-voice-recv>=0.5
 yt-dlp>=2024.0
+# Local on-device STT (Apple Silicon). Falls back to Groq API if absent + STT_ENGINE=groq.
+mlx-whisper>=0.4 ; sys_platform == "darwin" and platform_machine == "arm64"

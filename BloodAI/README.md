@@ -1,6 +1,6 @@
 # Blood — Discord AI Agent Bot
 
-> **Persona:** the bot now runs the **Claude Fable 5** personality (warm, helpful, honest, direct) and is live in Discord as **Clawd**. "Blood" remains the codebase/project name (repo, classes, internal identifiers); the user-facing assistant is Claude. The persona is defined in `personality_fable5.md` and loaded by `build_system_prompt()` in `bot.py`.
+> **Persona:** the bot now runs the **Claude Fable 6** personality (warm, helpful, honest, direct) and is live in Discord as **Clawd**. "Blood" remains the codebase/project name (repo, classes, internal identifiers); the user-facing assistant is Claude. The persona is defined in `personality_fable5.md` and loaded by `build_system_prompt()` in `bot.py`.
 
 ## What this is
 A full-featured Discord AI agent with voice presence, real-time audio mixing, an AI music radio with a DJ host, moderation, a coin economy, stock-market trading, web browsing, image vision, and persistent memory. Supports optional STT + TTS for live voice conversations with simultaneous music playback and smooth audio transitions.
@@ -24,7 +24,7 @@ web_mixer.py    — Mixer web UI dashboard (localhost:7777)
 tools.py             — Tool definitions + executors (50+ tools)
 provider.py          — Multi-provider chat client: gateway → MiMo → Moonshot failover + vision
 config.py            — Permission tiers, role IDs, tool gates, provider + feature toggles
-personality_fable5.md— Claude Fable 5 base system prompt (the bot's personality)
+personality_fable5.md— Claude Fable 6 base system prompt (the bot's personality)
 memory.py            — Memory manager (RAM + channels + summaries + coins + market)
 market.py            — Real-time stock/crypto/commodity prices + charts
 mood.py              — Emotional-state helpers (resets on restart)
@@ -74,7 +74,6 @@ Blood can use these on its own judgment:
 - `image_search` — find and send images
 - `analyze_image` — process attached image URLs via Vision AI
 - `internal_reasoning` — silent reasoning step
-- `give_coins` — reward or punish users with BHC coins (Blood decides)
 
 ## Commands
 
@@ -121,8 +120,6 @@ Blood can use these on its own judgment:
 ### Admin
 | Command | Description |
 |---------|-------------|
-| `/openterminal` | Open remote terminal session |
-| `/closeterminal` | Close remote terminal session |
 | `/hotreload` (`/reboot`, `/restart`) | **Owner only.** Restart the bot in-place with fresh code via `os.execv` (same terminal/PID; reloads code + `.env`). The new "online" log is the restart confirmation. |
 
 ## Voice System (`voice.py`)
@@ -220,7 +217,7 @@ GROQ_API_KEY=...              # Groq — also the VISION fallback (llama-4-scout
 
 # ── Feature toggles ──
 STT_ENABLED=false             # voice-channel transcription (Groq Whisper). false = music/TTS only, no audio receive
-MEMES_ENABLED=false           # auto reaction GIFs/memes after replies + the send_meme tool
+MEMES_ENABLED=false           # auto reaction GIFs/memes after replies
 
 # ── Optional integrations ──
 TAVILY_API_KEY=...            # web search
@@ -236,12 +233,15 @@ SPOTIFY_CLIENT_SECRET=...
 |-----|---------|--------|
 | `USE_GATEWAY_API` | `true` | Use the 9arm gateway as the primary chat/vision provider. If false (and no `GATEWAY_API_KEY`), falls back to MiMo/Moonshot. |
 | `STT_ENABLED` | `true` | When `false`, the bot joins voice for **music + TTS only** — it does not attach the audio receiver, so there's no opus decoding or transcription (and no related log noise). |
-| `MEMES_ENABLED` | `true` | When `false`, no auto reaction GIF/meme after replies, the meme list is dropped from the prompt, and `send_meme` is removed from the toolset. |
+| `MEMES_ENABLED` | `true` | When `false`, no auto reaction GIF/meme after replies and the meme list is dropped from the prompt. |
 
 ### Provider failover (`call_ai`)
 Chat tries providers in order — **Gateway → MiMo → Moonshot** — failing over fast (short retry budget on non-final providers, raise-on-last-attempt) so a gateway outage (e.g. HTTP 502) doesn't take the bot down. If all fail, it returns a graceful "providers are down" message instead of throwing. The gateway stays first, so it automatically resumes once healthy. **Vision** (`call_vision` / `call_fast_vision`) uses the gateway first, then Groq `llama-4-scout`.
 
 ## Recent changes
+- **Goals flipped from AI-initiated to user-initiated**: `set_goal` is no longer an AI tool. Instead, `/set_goal <text>` (any user) creates the goal and immediately kicks off a dedicated work loop (`_run_goal_loop` in `bot.py`) — paced tool-calling rounds (`goal_loop_interval_sec`, default 25s) that keep going, posting progress in-channel, until the AI calls `complete_goal` or a wall-clock safety cap (`goal_loop_max_seconds`, default 15 min) is hit, at which point the goal stays active but the loop pauses. `complete_goal`/`list_goals` are unchanged (still AI tools).
+- **Removed unused tools**: `give_coins`, `send_meme`, `request_capability`, `update_emotional_state`, and the entire remote-terminal-control feature (`run_terminal_command`, `open_url_browser`, `view_screen`, `keyboard_type`, `press_key`, `mouse_click`, `mouse_move`, `scroll_screen`, `/openterminal`, `/closeterminal`, `/fastimg`, the disabled Playwright browser-DOM tools, and their supporting session/screenshot-loop code). The coin economy (`/buy`, `/sell`, `/portfolio`) and auto meme-reaction pass are unaffected — only the AI-callable tools were cut.
+- **Persona bump → Claude Fable 6** (display name + system prompt only; backend is still the 9arm gateway `qwen3.6-35b-a3b`, unchanged).
 - **Persona → Claude Fable 5** (loaded from `personality_fable5.md`); all internal sub-prompts (meme picker, reflection, QA checker, background agent, radio/voice DJ) reframed from the old "Blood/House" persona to Claude. Radio rebranded **Clawd Radio**.
 - **Providers**: primary chat + vision on the 9arm gateway (`qwen3.6-35b-a3b`) with MiMo/Moonshot/Groq failover. Vision repointed off MiMo (quota-exhausted) to the gateway + Groq fallback.
 - **`/hotreload`** owner command for in-place restarts (`os.execv`).
