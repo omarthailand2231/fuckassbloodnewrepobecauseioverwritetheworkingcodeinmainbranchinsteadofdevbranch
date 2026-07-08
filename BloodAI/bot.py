@@ -186,6 +186,7 @@ _fastdebug_msg: dict[str, object] = {}  # channel_id -> discord.Message for live
 _cancel_requested: set[str] = set()  # channel_ids where /cancel was issued
 _persona_overrides: dict[str, str] = {}  # channel_id -> persona name (e.g. "trump")
 _active_goal_loops: dict[str, "asyncio.Task"] = {}  # "guild_id:goal_id" -> running work-loop task
+_goal_loop_channels: dict[str, str] = {}  # "guild_id:goal_id" -> channel_id it runs in (for /cancel)
 
 # ── Base personality prompt (Claude Fable 6) ─────────────────────────────────
 _fable5_base_cache: str | None = None
@@ -778,6 +779,21 @@ def _split_message(text: str, limit: int = 1900) -> list[str]:
         text = remainder
     return chunks
 
+
+async def _goal_emit(channel, goal_id, text: str, *, to_channel: bool = True):
+    """Goal-loop output sink. ALWAYS logs (so the full run is captured in the log
+    regardless of Discord), and — when to_channel is True — posts to the channel
+    split into Discord-sized chunks so long research replies are never cut off.
+    Verbose per-tool traces pass to_channel=False: logged only, not spamming chat."""
+    log.info("[GOAL #%s] %s", goal_id, text)
+    if to_channel and channel is not None:
+        for chunk in _split_message(str(text)):
+            try:
+                await channel.send(chunk)
+            except Exception:
+                pass
+
+
 async def safe_progress_start(message, content):
     try:
         return await message.reply(content[:CONFIG["discord_message_limit"]], mention_author=False)
@@ -1214,18 +1230,19 @@ RULES:
             started = time.monotonic()
             round_num = 0
             try:
-                await channel.send(f"```ansi\n[1;36m[GOAL #{goal_id}][0m starting: {goal['text'][:200]}\n```")
+                await _goal_emit(channel, goal_id, f"▶ starting: {goal['text'][:200]}")
                 while True:
                     current = next((g for g in memory.list_goals(guild_id, "all") if g["id"] == goal_id), None)
                     if not current or current.get("status") != "active":
                         status = current.get("status") if current else "unknown"
-                        await channel.send(f"```ansi\n[1;32m[GOAL #{goal_id}][0m {status} — loop stopped.\n```")
+                        await _goal_emit(channel, goal_id, f"{status} — loop stopped.")
                         return
 
                     if time.monotonic() - started > max_seconds:
-                        await channel.send(
-                            f"```ansi\n[1;33m[GOAL #{goal_id}][0m paused after {max_seconds // 60} min without completion. "
-                            f"Still active — nudge me in chat about it to pick it back up.\n```"
+                        await _goal_emit(
+                            channel, goal_id,
+                            f"paused after {max_seconds // 60} min without completion. "
+                            f"Still active — nudge me in chat about it to pick it back up."
                         )
                         return
 
@@ -1239,7 +1256,7 @@ RULES:
                     try:
                         response = await call_ai(system=system, messages=history, tools=allowed_tools or None)
                     except Exception as e:
-                        await channel.send(f"```[GOAL #{goal_id}] error calling model: {e}```")
+                        await _goal_emit(channel, goal_id, f"error calling model: {e}")
                         return
 
                     for _step in range(1, CONFIG["max_tool_loop_steps"] + 1):
@@ -1262,24 +1279,27 @@ RULES:
                             result_str = str(result)[:result_cap]
                             history.append({"role": "assistant", "content": None, "tool_calls": [tc]})
                             history.append({"role": "tool", "tool_call_id": tc.get("id", ""), "name": tool_name, "content": result_str})
-                            await channel.send(f"```[GOAL #{goal_id}] {tool_name} → {result_str[:300]}```")
+                            await _goal_emit(channel, goal_id, f"{tool_name} → {result_str}", to_channel=False)
                         response = await call_ai(system=system, messages=history, tools=allowed_tools or None)
 
                     final_text = clean_response(response.get("message", {}).get("content") or "")
                     if final_text:
                         history.append({"role": "assistant", "content": final_text})
-                        await channel.send(f"**[GOAL #{goal_id}]** {final_text[:1500]}")
+                        await _goal_emit(channel, goal_id, final_text)
 
                     await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                # /cancel cancelled the task — the goal was already marked abandoned
+                # by cancel_cmd, and it posts its own confirmation. Just unwind.
+                raise
             except Exception as e:
                 log.error("Goal loop error for #%s: %s", goal_id, e, exc_info=True)
-                try:
-                    await channel.send(f"```[GOAL #{goal_id}] loop crashed: {e}```")
-                except Exception:
-                    pass
+                await _goal_emit(channel, goal_id, f"loop crashed: {e}")
             finally:
                 _active_goal_loops.pop(key, None)
+                _goal_loop_channels.pop(key, None)
 
+        _goal_loop_channels[key] = str(channel.id)
         _active_goal_loops[key] = asyncio.create_task(_loop())
 
     _reflection_lock = asyncio.Lock()
@@ -2705,11 +2725,31 @@ RULES:
 
     # ── Cancel / Reset / Fastdebug ────────────────────────────────────────
 
-    @bot.hybrid_command(name="cancel", description="Cancel Blood's current request in this channel")
+    @bot.hybrid_command(name="cancel", description="Cancel Blood's current request or goal in this channel")
     async def cancel_cmd(ctx):
         ch_id = str(ctx.channel.id)
         _cancel_requested.add(ch_id)
-        await ctx.reply("```ansi\n\u001b[1;31m[CANCEL]\u001b[0m aborting current request.\n```")
+        # Also stop any goal loop running in this channel: mark it abandoned so the
+        # loop will not restart, then cancel the task for an immediate halt (a research
+        # round can run for minutes, so the status check alone would not stop it fast).
+        stopped = []
+        if ctx.guild:
+            for gk, cid in list(_goal_loop_channels.items()):
+                if cid != ch_id:
+                    continue
+                gid = None
+                try:
+                    gid = int(gk.split(":", 1)[1])
+                    memory.complete_goal(str(ctx.guild.id), gid, outcome="abandoned")
+                except Exception:
+                    pass
+                task = _active_goal_loops.get(gk)
+                if task and not task.done():
+                    task.cancel()
+                if gid is not None:
+                    stopped.append(gid)
+        note = ("  stopped goal(s): " + ", ".join(f"#{g}" for g in stopped)) if stopped else ""
+        await ctx.reply("```ansi\n\u001b[1;31m[CANCEL]\u001b[0m aborting current request." + note + "\n```")
 
     @bot.hybrid_command(name="reset", description="Hard reset ALL memory, history, caches (admin+)")
     async def reset_cmd(ctx):
