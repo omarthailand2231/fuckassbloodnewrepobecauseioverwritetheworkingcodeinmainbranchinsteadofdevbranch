@@ -647,15 +647,17 @@ async def _is_followup_to_bot(message, guild) -> bool:
     try:
         resp = await call_ai(
             system=(
-                "You judge whether a new Discord message — one that did NOT @mention or reply to the "
-                "assistant — is still directed AT the assistant, continuing the conversation it was just "
-                "having with this user. The user often keeps talking to it without re-tagging it.\n"
-                "Say YES if the message is aimed at the assistant, even indirectly: a follow-up question, "
-                "a reaction to its last answer, a new but related question, or the user thinking out loud "
-                "to it ('hmm i can't decide what to ask next', 'wait really?', 'ok what about X').\n"
-                "Say NO only when the message is clearly aimed at other people, is unrelated human-to-human "
-                "chatter, or is bare filler with nothing to respond to ('lol', 'ok', 'brb').\n"
-                "When it's genuinely a one-on-one flow and the assistant just replied moments ago, lean YES. "
+                "You decide whether a new Discord message — one that did NOT @mention or reply to the "
+                "assistant — is CLEARLY a continuation of the assistant's last answer to this user: the "
+                "user obviously kept talking to the assistant but forgot to tag it.\n"
+                "Say YES ONLY when the message plainly builds on the assistant's previous answer — a direct "
+                "follow-up question ('what about blueberries?', 'why is that?'), an explicit challenge/reaction "
+                "to that answer ('wait, are you sure?'), or a clear request to do more with it ('can you also "
+                "list X'). The link to the assistant's last answer must be obvious.\n"
+                "Say NO for everything else: a remark the user makes to themselves or the room, a fresh topic "
+                "not put to the assistant, small talk, greetings, reactions with nothing to answer ('ok cool', "
+                "'interesting', 'hmm'), filler, or anything aimed at other people. If it is not OBVIOUSLY a "
+                "follow-up to the assistant, say NO.\n"
                 "Answer ONLY 'YES' or 'NO'."
             ),
             messages=[{"role": "user", "content": (
@@ -663,7 +665,7 @@ async def _is_followup_to_bot(message, guild) -> bool:
                 f"User: {exch['user_msg'][:300]}\n"
                 f"Assistant: {exch['bot_reply'][:300]}\n\n"
                 f"NEW MESSAGE from {message.author.display_name}:\n{text[:300]}\n\n"
-                f"Is the new message still directed at the assistant? YES or NO."
+                f"Is the new message CLEARLY a follow-up to the assistant's last answer? YES or NO."
             )}],
             tools=None,
             max_tokens=3,
