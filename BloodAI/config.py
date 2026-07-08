@@ -373,6 +373,12 @@ CONFIG = {
     "goal_loop_max_seconds":            900,     # 15 min of continuous work before auto-pausing
     "goal_loop_tool_result_cap":        3000,    # max chars of a tool result kept in the loop's own history
 
+    # ── ask_user (mid-task clarifying questions) ────────────────────────────────
+    "ask_user_no_response_timeout_sec": 600,      # 10 min — times out if NOTHING happens at all (no click, no reply)
+    "ask_user_idle_timeout_sec":        1200,     # 20 min — once discussion starts, times out after this much silence
+    "ask_user_watchdog_interval_sec":   15,       # how often the idle watchdog checks
+    "ask_user_thread_archive_min":      60,       # thread auto-archive duration (Discord: 60/1440/4320/10080 only)
+
     # ── Skills folder ──────────────────────────────────────────────────────────
     "skills_enabled":                   True,
     "skills_dir":                       os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills"),

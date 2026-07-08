@@ -9,6 +9,7 @@ promise to do something and then fail on permission.
 import asyncio
 import os
 import sys
+import time
 import logging
 from datetime import timedelta
 from config import CONFIG
@@ -19,6 +20,11 @@ try:
     import discord as _discord
 except ImportError:
     _discord = None
+
+# Pending ask_user questions — channel/thread id (str) -> state dict. Populated by
+# the ask_user tool below, consumed by bot.py's on_message to route plain-text
+# discussion replies back into the pending question instead of normal chat.
+_pending_ask_user: dict[str, dict] = {}
 
 
 # ── Tool definitions ──────────────────────────────────────────────────────────
@@ -549,6 +555,25 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "ask_user",
+            "description": "Ask the user a clarifying question when you're genuinely blocked on a decision only they can make — not for things you can reasonably decide yourself. Posts clickable option buttons (plus an 'Other' button for a free-text answer) in a thread and waits for a response. The user can also just reply in the thread to discuss it instead of clicking; once they've settled on something, you'll get their resolved answer as the tool result. If they pick 'Other' and type something like '1 + 3, I'd rather do both', interpret that as referring to your numbered options plus their own note.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "The question to ask, phrased clearly and self-contained."},
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "2 to 5 short, clickable option labels. Don't include a generic 'other/custom' option — that's added automatically.",
+                    },
+                },
+                "required": ["question", "options"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "edit_code_file",
             "description": "Edit a code/text file. Two modes: (1) PATCH mode — provide find_replace with search/replace pairs for surgical edits. (2) FULL mode — provide new_content with the entire file (only for small files or full rewrites). Prefer PATCH mode for large files to avoid truncation.",
             "parameters": {
@@ -684,7 +709,7 @@ AUTONOMOUS_TOOLS = {
     "timeout_user", "read_channel_history", "recall_memory",
     "get_server_info", "save_summary", "web_search", "image_search",
     "read_url", "crawl_website", "extract_urls", "internal_reasoning", "analyze_image", "edit_code_file",
-    "send_dm",
+    "send_dm", "ask_user",
     "schedule_task", "delete_messages", "get_server_members",
     "complete_goal", "list_goals", "save_skill", "list_skills", "read_skill",
 }
@@ -1600,6 +1625,178 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
         reasoning = args.get("reasoning", "")
         log.debug("[internal_reasoning] %s", reasoning[:200])
         return "ok"
+
+    # ── ask_user ──────────────────────────────────────────────────────────────
+    elif name == "ask_user":
+        question = args.get("question", "").strip()
+        options = args.get("options", [])
+        if not question:
+            return "ERROR: question is required."
+        if not isinstance(options, list) or not (2 <= len(options) <= 5):
+            return "ERROR: options must be a list of 2 to 5 short choices."
+        options = [str(o)[:80] for o in options]
+
+        target_user = invoker
+        try:
+            if hasattr(channel, "create_thread") and not isinstance(channel, discord.Thread):
+                post_channel = await channel.create_thread(
+                    name=f"❓ {question[:80]}",
+                    type=discord.ChannelType.public_thread,
+                    auto_archive_duration=CONFIG.get("ask_user_thread_archive_min", 60),
+                )
+            else:
+                post_channel = channel
+        except Exception:
+            post_channel = channel
+
+        created_new_thread = post_channel is not channel
+        thread_id = str(post_channel.id)
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        activity = {"last": time.monotonic(), "seen": False}
+
+        def _touch_activity():
+            activity["last"] = time.monotonic()
+            activity["seen"] = True
+
+        class _CustomModal(discord.ui.Modal, title="Custom answer"):
+            answer = discord.ui.TextInput(
+                label="Your answer",
+                style=discord.TextStyle.paragraph,
+                placeholder="e.g. '1 + 3 — I'd rather do both plus my own idea...'",
+                max_length=500,
+            )
+
+            async def on_submit(self, interaction):
+                await interaction.response.send_message(
+                    f"Got it: {self.answer.value[:200]}", ephemeral=True
+                )
+
+        class _AskUserView(discord.ui.View):
+            def __init__(self):
+                super().__init__(timeout=None)  # the watchdog below manages timing, not discord.py's own timer
+                self.message = None
+                for i, opt in enumerate(options):
+                    self.add_item(_make_option_button(opt, i))
+                self.add_item(_make_custom_button())
+
+        def _resolve(view, answer_text):
+            _pending_ask_user.pop(thread_id, None)
+            if not future.done():
+                future.set_result(answer_text)
+            view.stop()
+            for child in view.children:
+                child.disabled = True
+
+        def _make_option_button(label, idx):
+            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary, row=idx // 5)
+
+            async def _callback(interaction):
+                if interaction.user.id != target_user.id:
+                    await interaction.response.send_message("this question is for someone else.", ephemeral=True)
+                    return
+                _touch_activity()
+                view = btn.view
+                _resolve(view, label)
+                await interaction.response.edit_message(view=view)
+                await post_channel.send(f"✅ Picked: **{label}**")
+
+            btn.callback = _callback
+            return btn
+
+        def _make_custom_button():
+            btn = discord.ui.Button(label="Other / custom answer", style=discord.ButtonStyle.secondary)
+
+            async def _callback(interaction):
+                if interaction.user.id != target_user.id:
+                    await interaction.response.send_message("this question is for someone else.", ephemeral=True)
+                    return
+                _touch_activity()
+                modal = _CustomModal()
+                await interaction.response.send_modal(modal)
+                await modal.wait()
+                if modal.answer.value:
+                    view = btn.view
+                    _resolve(view, f"(custom) {modal.answer.value.strip()}")
+                    try:
+                        if view.message:
+                            await view.message.edit(view=view)
+                    except Exception:
+                        pass
+                    await post_channel.send(f"✅ Custom answer: {modal.answer.value.strip()[:300]}")
+
+            btn.callback = _callback
+            return btn
+
+        options_block = "\n".join(f"{i + 1}. {opt}" for i, opt in enumerate(options))
+        view = _AskUserView()
+        try:
+            msg = await post_channel.send(
+                f"**❓ {question}**\n{options_block}\n\n"
+                f"Click an option, or **Other / custom answer** to type your own — "
+                f"you can also just reply here to talk it through; once you've settled on "
+                f"something I'll pick it up from the discussion.",
+                view=view,
+            )
+        except Exception as e:
+            return f"Failed to post question: {e}"
+        view.message = msg
+
+        _pending_ask_user[thread_id] = {
+            "future": future,
+            "requester_id": target_user.id,
+            "question": question,
+            "options": options,
+            "guild_id": str(guild.id) if guild else "dm",
+            "history": [],
+            "view": view,
+            "message": msg,
+            "touch": _touch_activity,
+        }
+
+        no_response_timeout = CONFIG.get("ask_user_no_response_timeout_sec", 600)
+        idle_timeout = CONFIG.get("ask_user_idle_timeout_sec", 1200)
+        watchdog_interval = CONFIG.get("ask_user_watchdog_interval_sec", 15)
+
+        async def _watchdog():
+            while not future.done():
+                await asyncio.sleep(watchdog_interval)
+                window = idle_timeout if activity["seen"] else no_response_timeout
+                if time.monotonic() - activity["last"] > window:
+                    if not future.done():
+                        future.set_result(None)
+                    break
+
+        watchdog_task = asyncio.create_task(_watchdog())
+        try:
+            answer = await future
+        finally:
+            watchdog_task.cancel()
+            _pending_ask_user.pop(thread_id, None)
+            view.stop()
+            for child in view.children:
+                child.disabled = True
+            try:
+                await msg.edit(view=view)
+            except Exception:
+                pass
+
+        if answer is None:
+            try:
+                await post_channel.send("⌛ No answer given in time — proceeding without a decision.")
+            except Exception:
+                pass
+
+        if created_new_thread:
+            try:
+                await asyncio.sleep(5)  # let the resolution/timeout message be visible briefly
+                await post_channel.delete()
+            except Exception:
+                pass
+
+        if answer is None:
+            return f"User did not respond in time to: {question}"
+        return f"User answered: {answer}"
 
     # ── AGI: goals ────────────────────────────────────────────────────────────
     elif name == "complete_goal":
