@@ -18,7 +18,7 @@ except ImportError:
     call_ai = None
     pass
 from memory import MemoryManager
-from tools import TOOL_DEFINITIONS, AUTONOMOUS_TOOLS, execute_tool, get_meme_url, get_meme_data, _pending_ask_user
+from tools import TOOL_DEFINITIONS, AUTONOMOUS_TOOLS, execute_tool, get_meme_url, get_meme_data
 from config import CONFIG, MEMES_ENABLED
 from backup import (
     create_backup, save_backup, load_backup_file, list_backups,
@@ -614,58 +614,6 @@ async def handle_meme_pass(guild, channel, user_input: str, blood_reply: str, ex
 
     except Exception as e:
         await send_trace_log(guild, f"[MEME PASS ERROR] {e}")
-
-# ── ask_user: resolve via open discussion instead of a button click ──────────
-
-async def _handle_ask_user_reply(message, pending: dict):
-    """A user replied in a pending ask_user thread instead of clicking a button.
-    Classify whether they've reached a final decision; if so, resolve the tool
-    call, otherwise reply and keep the discussion open."""
-    touch = pending.get("touch")
-    if touch:
-        touch()
-
-    question = pending["question"]
-    options = pending["options"]
-    pending["history"].append(f"{message.author.display_name}: {message.content[:400]}")
-    discussion = "\n".join(pending["history"][-20:])
-
-    classify_prompt = (
-        f"An assistant asked a user a question and the user is discussing it in a thread "
-        f"instead of clicking one of the provided option buttons.\n\n"
-        f"QUESTION: {question}\n"
-        f"OPTIONS: {', '.join(options)}\n\n"
-        f"DISCUSSION SO FAR:\n{discussion}\n\n"
-        f"Has the user reached a clear final decision? If yes, respond with EXACTLY:\n"
-        f"DECIDED: <a concise one-sentence summary of their decision>\n"
-        f"If not yet decided, respond with EXACTLY:\n"
-        f"REPLY: <a short, helpful reply continuing the discussion, one or two sentences>"
-    )
-    try:
-        resp = await call_ai(
-            system="You are Claude, helping a user think through a decision in a Discord thread. Be concise.",
-            messages=[{"role": "user", "content": classify_prompt}],
-            tools=None,
-            max_tokens=250,
-        )
-    except Exception as e:
-        log.warning("ask_user discussion classify failed: %s", e)
-        return
-
-    text = (resp.get("message", {}).get("content") or "").strip()
-
-    if text.upper().startswith("DECIDED:"):
-        # Just resolve the future — the ask_user tool call itself owns cleanup
-        # (disabling the view, deleting the thread if it created one).
-        decision = text.split(":", 1)[1].strip()
-        await message.channel.send(f"✅ Got it — going with: **{decision}**")
-        fut = pending["future"]
-        if not fut.done():
-            fut.set_result(f"(via discussion) {decision}")
-    elif text.upper().startswith("REPLY:"):
-        reply = text.split(":", 1)[1].strip()
-        if reply:
-            await message.channel.send(reply)
 
 # ── Leak detection ────────────────────────────────────────────────────────────
 
@@ -1378,14 +1326,6 @@ RULES:
             pass
 
         if message.author.bot:
-            return
-
-        # ask_user: if this channel/thread has a pending question and the message
-        # is from the person who was asked, route it into the discussion resolver
-        # instead of normal chat handling.
-        pending = _pending_ask_user.get(str(message.channel.id))
-        if pending and message.author.id == pending["requester_id"]:
-            await _handle_ask_user_reply(message, pending)
             return
 
         guild = message.guild

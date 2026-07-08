@@ -21,9 +21,9 @@ try:
 except ImportError:
     _discord = None
 
-# Pending ask_user questions — channel/thread id (str) -> state dict. Populated by
-# the ask_user tool below, consumed by bot.py's on_message to route plain-text
-# discussion replies back into the pending question instead of normal chat.
+# Pending ask_user questions — channel/thread id (str) -> state dict. Internal
+# bookkeeping for the ask_user tool below (buttons only — typed replies in the
+# thread are deliberately ignored; free text lost context, see aithing history).
 _pending_ask_user: dict[str, dict] = {}
 
 
@@ -556,7 +556,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "ask_user",
-            "description": "Ask the user a clarifying question when you're genuinely blocked on a decision only they can make — not for things you can reasonably decide yourself. Posts clickable option buttons (plus an 'Other' button for a free-text answer) in a thread and waits for a response. The user can also just reply in the thread to discuss it instead of clicking; once they've settled on something, you'll get their resolved answer as the tool result. If they pick 'Other' and type something like '1 + 3, I'd rather do both', interpret that as referring to your numbered options plus their own note.",
+            "description": "Ask the user a clarifying question when you're genuinely blocked on a decision only they can make — not for things you can reasonably decide yourself. Posts clickable option buttons (plus 'Other' for a free-text answer via a popup, and 'Cancel') in a thread, @mentions the asker, and waits. Only the person who triggered you can answer; typed replies in the thread are ignored — answers come from the buttons only. If they pick 'Other' and type something like '1 + 3, I'd rather do both', interpret that as referring to your numbered options plus their own note.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1679,6 +1679,7 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
                 for i, opt in enumerate(options):
                     self.add_item(_make_option_button(opt, i))
                 self.add_item(_make_custom_button())
+                self.add_item(_make_cancel_button())
 
         def _resolve(view, answer_text):
             _pending_ask_user.pop(thread_id, None)
@@ -1728,14 +1729,31 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
             btn.callback = _callback
             return btn
 
+        cancelled = {"v": False}
+
+        def _make_cancel_button():
+            btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.danger)
+
+            async def _callback(interaction):
+                if interaction.user.id != target_user.id:
+                    await interaction.response.send_message("this question is for someone else.", ephemeral=True)
+                    return
+                cancelled["v"] = True
+                view = btn.view
+                _resolve(view, None)
+                await interaction.response.edit_message(view=view)
+                await post_channel.send("🚫 Cancelled.")
+
+            btn.callback = _callback
+            return btn
+
         options_block = "\n".join(f"{i + 1}. {opt}" for i, opt in enumerate(options))
         view = _AskUserView()
         try:
             msg = await post_channel.send(
-                f"**❓ {question}**\n{options_block}\n\n"
-                f"Click an option, or **Other / custom answer** to type your own — "
-                f"you can also just reply here to talk it through; once you've settled on "
-                f"something I'll pick it up from the discussion.",
+                f"{target_user.mention}\n**❓ {question}**\n{options_block}\n\n"
+                f"Click an option, **Other / custom answer** to type your own, "
+                f"or **Cancel**. Only {target_user.display_name} can answer.",
                 view=view,
             )
         except Exception as e:
@@ -1748,10 +1766,8 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
             "question": question,
             "options": options,
             "guild_id": str(guild.id) if guild else "dm",
-            "history": [],
             "view": view,
             "message": msg,
-            "touch": _touch_activity,
         }
 
         no_response_timeout = CONFIG.get("ask_user_no_response_timeout_sec", 600)
@@ -1781,7 +1797,7 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
             except Exception:
                 pass
 
-        if answer is None:
+        if answer is None and not cancelled["v"]:
             try:
                 await post_channel.send("⌛ No answer given in time — proceeding without a decision.")
             except Exception:
@@ -1795,6 +1811,8 @@ async def execute_tool(name, args, guild, invoker, channel, mentioned_members, m
                 pass
 
         if answer is None:
+            if cancelled["v"]:
+                return f"User cancelled the question (no answer): {question}"
             return f"User did not respond in time to: {question}"
         return f"User answered: {answer}"
 
