@@ -646,18 +646,23 @@ async def _is_followup_to_bot(message, guild) -> bool:
     try:
         resp = await call_ai(
             system=(
-                "You judge whether a new Discord message is a direct follow-up to the assistant's "
-                "previous answer — the user forgot to @mention or reply to the bot but is clearly "
-                "still talking to it (a follow-up question, a reaction to its answer, a 'what about X'). "
-                "Answer ONLY 'YES' or 'NO'. Default to NO when unsure, or when the message reads like "
-                "chatter aimed at other people."
+                "You judge whether a new Discord message — one that did NOT @mention or reply to the "
+                "assistant — is still directed AT the assistant, continuing the conversation it was just "
+                "having with this user. The user often keeps talking to it without re-tagging it.\n"
+                "Say YES if the message is aimed at the assistant, even indirectly: a follow-up question, "
+                "a reaction to its last answer, a new but related question, or the user thinking out loud "
+                "to it ('hmm i can't decide what to ask next', 'wait really?', 'ok what about X').\n"
+                "Say NO only when the message is clearly aimed at other people, is unrelated human-to-human "
+                "chatter, or is bare filler with nothing to respond to ('lol', 'ok', 'brb').\n"
+                "When it's genuinely a one-on-one flow and the assistant just replied moments ago, lean YES. "
+                "Answer ONLY 'YES' or 'NO'."
             ),
             messages=[{"role": "user", "content": (
                 f"ASSISTANT'S LAST EXCHANGE IN THIS CHANNEL:\n"
                 f"User: {exch['user_msg'][:300]}\n"
                 f"Assistant: {exch['bot_reply'][:300]}\n\n"
                 f"NEW MESSAGE from {message.author.display_name}:\n{text[:300]}\n\n"
-                f"Is the new message a direct follow-up to the assistant? YES or NO."
+                f"Is the new message still directed at the assistant? YES or NO."
             )}],
             tools=None,
             max_tokens=3,
