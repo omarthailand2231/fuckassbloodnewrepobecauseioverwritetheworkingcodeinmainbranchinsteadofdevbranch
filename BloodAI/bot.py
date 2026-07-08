@@ -615,6 +615,64 @@ async def handle_meme_pass(guild, channel, user_input: str, blood_reply: str, ex
     except Exception as e:
         await send_trace_log(guild, f"[MEME PASS ERROR] {e}")
 
+# ── Follow-up catcher ─────────────────────────────────────────────────────────
+# When a user keeps talking to Blood right after his reply but forgets to @mention
+# or Discord-reply, catch it: within followup_window_sec of his last reply in a
+# channel, an un-addressed message is run past a cheap YES/NO classifier and, only
+# on YES, handled as if he'd been mentioned. Fail-silent everywhere — any doubt or
+# error means stay quiet rather than butt into unrelated chatter.
+_last_bot_exchange: dict[str, dict] = {}  # channel_id -> {ts, user_msg, bot_reply}
+
+
+async def _is_followup_to_bot(message, guild) -> bool:
+    if not CONFIG.get("followup_catcher_enabled", True):
+        return False
+    ch_id = str(message.channel.id)
+    exch = _last_bot_exchange.get(ch_id)
+    if not exch:
+        return False
+    if time.monotonic() - exch["ts"] > CONFIG.get("followup_window_sec", 300):
+        _last_bot_exchange.pop(ch_id, None)
+        return False
+    text = message.content.strip()
+    if not text or text.startswith(("!", "/", "http")):
+        return False
+    if len(text) > CONFIG.get("followup_max_len", 400):
+        return False  # long paste is unlikely a quick follow-up — skip to save a call
+    # A Discord reply to a specific message is explicit aim: if it were at Blood he'd
+    # already be in mentions, so a reference here means it's aimed at someone else.
+    if message.reference is not None:
+        return False
+    try:
+        resp = await call_ai(
+            system=(
+                "You judge whether a new Discord message is a direct follow-up to the assistant's "
+                "previous answer — the user forgot to @mention or reply to the bot but is clearly "
+                "still talking to it (a follow-up question, a reaction to its answer, a 'what about X'). "
+                "Answer ONLY 'YES' or 'NO'. Default to NO when unsure, or when the message reads like "
+                "chatter aimed at other people."
+            ),
+            messages=[{"role": "user", "content": (
+                f"ASSISTANT'S LAST EXCHANGE IN THIS CHANNEL:\n"
+                f"User: {exch['user_msg'][:300]}\n"
+                f"Assistant: {exch['bot_reply'][:300]}\n\n"
+                f"NEW MESSAGE from {message.author.display_name}:\n{text[:300]}\n\n"
+                f"Is the new message a direct follow-up to the assistant? YES or NO."
+            )}],
+            tools=None,
+            max_tokens=3,
+        )
+        verdict = (resp.get("message", {}).get("content") or "").strip().upper()
+        if verdict.startswith("Y"):
+            log.info("[FOLLOWUP] catching un-addressed follow-up from %s in #%s",
+                     message.author.display_name, getattr(message.channel, "name", "?"))
+            return True
+        return False
+    except Exception as e:
+        log.debug("[FOLLOWUP] classify failed: %s", e)
+        return False
+
+
 # ── Leak detection ────────────────────────────────────────────────────────────
 
 def is_garbage_output(text: str) -> bool:
@@ -1449,8 +1507,12 @@ RULES:
 
         bot_mentioned = bot.user in message.mentions
         if not bot_mentioned:
-            await bot.process_commands(message)
-            return
+            # User may have forgotten to @mention/reply but is still talking to Blood.
+            if await _is_followup_to_bot(message, guild):
+                bot_mentioned = True  # treat as addressed; fall through to normal handling
+            else:
+                await bot.process_commands(message)
+                return
 
         perm = get_user_permission(message.author)
         if perm == "blacklisted":
@@ -1960,6 +2022,14 @@ RULES:
                 final_text = "nah."
 
             memory.push_message(channel_id, "assistant", final_text)
+
+            # Remember this exchange so a follow-up in the next few minutes that
+            # forgets to @mention Blood can still be caught (_is_followup_to_bot).
+            _last_bot_exchange[channel_id] = {
+                "ts": time.monotonic(),
+                "user_msg": base_content or "(no text)",
+                "bot_reply": final_text,
+            }
 
             prompt_t = usage.get("prompt_tokens", 0)
             completion_t = usage.get("completion_tokens", 0)

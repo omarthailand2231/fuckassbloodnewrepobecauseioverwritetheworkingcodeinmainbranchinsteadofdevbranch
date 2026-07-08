@@ -379,6 +379,11 @@ CONFIG = {
     "ask_user_watchdog_interval_sec":   15,       # how often the idle watchdog checks
     "ask_user_thread_archive_min":      60,       # thread auto-archive duration (Discord: 60/1440/4320/10080 only)
 
+    # ── Follow-up catcher (reply when a user forgets to @mention but keeps talking) ─
+    "followup_catcher_enabled":         True,     # master switch
+    "followup_window_sec":              300,      # 5 min — how long after Blood's reply a bare message can be caught
+    "followup_max_len":                 400,      # skip classifying messages longer than this (unlikely a quick follow-up)
+
     # ── Skills folder ──────────────────────────────────────────────────────────
     "skills_enabled":                   True,
     "skills_dir":                       os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills"),
