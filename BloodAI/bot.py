@@ -41,6 +41,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("blood")
 
+# DAVE/E2EE receive fix — must import before any VC connect; placed after
+# logging setup so its install log is visible (see ~/Downloads/claudecode_fix.md)
+import dave_recv_patch  # noqa: E402,F401
+
 memory = MemoryManager()
 
 if discord and commands:
